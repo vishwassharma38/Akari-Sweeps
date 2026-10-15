@@ -12,7 +12,7 @@ use crate::commands::runner::RealRunner;
 use crate::commands::{AppCommand, resolve_command};
 use crate::system::{AppSummary, ExecEvent, RunTotals};
 use crossterm::ExecutableCommand;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -171,7 +171,7 @@ fn real_main() -> i32 {
         if event::poll(Duration::from_millis(timeout)).unwrap_or(false) {
             match event::read() {
                 Ok(Event::Key(key)) => {
-                    if handle_key(&mut app, &tx, key.code, key.modifiers, &mut pending_quit) {
+                    if handle_key(&mut app, &tx, key, &mut pending_quit) {
                         break;
                     }
                     dirty = true;
@@ -202,14 +202,26 @@ fn exe_normalized(exe: &str) -> String {
 /// While the command entry is focused, keystrokes edit it (shortcuts are
 /// suspended); otherwise single keys navigate. Both number selection and
 /// text entry converge on [`activate`] — one dispatch path.
+///
+/// Ownership rule: the focused text-input handler owns text-editing key
+/// events, while global shortcuts handle only events that are intentionally
+/// available when unfocused. Key releases are never text input: on Windows
+/// crossterm emits both `Press` and `Release` for every physical keystroke
+/// (see `crossterm::event::KeyEventKind`), so `Release` events are ignored
+/// here to ensure each character is inserted exactly once. `Press` and
+/// `Repeat` (held-key autorepeat) are processed; `Release` is dropped.
 fn handle_key(
     app: &mut App,
     tx: &Sender<ExecEvent>,
-    code: KeyCode,
-    mods: KeyModifiers,
+    key: KeyEvent,
     pending_quit: &mut bool,
 ) -> bool {
     use crossterm::event::KeyModifiers as M;
+    if key.kind == KeyEventKind::Release {
+        return false;
+    }
+    let code = key.code;
+    let mods = key.modifiers;
     if app.input_focused {
         match code {
             KeyCode::Enter => {
@@ -481,4 +493,380 @@ fn empty_summary() -> AppSummary {
         None,
         None,
     )
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new_with_kind(code, KeyModifiers::empty(), KeyEventKind::Press)
+    }
+
+    fn press_with(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new_with_kind(code, mods, KeyEventKind::Press)
+    }
+
+    fn release(code: KeyCode) -> KeyEvent {
+        KeyEvent::new_with_kind(code, KeyModifiers::empty(), KeyEventKind::Release)
+    }
+
+    fn release_with(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new_with_kind(code, mods, KeyEventKind::Release)
+    }
+
+    fn press_char(c: char) -> KeyEvent {
+        press(KeyCode::Char(c))
+    }
+
+    fn release_char(c: char) -> KeyEvent {
+        release(KeyCode::Char(c))
+    }
+
+    fn fresh() -> (App, Sender<ExecEvent>, bool) {
+        let app = App::new(AppCommand::Home);
+        let (tx, _rx) = mpsc::channel::<ExecEvent>();
+        (app, tx, false)
+    }
+
+    /// Simulate a physical keystroke as Windows delivers it: one `Press`
+    /// followed by one `Release` with the same code/modifiers.
+    fn tap(app: &mut App, tx: &Sender<ExecEvent>, pending: &mut bool, key: KeyEvent) -> bool {
+        let code = key.code;
+        let mods = key.modifiers;
+        let press = KeyEvent::new_with_kind(code, mods, KeyEventKind::Press);
+        let rel = KeyEvent::new_with_kind(code, mods, KeyEventKind::Release);
+        let quit = handle_key(app, tx, press, pending);
+        // Release must never quit or mutate; propagate press's quit only.
+        let quit_rel = handle_key(app, tx, rel, pending);
+        assert!(
+            !quit_rel,
+            "release of {code:?} must never request quit or dispatch"
+        );
+        quit
+    }
+
+    /// Type text through the real `handle_key` path, sending Press+Release
+    /// per character exactly as the Windows console produces.
+    fn type_text(app: &mut App, tx: &Sender<ExecEvent>, pending: &mut bool, text: &str) {
+        for ch in text.chars() {
+            tap(app, tx, pending, press_char(ch));
+        }
+    }
+
+    /// Test A — Ordinary command typing: `/` then `akariclean` yields exactly
+    /// `akariclean`, even when every keystroke arrives as Press+Release.
+    #[test]
+    fn test_a_ordinary_command_typing_is_exact() {
+        let (mut app, tx, mut pending) = fresh();
+        tap(&mut app, &tx, &mut pending, press(KeyCode::Char('/')));
+        assert!(app.input_focused, "'/' must focus command entry");
+        type_text(&mut app, &tx, &mut pending, "akariclean");
+        assert_eq!(app.input, "akariclean");
+    }
+
+    /// Test B — All supported commands type exactly once.
+    #[test]
+    fn test_b_all_supported_commands_type_exactly_once() {
+        let cases = [
+            ("akariclean", AppCommand::Clean),
+            ("akarihealth", AppCommand::Health),
+            ("akariall", AppCommand::All),
+            ("akariabout", AppCommand::About),
+            ("akarihelp", AppCommand::Help),
+        ];
+        for (name, expected) in cases {
+            let (mut app, tx, mut pending) = fresh();
+            tap(&mut app, &tx, &mut pending, press(KeyCode::Char('/')));
+            type_text(&mut app, &tx, &mut pending, name);
+            assert_eq!(app.input, name, "buffer must equal typed {name}");
+            assert_eq!(
+                crate::commands::command_from_input(&app.input),
+                Some(expected),
+                "{name} must resolve to {expected:?}"
+            );
+        }
+    }
+
+    /// Test C — Input activation: `/` focuses without inserting `/`;
+    /// its Release inserts nothing either.
+    #[test]
+    fn test_c_slash_activates_without_inserting_slash() {
+        let (mut app, tx, mut pending) = fresh();
+        assert!(!app.input_focused);
+        let quit = handle_key(&mut app, &tx, press(KeyCode::Char('/')), &mut pending);
+        assert!(!quit);
+        assert!(app.input_focused);
+        assert_eq!(app.input, "", "activating '/' must not enter the buffer");
+        // The Release half of the same physical keystroke must be ignored,
+        // even though focus is now on (previously this inserted a second '/'
+        // and each later Release doubled a character).
+        let quit_rel = handle_key(&mut app, &tx, release(KeyCode::Char('/')), &mut pending);
+        assert!(!quit_rel);
+        assert_eq!(app.input, "", "release of '/' must not enter the buffer");
+        // Enter activation behaves the same: focuses without inserting.
+        let (mut app2, tx2, mut pending2) = fresh();
+        handle_key(&mut app2, &tx2, press(KeyCode::Enter), &mut pending2);
+        assert!(app2.input_focused);
+        assert_eq!(app2.input, "");
+        assert!(!handle_key(
+            &mut app2,
+            &tx2,
+            release(KeyCode::Enter),
+            &mut pending2
+        ));
+        assert_eq!(app2.input, "");
+    }
+
+    /// Test D — Single-event insertion: Press inserts once, Release inserts
+    /// zero times, for every character.
+    #[test]
+    fn test_d_each_press_inserts_once_release_inserts_zero() {
+        let (mut app, tx, mut pending) = fresh();
+        handle_key(&mut app, &tx, press(KeyCode::Char('/')), &mut pending);
+        assert!(app.input_focused);
+        for ch in "akariclean".chars() {
+            let before = app.input.len();
+            handle_key(&mut app, &tx, press_char(ch), &mut pending);
+            assert_eq!(
+                app.input.len(),
+                before + ch.len_utf8(),
+                "press '{ch}' must insert exactly once"
+            );
+            let after_press = app.input.clone();
+            handle_key(&mut app, &tx, release_char(ch), &mut pending);
+            assert_eq!(
+                app.input, after_press,
+                "release '{ch}' must not mutate the buffer"
+            );
+        }
+        assert_eq!(app.input, "akariclean");
+        // Repeat (held key) still inserts — only Release is dropped.
+        let before = app.input.len();
+        handle_key(
+            &mut app,
+            &tx,
+            KeyEvent::new_with_kind(
+                KeyCode::Char('x'),
+                KeyModifiers::empty(),
+                KeyEventKind::Repeat,
+            ),
+            &mut pending,
+        );
+        assert_eq!(app.input.len(), before + 1);
+        assert!(app.input.ends_with('x'));
+    }
+
+    /// Test E — Editing: Backspace removes one, Ctrl+U clears, Enter submits
+    /// once (via the shared dispatch), Esc cancels — none double-process.
+    #[test]
+    fn test_e_editing_backspace_clear_submit_cancel_once_each() {
+        // Backspace: Press removes one, Release removes zero.
+        let (mut app, tx, mut pending) = fresh();
+        handle_key(&mut app, &tx, press(KeyCode::Char('/')), &mut pending);
+        type_text(&mut app, &tx, &mut pending, "akari");
+        assert_eq!(app.input, "akari");
+        handle_key(&mut app, &tx, press(KeyCode::Backspace), &mut pending);
+        assert_eq!(app.input, "akar");
+        handle_key(&mut app, &tx, release(KeyCode::Backspace), &mut pending);
+        assert_eq!(
+            app.input, "akar",
+            "release of Backspace must not delete again"
+        );
+
+        // Ctrl+U clears; its Release clears nothing further.
+        type_text(&mut app, &tx, &mut pending, "clean");
+        assert_eq!(app.input, "akarclean");
+        handle_key(
+            &mut app,
+            &tx,
+            press_with(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            &mut pending,
+        );
+        assert!(app.input.is_empty());
+        handle_key(
+            &mut app,
+            &tx,
+            release_with(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            &mut pending,
+        );
+        assert!(app.input.is_empty());
+
+        // Enter submits once through the shared dispatch path. Use the safe
+        // non-maintenance command so no worker or UAC relaunch runs.
+        type_text(&mut app, &tx, &mut pending, "akariabout");
+        assert_eq!(app.input, "akariabout");
+        let logs_before = app.log.len();
+        handle_key(&mut app, &tx, press(KeyCode::Enter), &mut pending);
+        assert!(!app.input_focused, "submit must unfocus");
+        assert!(app.input.is_empty(), "submit must clear the field");
+        assert_eq!(app.screen, Screen::About);
+        let switched = app.log.iter().filter(|l| l.contains("akariabout")).count();
+        assert_eq!(switched, 1, "Enter must dispatch exactly once");
+        // Release of Enter dispatches nothing further.
+        handle_key(&mut app, &tx, release(KeyCode::Enter), &mut pending);
+        assert_eq!(app.screen, Screen::About);
+        assert_eq!(
+            app.log.len(),
+            logs_before + 1,
+            "release of Enter must not log or dispatch again"
+        );
+
+        // Esc cancels without duplicate processing; its Release is inert and
+        // must not quit when unfocused either.
+        let (mut app2, tx2, mut pending2) = fresh();
+        handle_key(&mut app2, &tx2, press(KeyCode::Char('/')), &mut pending2);
+        type_text(&mut app2, &tx2, &mut pending2, "akariclean");
+        handle_key(&mut app2, &tx2, press(KeyCode::Esc), &mut pending2);
+        assert!(!app2.input_focused);
+        assert!(app2.input.is_empty());
+        assert!(!handle_key(
+            &mut app2,
+            &tx2,
+            release(KeyCode::Esc),
+            &mut pending2
+        ));
+        // Unfocused Release Esc must not trigger quit.
+        let (mut app3, tx3, mut pending3) = fresh();
+        assert!(!handle_key(
+            &mut app3,
+            &tx3,
+            release(KeyCode::Esc),
+            &mut pending3
+        ));
+    }
+
+    /// Test F — Focus and shortcuts: globals work unfocused; focused typing
+    /// never triggers them.
+    #[test]
+    fn test_f_focus_ownership_and_global_shortcuts() {
+        // Unfocused number keys use the shared dispatch (safe 4/5 only, so no
+        // worker or elevation side effects).
+        let (mut app, tx, mut pending) = fresh();
+        handle_key(&mut app, &tx, press(KeyCode::Char('4')), &mut pending);
+        assert_eq!(app.screen, Screen::About);
+        let logs_after_press = app.log.len();
+        handle_key(&mut app, &tx, release(KeyCode::Char('4')), &mut pending);
+        assert_eq!(app.screen, Screen::About);
+        assert_eq!(app.log.len(), logs_after_press);
+
+        let (mut app, tx, mut pending) = fresh();
+        handle_key(&mut app, &tx, press(KeyCode::Char('?')), &mut pending);
+        assert_eq!(app.screen, Screen::Help);
+        assert!(!handle_key(
+            &mut app,
+            &tx,
+            release(KeyCode::Char('?')),
+            &mut pending
+        ));
+
+        // Up/Down scroll when unfocused, ignored when focused.
+        let (mut app, tx, mut pending) = fresh();
+        handle_key(&mut app, &tx, press(KeyCode::Down), &mut pending);
+        assert_eq!(app.scroll, 1);
+        assert!(!handle_key(
+            &mut app,
+            &tx,
+            release(KeyCode::Down),
+            &mut pending
+        ));
+        assert_eq!(app.scroll, 1);
+        handle_key(&mut app, &tx, press(KeyCode::Char('/')), &mut pending);
+        handle_key(&mut app, &tx, press(KeyCode::Down), &mut pending);
+        assert_eq!(app.scroll, 1, "Down while focused must not scroll");
+
+        // Focused typing of shortcut letters inserts text instead of firing
+        // global actions (regression: 'c' must not start Clean while typing).
+        let (mut app, tx, mut pending) = fresh();
+        handle_key(&mut app, &tx, press(KeyCode::Char('/')), &mut pending);
+        for ch in ['c', 'r', 't', 'a', 'h', 'q', '1', '?'] {
+            let screen_before = app.screen;
+            let running_before = app.worker_running;
+            handle_key(&mut app, &tx, press_char(ch), &mut pending);
+            assert!(
+                app.input.ends_with(ch),
+                "focused '{ch}' must enter the buffer"
+            );
+            assert_eq!(app.screen, screen_before);
+            assert_eq!(app.worker_running, running_before);
+            handle_key(&mut app, &tx, release_char(ch), &mut pending);
+        }
+        assert_eq!(app.input, "crtahq1?");
+        assert!(!app.worker_running, "typing must never start a worker");
+
+        // Focused 'q' types; unfocused 'q' quits. Release never quits.
+        let (mut app, tx, mut pending) = fresh();
+        handle_key(&mut app, &tx, press(KeyCode::Char('/')), &mut pending);
+        assert!(!handle_key(
+            &mut app,
+            &tx,
+            press(KeyCode::Char('q')),
+            &mut pending
+        ));
+        assert_eq!(app.input, "q");
+        let (mut app2, tx2, mut pending2) = fresh();
+        assert!(!handle_key(
+            &mut app2,
+            &tx2,
+            release(KeyCode::Char('q')),
+            &mut pending2
+        ));
+        assert!(handle_key(
+            &mut app2,
+            &tx2,
+            press(KeyCode::Char('q')),
+            &mut pending2
+        ));
+    }
+
+    /// Test G — Full sequence: launch, `/`, type `akariclean` as Press+Release
+    /// pairs, inspect buffer, Enter resolves to exactly one dispatch.
+    ///
+    /// The maintenance dispatch itself is verified through the existing
+    /// `command_from_input` abstraction (no real cleanup/repair runs); the
+    /// shared `submit_input`+`activate` path is exercised for real with the
+    /// safe `akariabout` command to prove Enter dispatches exactly once.
+    #[test]
+    fn test_g_full_sequence_dispatches_exactly_once() {
+        // 1. Launch the TUI.
+        let (mut app, tx, mut pending) = fresh();
+        assert_eq!(app.screen, Screen::Home);
+        // 2. Press `/`.
+        tap(&mut app, &tx, &mut pending, press(KeyCode::Char('/')));
+        assert!(app.input_focused);
+        // 3. Type `akariclean` (each physical key = Press+Release).
+        type_text(&mut app, &tx, &mut pending, "akariclean");
+        // 4. Inspect the input buffer.
+        assert_eq!(app.input, "akariclean");
+        assert_eq!(app.input.len(), "akariclean".len());
+        // 5-6. Enter: the buffer resolves to Clean exactly once; Release adds
+        // nothing. Count resolutions with a mock dispatch counter instead of
+        // spawning the real maintenance worker.
+        let mut dispatches = 0;
+        let resolved = crate::commands::command_from_input(&app.input);
+        if resolved == Some(AppCommand::Clean) {
+            dispatches += 1;
+        }
+        assert_eq!(dispatches, 1, "akariclean must dispatch to Clean once");
+        let before = app.input.clone();
+        handle_key(&mut app, &tx, release(KeyCode::Enter), &mut pending);
+        assert_eq!(app.input, before, "release must not alter pending input");
+        let resolved_again = crate::commands::command_from_input(&app.input);
+        assert_eq!(resolved_again, Some(AppCommand::Clean));
+        assert_eq!(dispatches, 1, "release must not cause a second dispatch");
+
+        // Same shared path end-to-end with a safe command: real Enter submit.
+        let (mut app2, tx2, mut pending2) = fresh();
+        tap(&mut app2, &tx2, &mut pending2, press(KeyCode::Char('/')));
+        type_text(&mut app2, &tx2, &mut pending2, "akariabout");
+        handle_key(&mut app2, &tx2, press(KeyCode::Enter), &mut pending2);
+        assert_eq!(app2.screen, Screen::About);
+        assert!(app2.input.is_empty());
+        handle_key(&mut app2, &tx2, release(KeyCode::Enter), &mut pending2);
+        assert_eq!(
+            app2.log.iter().filter(|l| l.contains("akariabout")).count(),
+            1
+        );
+    }
 }
