@@ -18,19 +18,21 @@ file remains as the auditable baseline, not the runtime engine.
 ## Architecture
 
 ```
-src/main.rs          entry, exe-name dispatch, terminal lifecycle, event loop
-src/app.rs           App state (screen, execution, log, ops, animator, summary)
-src/commands/mod.rs  6-command registry + resolve_command()
+src/main.rs          entry, exe-name dispatch, elevation startup, event loop
+src/app.rs           App state (screen, execution, log, ops, input, animator)
+src/commands/mod.rs  command registry, 5-item selection, input mapping,
+                     phase identity (Phase) + capability gates (PhaseGate)
 src/commands/clean.rs cleanup plan ([1/18]–[18/18]) + BAT-faithful executor
 src/commands/health.rs repair plan (DISM×3, SFC, CHKDSK) + exit-code mapping
 src/commands/all.rs  akariall sequencing (cleanup, then repair, merged summary)
-src/commands/runner.rs RealRunner (filesystem + subprocess side effects)
+src/commands/runner.rs RealRunner + RecordingRunner (isolation tests)
 src/system/mod.rs    OpStatus/OpResult/ExecEvent/MaintenanceRunner/AppSummary
+src/system/elevation.rs UAC decision, runas relaunch, cancel handling
 src/system/process.rs run_program_capture(), program_exists()
 src/system/windows.rs is_elevated() (fltmc, like BAT), free_space_kb()
 src/akari/sprites.rs sweep discovery/validation/loading (256×320 RGBA)
-src/akari/animation.rs Animator (Ambient/Sweeping/Settled) + future sets
-src/ui/*             Ratatui layout: header, main/output, animation, status
+src/akari/animation.rs Animator (Ambient/Sweeping/Settled), 6 FPS deadline
+src/ui/*             Ratatui layout: header, main/output, animation, entry
 install.ps1 / uninstall.ps1  copy-based command registration
 ```
 
@@ -39,19 +41,76 @@ testable with mocks — no destructive ops run during `cargo test`.
 
 ## Commands
 
-| Command      | Action                                            | Maintenance? |
-| ------------ | ------------------------------------------------- | ------------ |
-| `akari`      | Interactive TUI home (logo, commands, animation)  | No — idle    |
-| `akariclean` | Cleanup phase only ([1/18]–[18/18])               | Cleanup only |
-| `akarihealth`| System-image repair only ([Repair 1/5]–[5/5])     | Repair only  |
-| `akariall`   | Cleanup, then repair, then combined summary       | Both, in order |
-| `akariabout` | About (name, V00.1, purpose, repo/license)        | No           |
-| `akarihelp`  | Usage, per-command help, exit instructions        | No           |
+`akari` launches the interface. Inside it, exactly five commands are
+selectable (keys `1`–`5`):
+
+| Key | Command      | Action                                        | Maintenance? |
+| --- | ------------ | --------------------------------------------- | ------------ |
+| `1` | `akariclean` | Cleanup phase only ([1/18]–[18/18])           | Cleanup only |
+| `2` | `akarihealth`| System-image repair only ([Repair 1/5]–[5/5]) | Repair only  |
+| `3` | `akariall`   | Cleanup, then repair, then combined summary   | Both, in order |
+| `4` | `akariabout` | About (name, V00.1, purpose, repo/license)    | No           |
+| `5` | `akarihelp`  | Usage, per-command help, exit instructions    | No           |
 
 `akari <name>` also works (`akari clean`, `akari --help`, …).
-In-TUI keys: `1–6` switch command · `c` cleanup · `r` repair · `t` all ·
-`?` help · `a` about · `h` home · `↑/↓` scroll · `q`/`Esc` quit ·
-`Ctrl+C` deliberate cancel/quit (double-press while running).
+
+### Command-entry field
+
+Every screen shows a `Command` box. Press `/` (or Enter) to type, then
+Enter to run. Input is trimmed and case-insensitive; number selection
+and text entry share one dispatch path. Empty input does nothing;
+unknown names get a hint listing the valid commands. While typing,
+shortcuts suspend except Enter (run), Esc (cancel), Backspace (edit),
+and Ctrl+U (clear).
+
+Other keys: `c` cleanup · `r` repair · `t` all · `?` help · `a` about ·
+`h` home · `↑/↓` scroll · `q`/`Esc` quit · `Ctrl+C` deliberate cancel/quit
+(double-press while running).
+
+### Cleanup/repair isolation (guaranteed)
+
+- `akariclean` runs only cleanup. It invokes zero repair-phase commands
+  (no DISM health check/scan/restore, no SFC, no CHKDSK). Note: the BAT's
+  `[18/18]` component-store cleanup (`DISM /StartComponentCleanup`) is a
+  *cleanup* operation and stays in the cleanup phase, now labeled
+  `[18/18] COMPONENT-STORE CLEANUP` so it can't be mistaken for repair.
+- `akarihealth` runs only the five repair commands. It deletes no files
+  and invokes no cleanup.
+- `akariall` runs cleanup to completion, then repair — never concurrent,
+  never a second cleanup. **Failure policy:** cleanup errors never block
+  repair, but they poison the combined summary, so overall status/exit
+  code can never report success when a required phase failed.
+- Enforcement is structural: phase runners require capability tokens
+  (`CleanupGate`/`RepairGate`) minted only for permitted commands, plus
+  invocation-log regression tests asserting the actual command order.
+
+## Administrator elevation (UAC)
+
+Detection uses the BAT's `fltmc` probe — a real privilege check.
+
+- Maintenance aliases (`akariclean`, `akarihealth`, `akariall`) started
+  without elevation relaunch the **same executable** with the **same
+  arguments** through the Shell `runas` verb
+  (`Start-Process -Verb RunAs -Wait`), so aliases keep working after
+  elevation. Paths with spaces are quoted; assets resolve from the exe
+  directory; PATH is untouched.
+- The relaunch is synchronous: the parent propagates the elevated
+  child's exit code. Declining UAC yields exit `1223` with an actionable
+  message — maintenance is never started, never reported as started.
+- An `ELEVATED` marker prevents loops: a relaunched copy that is still
+  not elevated aborts with instructions instead of relaunching again.
+- Informational screens (home/about/help) need no elevation. From inside
+  a non-elevated TUI, maintenance requests elevation in a background
+  thread (UI stays responsive); declining logs a message and runs nothing.
+
+### Manual Windows verification (UAC can't be automated in CI)
+
+1. Non-admin terminal: `akariclean` → approve UAC → cleanup runs elevated.
+2. Same, but decline UAC → "Elevation declined … was not started.",
+   exit `1223`, no maintenance output.
+3. `akari` → home works unelevated; press `c` → elevation requested,
+   declining keeps the TUI usable with an explanatory log line.
+4. `akarihelp` works fully unelevated.
 
 ## Sprite assets
 
@@ -61,18 +120,22 @@ Directory: `assets/akari/sweep/` (shipped to `<InstallDir>\assets\…`).
 akari_sweep_001.png … akari_sweep_008.png   (each 256×320, 32bpp ARGB)
 ```
 
-Validated at startup: all 8 must decode at exactly 256×320, in order,
-looped while cleanup runs (~180 ms/frame). Missing/corrupt frames produce
-an explicit diagnostic in the animation panel — the TUI stays usable.
+Validated at startup: all 8 must decode at exactly 256×320, in order.
+Missing/corrupt frames produce an explicit diagnostic in the animation
+panel — the TUI stays usable. Source PNGs are never modified.
 
-## Rendering + fallback
+## Rendering + animation
 
-Terminals can't blit 256×320 pixels, so frames render as true-color
-half-block cells (`▀` = 2 vertical px/cell), aspect-preserved, centered
-(no per-frame drift), transparency blended to background. Caption always
-labels it a terminal approximation — never "1:1 pixels". No image-protocol
-dependency; works in stock Windows Terminal / conhost. Small terminals
-(<60×18) fall back to a compact single-column view instead of overlapping.
+- Each half-block cell half is an **area average** over its source pixels
+  (box filter): gradients survive downscaling instead of aliasing, and
+  alpha composites over the terminal background during averaging.
+- Aspect preserved, centered on both axes (no per-frame drift).
+- True-color RGB output; terminals without true color degrade gracefully
+  to shape-only rendering (no crash, no claim of pixel-exact output).
+- **6 FPS** (≈167 ms/frame) for all animations via deadline scheduling on
+  a monotonic clock: no cumulative drift, stalls resync instead of
+  queuing backlog, redraws only on change, input polled within ≤50 ms —
+  no busy loop, keyboard never blocked.
 
 ## Build
 
@@ -103,26 +166,22 @@ Restart the terminal, then `akarihelp` should open the TUI.
 .\uninstall.ps1                    # removes exes, assets, and the PATH entry
 ```
 
-## Admin requirements
-
-Cleanup + repair need Administrator (BAT's `fltmc` probe is mirrored in
-`system::windows::is_elevated`). Without elevation the app warns with
-re-launch instructions and continues — privileged steps then fail honestly
-with their real exit codes rather than fake success.
-
 ## Errors & exit codes
 
 Summary rule mirrors BAT `:ShowSummary`: errors + some success → `1`;
-errors + zero success → `2`; clean → `0`. DISM `3010` = success + "restart
-required" warning. CHKDSK `0/1/2/3+` mapped per BAT. Locked files are
-skipped + counted (`files_left`), unmeasurable folders flagged, Recycle Bin
-/ cleanmgr / SilentCleanup reported as "issued, amount not reported" —
-never invented.
+errors + zero success → `2`; clean → `0`. Warnings (e.g. undocumented
+`cleanmgr` codes, unverifiable Recycle Bin result) show as `!` and never
+affect the exit code. DISM `3010` = success + "restart required" warning.
+CHKDSK `0/1/2/3+` mapped per BAT. Locked files are skipped + counted
+(`files_left`), unmeasurable folders flagged.
 
 ## Known limitations
 
 - Repair needs Windows 10 servicing stack + elevation; on non-Windows
-  hosts the TUI runs but Windows-only subprocesses fail honestly.
+  hosts the TUI runs but Windows-only subprocesses fail honestly, and
+  elevation is skipped (dev/test path) with a notice.
+- UAC interaction itself can't be covered by automated tests (manual
+  procedure above); the decision/relaunch/quote logic is unit-tested.
 - Disk-space deltas include concurrent drive activity (same caveat as BAT).
 - Animation is a scaled approximation, not pixel-exact blitting.
 - `akariall` runs repair without a second Y/N gate — the explicit alias
@@ -136,9 +195,10 @@ extend `akari::animation::AnimationSet`; the TUI panel needs no rewrite.
 ## Tests
 
 ```powershell
-cargo test   # 43 tests: dispatch, phase order, exit mapping, mocks, sprites
+cargo test   # 75 tests: dispatch, input, elevation, isolation, sprites,
+             # rendering, timing, exit codes (mock runners + temp dirs only)
 ```
 
-Destructive/real servicing ops never run in tests (mock runners + temp
-dirs only). TUI resize/exit-code/shim-CWD cases are covered by unit +
-layout-guard tests; interactive screenshot runs remain manual.
+Destructive/real servicing ops never run in tests. TUI resize/exit-code
+cases are covered by TestBackend layout tests; UAC prompts and live
+maintenance runs remain manual (see verification procedure).

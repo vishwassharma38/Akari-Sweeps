@@ -78,6 +78,99 @@ pub const COMMAND_CATALOGUE: [AppCommand; 6] = [
     AppCommand::Help,
 ];
 
+/// The five TUI-selectable commands, in number-key order (`1`–`5`).
+/// `akari` launches the interface and is intentionally not selectable
+/// inside its own UI.
+pub const SELECTABLE_COMMANDS: [AppCommand; 5] = [
+    AppCommand::Clean,
+    AppCommand::Health,
+    AppCommand::All,
+    AppCommand::About,
+    AppCommand::Help,
+];
+
+/// Map a TUI number key (`1`–`5`) to its command. Shared by number-key
+/// selection; text entry resolves through [`command_from_input`] and both
+/// converge on [`AppCommand`], a single dispatch path.
+pub fn command_from_number(n: u8) -> Option<AppCommand> {
+    match n {
+        1 => Some(AppCommand::Clean),
+        2 => Some(AppCommand::Health),
+        3 => Some(AppCommand::All),
+        4 => Some(AppCommand::About),
+        5 => Some(AppCommand::Help),
+        _ => None,
+    }
+}
+
+/// Map raw command-entry text to a command: trims surrounding whitespace
+/// and matches case-insensitively. Empty or unknown input yields `None`
+/// (the caller shows a hint instead of starting anything).
+pub fn command_from_input(raw: &str) -> Option<AppCommand> {
+    let t = normalize_token(raw);
+    if t.is_empty() {
+        return None;
+    }
+    from_token(&t)
+}
+
+/// Maintenance phase identity. Cleanup and repair are distinct phases;
+/// illegal transitions are rejected by construction (see [`PhaseGate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Cleanup,
+    Repair,
+}
+
+impl AppCommand {
+    /// Phases this command is allowed to execute, in order.
+    /// `Clean` → cleanup only, `Health` → repair only,
+    /// `All` → cleanup then repair. Non-maintenance commands allow none.
+    pub fn allowed_phases(self) -> &'static [Phase] {
+        match self {
+            AppCommand::Clean => &[Phase::Cleanup],
+            AppCommand::Health => &[Phase::Repair],
+            AppCommand::All => &[Phase::Cleanup, Phase::Repair],
+            AppCommand::Home | AppCommand::About | AppCommand::Help => &[],
+        }
+    }
+}
+
+/// Capability token authorizing the cleanup phase. Only [`PhaseGate`]
+/// can mint one, and only for commands whose [`AppCommand::allowed_phases`]
+/// include [`Phase::Cleanup`]. Phase runners take the matching token, so
+/// code holding only a `CleanupGate` cannot invoke the repair phase —
+/// an illegal transition fails to compile.
+#[derive(Debug)]
+pub struct CleanupGate {
+    _private: (),
+}
+
+/// Capability token authorizing the repair phase. See [`CleanupGate`].
+#[derive(Debug)]
+pub struct RepairGate {
+    _private: (),
+}
+
+/// Mints phase gates for exactly one command invocation.
+pub struct PhaseGate;
+
+impl PhaseGate {
+    /// Returns the gates the command may use, in phase order.
+    /// `Clean` → cleanup only; `Health` → repair only;
+    /// `All` → both; anything else → neither.
+    pub fn for_command(cmd: AppCommand) -> (Option<CleanupGate>, Option<RepairGate>) {
+        let phases = cmd.allowed_phases();
+        let cleanup = phases
+            .contains(&Phase::Cleanup)
+            .then(|| CleanupGate { _private: () });
+        let repair = phases
+            .contains(&Phase::Repair)
+            .then(|| RepairGate { _private: () });
+        (cleanup, repair)
+    }
+}
+
 /// Normalize an executable stem or CLI token: lowercase, strip `.exe`,
 /// strip directory components.
 pub fn normalize_token(raw: &str) -> String {
@@ -202,6 +295,85 @@ mod tests {
         assert!(!AppCommand::Home.starts_maintenance());
         assert!(!AppCommand::About.starts_maintenance());
         assert!(!AppCommand::Help.starts_maintenance());
+    }
+
+    #[test]
+    fn selectable_list_has_five_and_excludes_launcher() {
+        assert_eq!(SELECTABLE_COMMANDS.len(), 5);
+        assert!(!SELECTABLE_COMMANDS.contains(&AppCommand::Home));
+        let names: Vec<_> = SELECTABLE_COMMANDS
+            .iter()
+            .map(|c| c.public_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "akariclean",
+                "akarihealth",
+                "akariall",
+                "akariabout",
+                "akarihelp"
+            ]
+        );
+    }
+
+    #[test]
+    fn number_keys_map_to_selectable_commands() {
+        for (i, cmd) in SELECTABLE_COMMANDS.iter().enumerate() {
+            assert_eq!(command_from_number((i + 1) as u8), Some(*cmd));
+        }
+        assert_eq!(command_from_number(0), None);
+        assert_eq!(command_from_number(6), None);
+        // No number ever selects the launcher itself.
+        assert!(!(1..=9).any(|n| command_from_number(n) == Some(AppCommand::Home)));
+    }
+
+    #[test]
+    fn text_entry_agrees_with_number_selection() {
+        // Every selectable command: typed name == number-key dispatch.
+        for (i, cmd) in SELECTABLE_COMMANDS.iter().enumerate() {
+            let typed = command_from_input(cmd.public_name());
+            assert_eq!(typed, Some(*cmd));
+            assert_eq!(typed, command_from_number((i + 1) as u8));
+        }
+        // Normalization: whitespace trimmed, case-insensitive.
+        assert_eq!(
+            command_from_input("  AkariClean  "),
+            Some(AppCommand::Clean)
+        );
+        assert_eq!(command_from_input("AKARIHELP"), Some(AppCommand::Help));
+        // Empty / unknown input dispatches to nothing.
+        assert_eq!(command_from_input(""), None);
+        assert_eq!(command_from_input("   "), None);
+        assert_eq!(command_from_input("akaricleen"), None);
+        assert_eq!(command_from_input("format c:"), None);
+    }
+
+    #[test]
+    fn allowed_phases_isolate_cleanup_and_repair() {
+        assert_eq!(AppCommand::Clean.allowed_phases(), &[Phase::Cleanup]);
+        assert_eq!(AppCommand::Health.allowed_phases(), &[Phase::Repair]);
+        assert_eq!(
+            AppCommand::All.allowed_phases(),
+            &[Phase::Cleanup, Phase::Repair]
+        );
+        assert!(AppCommand::Home.allowed_phases().is_empty());
+        assert!(AppCommand::About.allowed_phases().is_empty());
+        assert!(AppCommand::Help.allowed_phases().is_empty());
+    }
+
+    #[test]
+    fn gates_mint_only_permitted_phases() {
+        let (c, r) = PhaseGate::for_command(AppCommand::Clean);
+        assert!(c.is_some() && r.is_none());
+        let (c, r) = PhaseGate::for_command(AppCommand::Health);
+        assert!(c.is_none() && r.is_some());
+        let (c, r) = PhaseGate::for_command(AppCommand::All);
+        assert!(c.is_some() && r.is_some());
+        for cmd in [AppCommand::Home, AppCommand::About, AppCommand::Help] {
+            let (c, r) = PhaseGate::for_command(cmd);
+            assert!(c.is_none() && r.is_none());
+        }
     }
 
     #[test]

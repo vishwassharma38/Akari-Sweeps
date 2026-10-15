@@ -4,6 +4,7 @@
 //! `WARN_COUNT`, `OVERALL_RC`) so tests can verify orchestration without
 //! touching the real filesystem or Windows servicing stack.
 
+pub mod elevation;
 pub mod process;
 pub mod windows;
 
@@ -18,6 +19,10 @@ pub enum OpStatus {
     Pending,
     Running,
     Success,
+    /// Ran, but the result is unknown or needs attention (e.g. an
+    /// exit code the OS does not document). Counts as a warning, never
+    /// as an error — exit codes only reflect `Failed`.
+    Warning,
     Failed,
     Skipped,
 }
@@ -28,6 +33,7 @@ impl fmt::Display for OpStatus {
             OpStatus::Pending => "pending",
             OpStatus::Running => "running",
             OpStatus::Success => "ok",
+            OpStatus::Warning => "warning",
             OpStatus::Failed => "FAILED",
             OpStatus::Skipped => "skipped",
         };
@@ -85,6 +91,20 @@ impl OpResult {
             label: label.to_string(),
             target: target.to_string(),
             status: OpStatus::Skipped,
+            exit_code: None,
+            detail,
+            files_removed: 0,
+            kb_removed: 0,
+            files_left: 0,
+        }
+    }
+
+    pub fn warning(id: &str, label: &str, target: &str, detail: String) -> Self {
+        Self {
+            id: id.to_string(),
+            label: label.to_string(),
+            target: target.to_string(),
+            status: OpStatus::Warning,
             exit_code: None,
             detail,
             files_removed: 0,

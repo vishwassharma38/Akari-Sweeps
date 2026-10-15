@@ -44,6 +44,13 @@ pub struct App {
     /// Guard against double-start from repeated keypresses/events.
     pub run_token: Option<u64>,
     pub scroll: usize,
+    /// Command-entry field text (visible on every screen).
+    pub input: String,
+    /// When true, keystrokes edit `input`; shortcuts are suspended
+    /// except Enter (submit), Esc (cancel), Backspace, and Ctrl+U (clear).
+    pub input_focused: bool,
+    /// Administrator-elevation state captured at startup.
+    pub elevated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +98,9 @@ impl App {
             status_line: String::new(),
             run_token: None,
             scroll: 0,
+            input: String::new(),
+            input_focused: false,
+            elevated: crate::system::windows::is_elevated(),
         };
         app.sync_animation();
         app
@@ -229,10 +239,14 @@ impl App {
     }
 
     /// Drain all pending worker events without blocking the TUI.
-    pub fn drain_events(&mut self, rx: &Receiver<ExecEvent>) {
+    /// Returns the number drained (drives redraw scheduling).
+    pub fn drain_events(&mut self, rx: &Receiver<ExecEvent>) -> usize {
+        let mut n = 0;
         while let Ok(ev) = rx.try_recv() {
             self.on_event(ev);
+            n += 1;
         }
+        n
     }
 
     pub fn mark_started(&mut self, token: u64) {
@@ -242,6 +256,39 @@ impl App {
         self.operations.clear();
         self.summary = None;
         self.sync_animation();
+    }
+
+    /// Focus (`/` key) or unfocus (Esc) the command-entry field.
+    /// Focusing never starts an operation.
+    pub fn set_input_focus(&mut self, focused: bool) {
+        self.input_focused = focused;
+        if focused {
+            self.push_log(
+                "Command entry: type a command, Enter to run, Esc to cancel.".to_string(),
+            );
+        }
+    }
+
+    /// Append typed text to the entry field (called only while focused).
+    pub fn push_input(&mut self, text: &str) {
+        const MAX: usize = 64;
+        for ch in text.chars() {
+            if self.input.len() >= MAX {
+                break;
+            }
+            // Printable characters only; control keys are handled by the caller.
+            if !ch.is_control() {
+                self.input.push(ch);
+            }
+        }
+    }
+
+    pub fn backspace_input(&mut self) {
+        self.input.pop();
+    }
+
+    pub fn clear_input(&mut self) {
+        self.input.clear();
     }
 }
 
@@ -315,5 +362,47 @@ mod tests {
         running.execution = ExecutionState::Done;
         running.sync_animation();
         assert_eq!(running.animator.mode(), AnimationMode::Settled);
+    }
+
+    #[test]
+    fn command_entry_editing_is_safe() {
+        let mut app = App::new(AppCommand::Home);
+        assert!(!app.input_focused);
+        app.set_input_focus(true);
+        assert!(app.input_focused);
+        app.push_input("Akari");
+        app.push_input("Clean");
+        assert_eq!(app.input, "AkariClean");
+        app.backspace_input();
+        assert_eq!(app.input, "AkariClea");
+        app.clear_input();
+        assert!(app.input.is_empty());
+        // Control characters are ignored, never executed.
+        app.push_input("\n\t");
+        assert!(app.input.is_empty());
+        app.set_input_focus(false);
+        assert!(!app.input_focused);
+    }
+
+    #[test]
+    fn finishing_a_workflow_spawns_nothing() {
+        use crate::system::RunTotals;
+        let mut app = App::new(AppCommand::Clean);
+        app.mark_started(1);
+        assert!(app.worker_running);
+        let summary = AppSummary::compute(
+            "completed".into(),
+            "not run - cleanup only".into(),
+            false,
+            RunTotals::default(),
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        assert!(app.on_event(ExecEvent::Finished(summary)));
+        assert_eq!(app.execution, ExecutionState::Done);
+        assert!(!app.worker_running);
+        // No further events are produced by completion itself.
     }
 }

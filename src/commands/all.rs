@@ -5,17 +5,40 @@
 //! without a second prompt; the final summary still reports each phase
 //! honestly (a failed cleanup does not silently cancel repair, and the
 //! overall status is never "success" when a required phase failed).
+//!
+//! Failure policy (explicit, matching the BAT's continuation behavior):
+//! cleanup errors never block the repair stage — repair always runs after
+//! cleanup finishes — but any error poisons the combined summary, so the
+//! overall status and exit code can never report success when a required
+//! phase failed.
 
 use crate::commands::clean::run_cleanup_phase;
 use crate::commands::health::run_repair_phase;
+use crate::commands::{CleanupGate, PhaseGate, RepairGate};
 use crate::system::windows::free_space_kb;
 use crate::system::{AppSummary, ExecEvent, MaintenanceRunner, RunTotals};
 
 /// Run cleanup, then repair, merging totals like the BAT summary.
 /// `repair_already_entered` is the `REPAIR_ENTERED` guard (always false on
 /// a fresh `akariall` run; exposed for tests).
+///
+/// Gates are minted here — the only place holding both — and each phase
+/// receives only its own: cleanup runs strictly before repair, repair
+/// never runs concurrently, and cleaning is never started a second time.
 pub fn run_all_phases(
     runner: &mut dyn MaintenanceRunner,
+    repair_already_entered: bool,
+) -> AppSummary {
+    let (cleanup_gate, repair_gate) = PhaseGate::for_command(crate::commands::AppCommand::All);
+    let cleanup_gate = cleanup_gate.expect("All allows cleanup");
+    let repair_gate = repair_gate.expect("All allows repair");
+    run_all_phases_gated(runner, &cleanup_gate, &repair_gate, repair_already_entered)
+}
+
+fn run_all_phases_gated(
+    runner: &mut dyn MaintenanceRunner,
+    cleanup_gate: &CleanupGate,
+    repair_gate: &RepairGate,
     repair_already_entered: bool,
 ) -> AppSummary {
     let free_before = free_space_kb();
@@ -24,13 +47,14 @@ pub fn run_all_phases(
         "akariall: running cleanup followed by system-image repair.".to_string(),
     ));
 
-    // Phase 1: cleanup (always runs).
-    let (cleanup_results, mut totals) = run_cleanup_phase(runner);
+    // Phase 1: cleanup runs to completion (errors recorded, never fatal).
+    let (cleanup_results, mut totals) = run_cleanup_phase(runner, cleanup_gate);
     let free_after = free_space_kb();
 
-    // Phase 2: repair (runs after cleanup; never concurrent).
+    // Phase 2: repair starts only after cleanup finished; never concurrent.
     let err_at_repair_start = totals.err_count;
-    let (repair_results, repair_totals, entered) = run_repair_phase(runner, repair_already_entered);
+    let (repair_results, repair_totals, entered) =
+        run_repair_phase(runner, repair_gate, repair_already_entered);
 
     // Merge repair bookkeeping into the shared totals.
     let merged = RunTotals {
@@ -79,6 +103,7 @@ pub fn run_all_phases(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::runner::test_support::RecordingRunner;
     use crate::system::{DirOutcome, ProgramOutcome};
     use std::path::Path;
 
@@ -105,6 +130,11 @@ mod tests {
             false
         }
         fn emit(&mut self, _: ExecEvent) {}
+    }
+
+    fn gates() -> (CleanupGate, RepairGate) {
+        let (c, r) = PhaseGate::for_command(crate::commands::AppCommand::All);
+        (c.unwrap(), r.unwrap())
     }
 
     #[test]
@@ -148,5 +178,44 @@ mod tests {
         let summary = run_all_phases(&mut m, false);
         assert!(summary.exit_code != 0);
         assert!(summary.repair_status.contains("failure"));
+    }
+
+    // --- Requirement 3 regression tests (invocation order + isolation) ---
+
+    #[test]
+    fn combined_runs_every_cleanup_before_first_repair() {
+        let mut r = RecordingRunner::new();
+        let (cg, rg) = gates();
+        let _ = run_cleanup_phase(&mut r, &cg);
+        // Simulate the real sequencing: repair starts after cleanup ends.
+        let _ = run_repair_phase(&mut r, &rg, false);
+        assert!(!r.cleanup_dir_calls().is_empty());
+        assert_eq!(r.repair_calls().len(), 5);
+        assert!(
+            r.cleanup_before_repair(),
+            "every cleanup op must finish before the first repair op starts"
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_still_runs_repair_but_poisons_summary() {
+        // Documented failure policy: repair is not skipped, success is
+        // never reported.
+        let mut r = RecordingRunner::failing(&[
+            ("npm cache clean --force", 1),
+            (
+                "DISM.exe /Online /Cleanup-Image /StartComponentCleanup",
+                1726,
+            ),
+        ]);
+        let summary = run_all_phases(&mut r, false);
+        assert_eq!(
+            r.repair_calls().len(),
+            5,
+            "repair must still run after cleanup errors"
+        );
+        assert!(summary.exit_code != 0, "errors must poison the summary");
+        assert!(!summary.totals.errors.is_empty());
+        assert!(r.cleanup_before_repair());
     }
 }

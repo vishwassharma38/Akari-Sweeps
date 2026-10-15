@@ -34,6 +34,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             Constraint::Length(3),
             Constraint::Min(8),
             Constraint::Length(3),
+            Constraint::Length(3),
         ])
         .split(area);
 
@@ -60,6 +61,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     let status = Paragraph::new(status_text(app))
         .block(Block::default().borders(Borders::ALL).title(" Status "));
     frame.render_widget(status, vertical[2]);
+
+    // Command-entry field (visible on every screen).
+    render_command_entry(frame, app, vertical[3]);
 }
 
 fn screen_subtitle(app: &App) -> String {
@@ -114,6 +118,7 @@ fn render_maintenance(frame: &mut Frame, app: &App, area: Rect) {
                 OpStatus::Pending => ("○", Color::DarkGray),
                 OpStatus::Running => ("◐", Color::Yellow),
                 OpStatus::Success => ("✓", Color::Green),
+                OpStatus::Warning => ("!", Color::Yellow),
                 OpStatus::Failed => ("✗", Color::Red),
                 OpStatus::Skipped => ("–", Color::DarkGray),
             };
@@ -205,10 +210,36 @@ fn status_text(app: &App) -> String {
         crate::app::ExecutionState::Done => "done",
         crate::app::ExecutionState::Error => "error",
     };
+    let elev = if app.elevated { "admin" } else { "not admin" };
     format!(
-        "[{}] exit={} · 1-6 commands · c clean · r repair · ? help · q/Esc quit",
-        exec, app.exit_code
+        "[{}|{}] exit={} · 1-5 select · / input · c clean · r repair · ? help · q/Esc quit",
+        exec, elev, app.exit_code
     )
+}
+
+/// Dedicated command-entry field. `/` focuses it (shortcuts suspend
+/// while typing); Enter submits through the same dispatch as number
+/// keys; Esc unfocuses; Backspace edits; Ctrl+U clears.
+fn render_command_entry(frame: &mut Frame, app: &App, area: Rect) {
+    let (title, hint) = if app.input_focused {
+        (" Command (typing — Enter runs, Esc cancels) ", "▌")
+    } else {
+        (" Command ( / to type ) ", "")
+    };
+    let body = format!("> {}{}", app.input, hint);
+    let entry = Paragraph::new(Line::from(vec![
+        Span::raw(body),
+        Span::styled(
+            if app.input_focused {
+                "  [Enter] run · [Esc] cancel · [⌫] edit · [Ctrl+U] clear"
+            } else {
+                "  type 1-5 or press / and type a command name"
+            },
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]))
+    .block(Block::default().borders(Borders::ALL).title(title));
+    frame.render_widget(entry, area);
 }
 
 fn render_compact(frame: &mut Frame, app: &App, area: Rect) {
@@ -239,9 +270,61 @@ fn render_compact(frame: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::AppCommand;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn product_label_constant() {
         assert_eq!(PRODUCT_LABEL, "Akari-Sweeps_V00.1");
+    }
+
+    fn buffer_text(width: u16, height: u16, app: &App) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn home_lists_five_commands_not_the_launcher() {
+        let app = crate::app::App::new(AppCommand::Home);
+        let text = buffer_text(100, 28, &app);
+        assert!(text.contains(PRODUCT_LABEL));
+        for name in [
+            "akariclean",
+            "akarihealth",
+            "akariall",
+            "akariabout",
+            "akarihelp",
+        ] {
+            assert!(text.contains(name), "missing selectable {name}");
+        }
+        // `akari` as a bare selectable entry must not appear; the numbered
+        // rows carry only the five public names.
+        assert!(!text.contains("6  "), "must not offer six items");
+    }
+
+    #[test]
+    fn missing_sprites_fall_back_without_crashing() {
+        let mut app = crate::app::App::new(AppCommand::Home);
+        app.frames.clear();
+        app.sprite_error = Some("test: assets missing".to_string());
+        let text = buffer_text(100, 28, &app);
+        assert!(text.contains(PRODUCT_LABEL));
+        assert!(text.contains("test: assets missing"));
+    }
+
+    #[test]
+    fn tiny_terminal_degrades_gracefully() {
+        let app = crate::app::App::new(AppCommand::Home);
+        let text = buffer_text(40, 10, &app);
+        assert!(text.contains(PRODUCT_LABEL));
     }
 }

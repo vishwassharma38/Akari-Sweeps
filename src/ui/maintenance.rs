@@ -17,7 +17,7 @@ pub fn progress_line(app: &App) -> String {
         .filter(|o| {
             matches!(
                 o.status,
-                OpStatus::Success | OpStatus::Failed | OpStatus::Skipped
+                OpStatus::Success | OpStatus::Warning | OpStatus::Failed | OpStatus::Skipped
             )
         })
         .count();
@@ -26,7 +26,12 @@ pub fn progress_line(app: &App) -> String {
         .iter()
         .filter(|o| o.status == OpStatus::Failed)
         .count();
-    format!("{done}/{total} settled · {failed} failed")
+    let warned = app
+        .operations
+        .iter()
+        .filter(|o| o.status == OpStatus::Warning)
+        .count();
+    format!("{done}/{total} settled · {failed} failed · {warned} warnings")
 }
 
 pub fn summary_lines(app: &App) -> Vec<Line<'static>> {

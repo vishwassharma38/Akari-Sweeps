@@ -75,17 +75,36 @@ impl Animator {
         }
     }
 
-    /// Advance on elapsed wall-clock ms. Returns true when the frame changed.
+    /// Advance on monotonic wall-clock ms. Returns true when the frame
+    /// changed. Deadline-based with resync: the clock is anchored to
+    /// `now_ms` after advancing, so timing never accumulates drift, and
+    /// a long stall advances by whole elapsed intervals at once instead
+    /// of queuing a backlog (no spiral, no busy loop).
     pub fn tick(&mut self, now_ms: u64) -> bool {
         if self.mode == AnimationMode::Settled {
             return false;
         }
-        if now_ms.wrapping_sub(self.last_advance_ms) >= self.interval_ms() {
+        let interval = self.interval_ms();
+        let elapsed = now_ms.wrapping_sub(self.last_advance_ms);
+        if elapsed >= interval {
+            let steps = elapsed / interval;
             self.last_advance_ms = now_ms;
-            self.frame = (self.frame + 1) % self.frame_count;
+            self.frame =
+                (self.frame + (steps % self.frame_count as u64) as usize) % self.frame_count;
             return true;
         }
         false
+    }
+
+    /// Milliseconds until the next frame is due (saturating). The event
+    /// loop polls for at most this long (capped), so frames land on time
+    /// without blocking keyboard input.
+    pub fn ms_until_next_frame(&self, now_ms: u64) -> u64 {
+        if self.mode == AnimationMode::Settled {
+            return u64::MAX;
+        }
+        let interval = self.interval_ms();
+        interval.saturating_sub(now_ms.wrapping_sub(self.last_advance_ms))
     }
 
     /// Pure helper for tests: frame index at tick `n`.
@@ -122,6 +141,41 @@ mod tests {
         let held = a.current_frame();
         assert!(!a.tick(held as u64 + 10_000_000));
         assert_eq!(a.current_frame(), SWEEP_FRAMES - 1);
+    }
+
+    #[test]
+    fn playback_targets_six_fps_without_drift() {
+        // 6 FPS == ~166.7 ms per frame.
+        assert_eq!(SWEEP_INTERVAL_MS, 167);
+        let mut a = Animator::new(AnimationSet::Sweep);
+        a.set_mode(AnimationMode::Sweeping);
+        // Simulate 2 s of deadline ticks: expect 12 advances (±1 edge).
+        let mut advances = 0;
+        let mut t = 0u64;
+        while t <= 2000 {
+            if a.tick(t) {
+                advances += 1;
+            }
+            t += 10;
+        }
+        assert!(
+            (11..=13).contains(&advances),
+            "expected ~12 frames in 2 s, got {advances}"
+        );
+    }
+
+    #[test]
+    fn stall_resyncs_without_backlog_spiral() {
+        let mut a = Animator::new(AnimationSet::Sweep);
+        a.set_mode(AnimationMode::Sweeping);
+        a.tick(167);
+        // A 10 s stall: one tick catches up (modulo frame count)…
+        assert!(a.tick(10_167));
+        // …and the very next tick has nothing to do (no backlog).
+        assert!(!a.tick(10_167));
+        assert!(!a.tick(10_200));
+        // Scheduling resumes on deadline.
+        assert_eq!(a.ms_until_next_frame(10_200), SWEEP_INTERVAL_MS - 33);
     }
 
     #[test]

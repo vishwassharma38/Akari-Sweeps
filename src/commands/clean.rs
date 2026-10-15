@@ -3,9 +3,7 @@
 //! Authority: `Akari-Sweeps.bat`. No extra deletion targets. Every
 //! `CleanDir` call below appears in the same order as the script.
 
-use crate::system::{
-    ExecEvent, MaintenanceRunner, OpResult, OpStatus, RunTotals, expand_windows_template,
-};
+use crate::system::{ExecEvent, MaintenanceRunner, OpResult, RunTotals, expand_windows_template};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -519,7 +517,16 @@ fn tail(s: &str, max: usize) -> String {
 
 /// Execute the full cleanup phase. Returns (results, totals).
 /// Never panics on missing env vars, locked files, or absent programs.
-pub fn run_cleanup_phase(runner: &mut dyn MaintenanceRunner) -> (Vec<OpResult>, RunTotals) {
+///
+/// The `CleanupGate` proves the caller is authorized for the cleanup
+/// phase (see `PhaseGate::for_command`). This function holds no repair
+/// gate, so it cannot invoke the repair phase — isolation is structural,
+/// not just conventional. It invokes zero repair-phase commands
+/// (no DISM health check/scan/restore, no SFC, no CHKDSK).
+pub fn run_cleanup_phase(
+    runner: &mut dyn MaintenanceRunner,
+    _gate: &crate::commands::CleanupGate,
+) -> (Vec<OpResult>, RunTotals) {
     let mut totals = RunTotals::default();
     let mut results: Vec<OpResult> = Vec::new();
 
@@ -827,7 +834,9 @@ pub fn run_cleanup_phase(runner: &mut dyn MaintenanceRunner) -> (Vec<OpResult>, 
                 "Recycle Bin command returned exit code {}; the result could not be verified.",
                 out.exit_code
             ));
-            let mut r = OpResult::failed(
+            // BAT records this as a warning, not an error: unknown result,
+            // honestly reported as `Warning` rather than success or failure.
+            let mut r = OpResult::warning(
                 "clean:recyclebin",
                 "17/18 RECYCLE BIN",
                 "Recycle Bin",
@@ -837,9 +846,6 @@ pub fn run_cleanup_phase(runner: &mut dyn MaintenanceRunner) -> (Vec<OpResult>, 
                 ),
             );
             r.exit_code = Some(out.exit_code);
-            r.status = OpStatus::Failed;
-            // BAT records this as warning, not error: downgrade.
-            totals.err_count = totals.err_count.saturating_sub(0);
             results.push(r);
         }
     }
@@ -871,7 +877,7 @@ pub fn run_cleanup_phase(runner: &mut dyn MaintenanceRunner) -> (Vec<OpResult>, 
                 "Disk Cleanup exited with code {}; its exit codes are not documented, so the result is unknown.",
                 out.exit_code
             ));
-            let mut r = OpResult::failed(
+            let mut r = OpResult::warning(
                 "clean:cleanmgr",
                 "18/18 DISK CLEANUP",
                 "cleanmgr /verylowdisk",
@@ -924,7 +930,7 @@ pub fn run_cleanup_phase(runner: &mut dyn MaintenanceRunner) -> (Vec<OpResult>, 
                 }
                 2 => {
                     totals.add_warning("SilentCleanup was still running after 20 minutes; the script continued without waiting.".to_string());
-                    results.push(OpResult::failed(
+                    results.push(OpResult::warning(
                         "clean:silent",
                         "18/18 SILENTCLEANUP",
                         "SilentCleanup task",
@@ -936,7 +942,7 @@ pub fn run_cleanup_phase(runner: &mut dyn MaintenanceRunner) -> (Vec<OpResult>, 
                         "SilentCleanup was started, but its completion could not be verified."
                             .to_string(),
                     );
-                    results.push(OpResult::failed(
+                    results.push(OpResult::warning(
                         "clean:silent",
                         "18/18 SILENTCLEANUP",
                         "SilentCleanup task",
@@ -949,7 +955,7 @@ pub fn run_cleanup_phase(runner: &mut dyn MaintenanceRunner) -> (Vec<OpResult>, 
                 "SilentCleanup task could not be started; schtasks exit code {}.",
                 out.exit_code
             ));
-            results.push(OpResult::failed(
+            results.push(OpResult::warning(
                 "clean:silent",
                 "18/18 SILENTCLEANUP",
                 "SilentCleanup task",
@@ -969,12 +975,18 @@ pub fn run_cleanup_phase(runner: &mut dyn MaintenanceRunner) -> (Vec<OpResult>, 
         for line in out.stdout.lines().take(8) {
             emit(runner, ExecEvent::Log(line.to_string()));
         }
-        let r = record_dism(
+        let mut r = record_dism(
             &mut totals,
             "StartComponentCleanup",
             out.exit_code,
             &tail(&out.stdout, 160),
         );
+        // Relabel: this is the BAT's [18/18] component-store *cleanup*,
+        // not image repair. The `dism:` identity previously made cleanup
+        // look like it had entered the repair workflow.
+        r.id = "clean:comp-store-cleanup".to_string();
+        r.label = "[18/18] COMPONENT-STORE CLEANUP".to_string();
+        r.target = "DISM /Online /Cleanup-Image /StartComponentCleanup (cleanup phase)".to_string();
         results.push(r);
     }
 
@@ -1005,7 +1017,7 @@ pub fn run_cleanup_phase(runner: &mut dyn MaintenanceRunner) -> (Vec<OpResult>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::system::{DirOutcome, ExecEvent, ProgramOutcome};
+    use crate::system::{DirOutcome, ExecEvent, OpStatus, ProgramOutcome};
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -1126,7 +1138,10 @@ mod tests {
     #[test]
     fn cleanup_runs_all_programs_and_counts_ok() {
         let mut runner = MockRunner::all_ok();
-        let (results, totals) = run_cleanup_phase(&mut runner);
+        let gate = crate::commands::PhaseGate::for_command(crate::commands::AppCommand::Clean)
+            .0
+            .unwrap();
+        let (results, totals) = run_cleanup_phase(&mut runner, &gate);
         assert!(!results.is_empty());
         assert!(totals.ok_count > 0);
         assert_eq!(totals.err_count, 0);
@@ -1142,7 +1157,10 @@ mod tests {
         runner
             .programs
             .insert("npm cache clean --force".to_string(), 1);
-        let (results, totals) = run_cleanup_phase(&mut runner);
+        let gate = crate::commands::PhaseGate::for_command(crate::commands::AppCommand::Clean)
+            .0
+            .unwrap();
+        let (results, totals) = run_cleanup_phase(&mut runner, &gate);
         let npm = results.iter().find(|r| r.id == "clean:npm").unwrap();
         assert_eq!(npm.status, OpStatus::Failed);
         assert_eq!(totals.err_count, 1);
@@ -1180,5 +1198,63 @@ mod tests {
         assert_eq!(after.0, 0);
         assert!(dir.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Requirement 3 regression tests: cleaning never repairs ---
+
+    #[test]
+    fn clean_only_invokes_zero_repair_commands() {
+        use crate::commands::runner::test_support::RecordingRunner;
+        let mut r = RecordingRunner::new();
+        let gate = crate::commands::PhaseGate::for_command(crate::commands::AppCommand::Clean)
+            .0
+            .unwrap();
+        let (results, totals) = run_cleanup_phase(&mut r, &gate);
+        assert!(
+            r.repair_calls().is_empty(),
+            "akariclean invoked repair commands: {:?}",
+            r.repair_calls()
+                .iter()
+                .map(|c| format!("{} {}", c.program, c.args.join(" ")))
+                .collect::<Vec<_>>()
+        );
+        assert!(!r.cleanup_dir_calls().is_empty());
+        assert!(!results.is_empty());
+        // Only the cleanup phase announced itself; no repair phase entered.
+        let _ = totals;
+    }
+
+    #[test]
+    fn clean_error_paths_never_trigger_repair() {
+        use crate::commands::runner::test_support::RecordingRunner;
+        // Every fallible program fails: error handling must still stay
+        // inside the cleanup phase.
+        let mut r = RecordingRunner::failing(&[
+            ("npm cache clean --force", 1),
+            ("pip cache purge", 1),
+            ("ipconfig /flushdns", 1),
+            (
+                "powershell -NoProfile -ExecutionPolicy Bypass -Command Clear-RecycleBin -Force -ErrorAction SilentlyContinue",
+                1,
+            ),
+            ("cleanmgr.exe /verylowdisk", 3),
+            (
+                "schtasks.exe /Run /TN \\Microsoft\\Windows\\DiskCleanup\\SilentCleanup",
+                1,
+            ),
+            (
+                "DISM.exe /Online /Cleanup-Image /StartComponentCleanup",
+                1726,
+            ),
+        ]);
+        let gate = crate::commands::PhaseGate::for_command(crate::commands::AppCommand::Clean)
+            .0
+            .unwrap();
+        let (_results, totals) = run_cleanup_phase(&mut r, &gate);
+        assert!(
+            r.repair_calls().is_empty(),
+            "cleanup error handling invoked repair"
+        );
+        assert!(totals.err_count > 0);
     }
 }

@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 pub const SWEEP_WIDTH: u32 = 256;
 pub const SWEEP_HEIGHT: u32 = 320;
 pub const SWEEP_FRAMES: usize = 8;
-/// ~5.5 fps: smooth without wasting CPU.
-pub const SWEEP_INTERVAL_MS: u64 = 180;
+/// Target 6 frames per second (≈166.7 ms per frame). All animation sets
+/// share this timing policy through `Animator`.
+pub const SWEEP_INTERVAL_MS: u64 = 167;
 
 #[derive(Debug)]
 pub enum SpriteError {

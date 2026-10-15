@@ -1,5 +1,8 @@
-//! Home screen content.
-use crate::commands::COMMAND_CATALOGUE;
+//! Home screen content: the five selectable commands.
+//!
+//! `akari` launches this interface and is therefore not a selectable
+//! item inside it (see `SELECTABLE_COMMANDS`).
+use crate::commands::SELECTABLE_COMMANDS;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
@@ -11,10 +14,10 @@ pub fn lines() -> Vec<Line<'static>> {
         )),
         Line::from(""),
     ];
-    for cmd in COMMAND_CATALOGUE {
+    for (i, cmd) in SELECTABLE_COMMANDS.iter().enumerate() {
         out.push(Line::from(vec![
             Span::styled(
-                format!("  {:<12}", cmd.public_name()),
+                format!("  {}  {:<12}", i + 1, cmd.public_name()),
                 Style::default().fg(Color::Yellow),
             ),
             Span::raw(format!("— {}", cmd.description())),
@@ -22,7 +25,7 @@ pub fn lines() -> Vec<Line<'static>> {
     }
     out.push(Line::from(""));
     out.push(Line::from(
-        "Keys: 1-6 run a command · ? help · a about · q/Esc quit.",
+        "Keys: 1-5 select · / command entry · ? help · a about · q/Esc quit.",
     ));
     out.push(Line::from(
         "Cleanup/repair start only from their explicit commands.",

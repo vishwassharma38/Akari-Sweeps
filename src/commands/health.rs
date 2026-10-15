@@ -154,8 +154,15 @@ pub fn record_chkdsk(totals: &mut RunTotals, exit_code: i32, drive: &str) -> OpR
 
 /// Execute the repair phase once (BAT guards re-entry with `REPAIR_ENTERED`).
 /// Returns (results, entered). When `already_entered`, warns and runs nothing.
+///
+/// The `RepairGate` proves the caller is authorized for the repair phase
+/// (see `PhaseGate::for_command`). This function holds no cleanup gate,
+/// so it cannot delete temporary files or invoke cleanup — isolation is
+/// structural. It invokes only the five repair commands
+/// (DISM Check/Scan/RestoreHealth, SFC, CHKDSK).
 pub fn run_repair_phase(
     runner: &mut dyn MaintenanceRunner,
+    _gate: &crate::commands::RepairGate,
     already_entered: bool,
 ) -> (Vec<OpResult>, RunTotals, bool) {
     let mut totals = RunTotals::default();
@@ -278,12 +285,18 @@ mod tests {
         }
     }
 
+    fn repair_gate() -> crate::commands::RepairGate {
+        crate::commands::PhaseGate::for_command(crate::commands::AppCommand::Health)
+            .1
+            .unwrap()
+    }
+
     #[test]
     fn repair_runs_once_guard() {
         let mut m = Mock {
             codes: HashMap::new(),
         };
-        let (results, _, entered) = run_repair_phase(&mut m, true);
+        let (results, _, entered) = run_repair_phase(&mut m, &repair_gate(), true);
         assert!(entered);
         assert!(results.is_empty());
     }
@@ -317,10 +330,58 @@ mod tests {
         let mut m = Mock {
             codes: HashMap::new(),
         };
-        let (results, totals, entered) = run_repair_phase(&mut m, false);
+        let (results, totals, entered) = run_repair_phase(&mut m, &repair_gate(), false);
         assert!(entered);
         assert_eq!(results.len(), 5);
         assert_eq!(totals.err_count, 0);
         assert_eq!(totals.ok_count, 5);
+    }
+
+    // --- Requirement 3 regression tests: repair never cleans ---
+
+    #[test]
+    fn health_only_invokes_zero_cleaning_commands() {
+        use crate::commands::runner::test_support::RecordingRunner;
+        let mut r = RecordingRunner::new();
+        let (results, totals, entered) = run_repair_phase(&mut r, &repair_gate(), false);
+        assert!(entered);
+        assert_eq!(results.len(), 5);
+        assert!(
+            r.cleanup_dir_calls().is_empty(),
+            "akarihealth deleted files: {:?}",
+            r.cleanup_dir_calls()
+                .iter()
+                .map(|c| c.dir.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            r.cleanup_program_calls().is_empty(),
+            "akarihealth ran cleanup programs: {:?}",
+            r.cleanup_program_calls()
+                .iter()
+                .map(|c| format!("{} {}", c.program, c.args.join(" ")))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(r.repair_calls().len(), 5);
+        let _ = totals;
+    }
+
+    #[test]
+    fn repair_error_paths_never_trigger_cleaning() {
+        use crate::commands::runner::test_support::RecordingRunner;
+        // Every repair command fails: error handling must stay in-phase.
+        let mut r = RecordingRunner::failing(&[
+            ("DISM.exe /Online /Cleanup-Image /CheckHealth", 1726),
+            ("DISM.exe /Online /Cleanup-Image /ScanHealth", 1726),
+            ("DISM.exe /Online /Cleanup-Image /RestoreHealth", 1726),
+            ("sfc /scannow", 1),
+        ]);
+        let (results, totals, _) = run_repair_phase(&mut r, &repair_gate(), false);
+        assert!(r.cleanup_dir_calls().is_empty());
+        assert!(r.cleanup_program_calls().is_empty());
+        // chkdsk uses the live system drive; only the four scripted
+        // failures are asserted here via totals.
+        assert!(totals.err_count >= 4, "failures must be recorded");
+        assert_eq!(results.len(), 5);
     }
 }
