@@ -1,0 +1,10 @@
+[package]
+name = "akari-sweeps"
+version = "0.1.0"
+edition = "2024"
+description = "A small Windows maintenance TUI featuring Akari."
+license = "MIT"
+
+[dependencies]
+crossterm = "0.29"
+ratatui = "0.30"
