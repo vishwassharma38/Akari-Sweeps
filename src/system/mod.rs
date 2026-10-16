@@ -6,7 +6,10 @@
 
 pub mod elevation;
 pub mod process;
+pub mod progress;
 pub mod windows;
+
+pub use progress::ProgressState;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -54,6 +57,11 @@ pub struct OpResult {
     pub files_removed: u64,
     pub kb_removed: u64,
     pub files_left: u64,
+    /// Wall-clock time spent in this operation (orchestration + external
+    /// process wait), measured with a monotonic clock. `None` when the
+    /// operation was skipped without running or when timing was
+    /// unavailable. Lightweight diagnostics only — never used for progress.
+    pub duration_ms: Option<u64>,
 }
 
 impl OpResult {
@@ -68,6 +76,7 @@ impl OpResult {
             files_removed: 0,
             kb_removed: 0,
             files_left: 0,
+            duration_ms: None,
         }
     }
 
@@ -82,6 +91,7 @@ impl OpResult {
             files_removed: 0,
             kb_removed: 0,
             files_left: 0,
+            duration_ms: None,
         }
     }
 
@@ -96,6 +106,7 @@ impl OpResult {
             files_removed: 0,
             kb_removed: 0,
             files_left: 0,
+            duration_ms: None,
         }
     }
 
@@ -110,6 +121,7 @@ impl OpResult {
             files_removed: 0,
             kb_removed: 0,
             files_left: 0,
+            duration_ms: None,
         }
     }
 }
@@ -161,6 +173,12 @@ pub enum ExecEvent {
     PhaseFinished {
         name: String,
     },
+    /// Evidence-based progress snapshot. Emitted once with the stable
+    /// operation total, then after each completed work unit (and once
+    /// before each opaque long-running task to show the working state
+    /// without advancing the percentage). Single coherent source — the UI
+    /// never invents progress from timers.
+    Progress(ProgressState),
     Finished(AppSummary),
     Error(String),
 }

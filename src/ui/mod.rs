@@ -68,7 +68,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
 fn screen_subtitle(app: &App) -> String {
     match app.screen {
-        Screen::Home => format!("home — {} · ? help · q quit", app.command.public_name()),
+        Screen::Home => format!("home — {} · q quit", app.command.public_name()),
         Screen::Maintenance => format!(
             "maintenance — {} · {} · back/- home · q quit",
             app.command.public_name(),
@@ -204,6 +204,35 @@ fn render_animation_panel(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn status_text(app: &App) -> String {
+    // During maintenance operations the Status panel is the accurate,
+    // continuously updated progress bar (spec: `Status: [====----] 76.4%`).
+    // While work is actively running it shows only the progress display
+    // and its directly associated execution/elevation indicators — the
+    // idle keyboard hints stay hidden until the run settles. Once the
+    // run is Done/Error the navigation hints return. Elsewhere the
+    // status line remains the idle/exec-state line. Error details stay
+    // in the operations list + output log; the bar never hides failures.
+    if app.screen == Screen::Maintenance
+        && matches!(
+            app.execution,
+            crate::app::ExecutionState::Running
+                | crate::app::ExecutionState::Done
+                | crate::app::ExecutionState::Error
+        )
+    {
+        let bar = maintenance::progress_bar_line(app);
+        let exec = match app.execution {
+            crate::app::ExecutionState::Idle => "idle",
+            crate::app::ExecutionState::Running => "running",
+            crate::app::ExecutionState::Done => "done",
+            crate::app::ExecutionState::Error => "error",
+        };
+        let elev = if app.elevated { "admin" } else { "not admin" };
+        if app.execution == crate::app::ExecutionState::Running {
+            return format!("{bar} · [{exec}|{elev}]");
+        }
+        return format!("{bar} · [{exec}|{elev}] · -/back home · q quit");
+    }
     let exec = match app.execution {
         crate::app::ExecutionState::Idle => "idle",
         crate::app::ExecutionState::Running => "running",
@@ -212,8 +241,8 @@ fn status_text(app: &App) -> String {
     };
     let elev = if app.elevated { "admin" } else { "not admin" };
     format!(
-        "[{}|{}] exit={} · 1-5 select · / input · -/back home · c clean · r repair · ? help · q/Esc quit",
-        exec, elev, app.exit_code
+        "[{}|{}] · 1-5 select · / input · -/back home · q/Esc quit",
+        exec, elev
     )
 }
 
@@ -449,5 +478,165 @@ mod tests {
         );
         // Status bar advertises -/back without claiming 1 exits.
         assert!(status_text(&done).contains("-/back"));
+    }
+
+    #[test]
+    fn running_status_hides_idle_hints_but_keeps_progress() {
+        use crate::system::ProgressState;
+
+        // Idle: the normal status text with keyboard hints stays visible.
+        let idle = crate::app::App::new(AppCommand::Home);
+        let idle_text = status_text(&idle);
+        assert!(idle_text.contains("1-5 select"), "idle keeps hints");
+        assert!(idle_text.contains("/ input"));
+        assert!(idle_text.contains("-/back home"));
+        assert!(idle_text.contains("q/Esc quit"));
+
+        // Running (cleanup, repair, combined): progress display only —
+        // no idle keyboard hints and no idle badge, while progress
+        // information and the running indicator stay visible.
+        for cmd in [AppCommand::Clean, AppCommand::Health, AppCommand::All] {
+            let mut running = crate::app::App::new(cmd);
+            running.screen = crate::app::Screen::Maintenance;
+            running.execution = crate::app::ExecutionState::Running;
+            running.progress = ProgressState::new(2, 6, "working…".to_string());
+            let s = status_text(&running);
+            assert!(s.contains("Status:"), "progress visible ({cmd:?}): {s}");
+            assert!(s.contains('%'), "percentage visible ({cmd:?}): {s}");
+            assert!(s.contains("[running|"), "running indicator kept: {s}");
+            for hint in [
+                "1-5 select",
+                "/ input",
+                "-/back home",
+                "q/Esc quit",
+                "q quit",
+                "[idle|",
+            ] {
+                assert!(!s.contains(hint), "running hides {hint:?} ({cmd:?}): {s}");
+            }
+        }
+
+        // Cancelled progress while still running: same progress-only bar.
+        let mut cancelled = crate::app::App::new(AppCommand::Clean);
+        cancelled.screen = crate::app::Screen::Maintenance;
+        cancelled.execution = crate::app::ExecutionState::Running;
+        let mut p = ProgressState::new(2, 6, "DISM ScanHealth".to_string());
+        p.cancelled = true;
+        cancelled.progress = p;
+        let s = status_text(&cancelled);
+        assert!(s.contains("cancelled"), "cancellation shown: {s}");
+        assert!(!s.contains("1-5 select") && !s.contains("-/back home"));
+
+        // Settled states restore the navigation hints.
+        for exec in [
+            crate::app::ExecutionState::Done,
+            crate::app::ExecutionState::Error,
+        ] {
+            let mut settled = crate::app::App::new(AppCommand::Clean);
+            settled.screen = crate::app::Screen::Maintenance;
+            settled.execution = exec;
+            settled.progress = ProgressState::new(6, 6, "done".to_string());
+            let s = status_text(&settled);
+            assert!(s.contains("Status:"), "progress kept ({exec:?}): {s}");
+            assert!(
+                s.contains("-/back home") && s.contains("q quit"),
+                "settled restores hints ({exec:?}): {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn removed_shortcut_hints_no_longer_appear() {
+        // Removed single-key hints (`c`, `r`, `?`, `a`), the `exit=`
+        // status display, and the retired one-means-exit notice must be
+        // gone from every rendered screen; retained navigation
+        // (1-5, /, -/back, q/Esc) stays.
+        for cmd in [
+            AppCommand::Home,
+            AppCommand::Clean,
+            AppCommand::Health,
+            AppCommand::All,
+            AppCommand::About,
+            AppCommand::Help,
+        ] {
+            let app = crate::app::App::new(cmd);
+            let text = buffer_text(120, 30, &app);
+            assert!(
+                !text.contains("c clean"),
+                "c clean hint must be gone ({cmd:?}): {text}"
+            );
+            assert!(
+                !text.contains("r repair"),
+                "r repair hint must be gone ({cmd:?})"
+            );
+            assert!(
+                !text.contains("? help"),
+                "? help hint must be gone ({cmd:?})"
+            );
+            assert!(
+                !text.contains("press ?"),
+                "press ? hint must be gone ({cmd:?})"
+            );
+            assert!(
+                !text.contains("c re-runs"),
+                "c re-runs hint must be gone ({cmd:?})"
+            );
+            assert!(
+                !text.contains("a about"),
+                "a about hint must be gone ({cmd:?}): {text}"
+            );
+            assert!(
+                !text.contains("exit="),
+                "exit= display must be gone ({cmd:?}): {text}"
+            );
+            assert!(
+                !text.contains("never means exit"),
+                "never-means-exit message must be gone ({cmd:?}): {text}"
+            );
+            // Help screen must not advertise removed single-key reruns.
+            if cmd == AppCommand::Help {
+                assert!(
+                    !text.contains("r repair"),
+                    "help must not advertise r repair"
+                );
+            }
+        }
+        // Status bars never advertise removed shortcuts and never show
+        // the exit-code display.
+        for cmd in [
+            AppCommand::Home,
+            AppCommand::About,
+            AppCommand::Help,
+            AppCommand::Clean,
+            AppCommand::Health,
+            AppCommand::All,
+        ] {
+            let app = crate::app::App::new(cmd);
+            let s = status_text(&app);
+            assert!(!s.contains("c clean"), "status must not show c clean");
+            assert!(!s.contains("r repair"), "status must not show r repair");
+            assert!(!s.contains("? help"), "status must not show ? help");
+            assert!(!s.contains("a about"), "status must not show a about");
+            assert!(!s.contains("exit="), "status must not show exit=");
+        }
+        // Startup log and home/help content carry no removed hints.
+        let home = crate::app::App::new(AppCommand::Home);
+        for line in &home.log {
+            assert!(
+                !line.contains("press ?"),
+                "startup log must not say press ?"
+            );
+        }
+        for line in crate::ui::home::lines() {
+            let s = format!("{line:?}");
+            assert!(!s.contains("? help"), "home must not show ? help: {s}");
+        }
+        for line in crate::ui::help::lines() {
+            let s = format!("{line:?}");
+            assert!(
+                !s.contains("c re-runs") && !s.contains("r repair"),
+                "help must not advertise c/r reruns: {s}"
+            );
+        }
     }
 }

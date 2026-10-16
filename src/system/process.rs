@@ -56,7 +56,7 @@ pub fn run_program_capture(program: &str, args: &[&str]) -> ProgramOutcome {
 }
 
 /// Probe whether `program` resolves on PATH (`where` on Windows,
-/// `command -v`-equivalent fallback elsewhere).
+/// direct `PATH` lookup elsewhere — no shell spawn).
 pub fn program_exists(program: &str) -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -70,13 +70,35 @@ pub fn program_exists(program: &str) -> bool {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        Command::new("sh")
-            .args(["-c", &format!("command -v {program}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        // Avoid `sh -c "command -v …"`: a direct PATH search spawns no
+        // shell and is deterministic in tests. Handles absolute/relative
+        // paths plus bare names resolved via `PATH`.
+        use std::os::unix::fs::PermissionsExt as _;
+        let p = std::path::Path::new(program);
+        if program.contains('/') {
+            return is_executable_file(p);
+        }
+        let Ok(path_var) = std::env::var_os("PATH") else {
+            return false;
+        };
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(program);
+            if is_executable_file(&candidate) {
+                return true;
+            }
+        }
+        return false;
+
+        #[cfg(not(target_os = "windows"))]
+        fn is_executable_file(p: &std::path::Path) -> bool {
+            let Ok(m) = std::fs::metadata(p) else {
+                return false;
+            };
+            if !m.is_file() {
+                return false;
+            }
+            m.permissions().mode() & 0o111 != 0
+        }
     }
 }
 

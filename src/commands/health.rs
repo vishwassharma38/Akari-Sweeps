@@ -13,7 +13,32 @@
 
 use crate::commands::clean::record_dism;
 use crate::system::windows::system_drive;
-use crate::system::{ExecEvent, MaintenanceRunner, OpResult, RunTotals};
+use crate::system::{ExecEvent, MaintenanceRunner, OpResult, ProgressState, RunTotals};
+use std::time::Instant;
+
+/// Fixed six-step health workflow. Completed steps advance overall
+/// progress; the running DISM/SFC/CHKDSK holds at the last defensible
+/// percentage with a working marker — no fabricated intra-command
+/// percentages and no log-line parsing as progress.
+pub const HEALTH_STEP_COUNT: u64 = 6;
+
+pub fn health_total_units() -> u64 {
+    HEALTH_STEP_COUNT
+}
+
+fn emit_health_progress(
+    runner: &mut dyn MaintenanceRunner,
+    completed: u64,
+    total: u64,
+    current: &str,
+    failed: bool,
+    indeterminate: bool,
+) {
+    let mut s = ProgressState::new(completed.min(total), total, current.to_string());
+    s.failed = failed;
+    s.indeterminate = indeterminate;
+    runner.emit(ExecEvent::Progress(s));
+}
 
 /// The six health steps in order: (id, banner, program, args).
 /// `StartComponentCleanup` runs first so servicing cleanup precedes
@@ -193,6 +218,9 @@ pub fn run_repair_phase(
     runner.emit(ExecEvent::PhaseStarted {
         name: "repair".to_string(),
     });
+    let total = health_total_units();
+    let phase_start = Instant::now();
+    emit_health_progress(runner, 0, total, "Starting system repair…", false, false);
     runner.emit(ExecEvent::Log(
         "Windows will now check and repair system components and protected system files. This may take some time. Do not close this window.".to_string(),
     ));
@@ -207,8 +235,21 @@ pub fn run_repair_phase(
             label: banner.clone(),
             target: format!("{program} {}", args.join(" ")),
         });
+        // Working state without advancing: the bar holds at the last
+        // defensible percentage while this opaque utility runs (no
+        // trustworthy intermediate progress exists for DISM/SFC/CHKDSK).
+        emit_health_progress(
+            runner,
+            results.len() as u64,
+            total,
+            &format!("{banner} — working…"),
+            totals.err_count > 0,
+            true,
+        );
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let t0 = Instant::now();
         let out = runner.run_program(&program, &arg_refs);
+        let elapsed_ms = t0.elapsed().as_millis() as u64;
         // Stream a bounded tail for live output.
         for line in out
             .stdout
@@ -226,7 +267,7 @@ pub fn run_repair_phase(
                 runner.emit(ExecEvent::Log(format!("stderr: {line}")));
             }
         }
-        let result = if id == "repair:sfc" {
+        let mut result = if id == "repair:sfc" {
             record_sfc(&mut totals, out.exit_code)
         } else if id == "repair:chkdsk" {
             record_chkdsk(&mut totals, out.exit_code, &drive)
@@ -239,9 +280,42 @@ pub fn run_repair_phase(
             };
             record_dism(&mut totals, op, out.exit_code, "")
         };
+        result.duration_ms = Some(elapsed_ms);
         runner.emit(ExecEvent::OpFinished(result.clone()));
         results.push(result);
+        // Evidence-based advance only (completed steps). Never parse log
+        // lines as percentages; never invent intra-command progress.
+        emit_health_progress(
+            runner,
+            results.len() as u64,
+            total,
+            &banner,
+            totals.err_count > 0,
+            false,
+        );
     }
+
+    let failed = totals.err_count > 0;
+    let done_label = if failed {
+        "Repair finished with failures"
+    } else {
+        "Repair complete"
+    };
+    emit_health_progress(
+        runner,
+        results.len() as u64,
+        total,
+        done_label,
+        failed,
+        false,
+    );
+    let phase_ms = phase_start.elapsed().as_millis() as u64;
+    runner.emit(ExecEvent::Log(format!(
+        "repair phase: {}/{} steps settled in {} ms (task-count approx; servicing utilities dominate)",
+        results.len(),
+        total,
+        phase_ms
+    )));
 
     runner.emit(ExecEvent::PhaseFinished {
         name: "repair".to_string(),
@@ -437,5 +511,79 @@ mod tests {
             totals.errors.iter().any(|e| e.contains("740")),
             "error log must identify the 740 operation"
         );
+    }
+
+    // --- Progress regression tests (prompt §4.2: health) ---
+
+    struct ProgressSpy {
+        inner: Mock,
+        progress: Vec<crate::system::ProgressState>,
+        finished: usize,
+    }
+
+    impl ProgressSpy {
+        fn new() -> Self {
+            Self {
+                inner: Mock {
+                    codes: HashMap::new(),
+                },
+                progress: Vec::new(),
+                finished: 0,
+            }
+        }
+    }
+
+    impl crate::system::MaintenanceRunner for ProgressSpy {
+        fn clean_dir(&mut self, p: &Path) -> crate::system::DirOutcome {
+            self.inner.clean_dir(p)
+        }
+        fn run_program(&mut self, program: &str, args: &[&str]) -> crate::system::ProgramOutcome {
+            self.inner.run_program(program, args)
+        }
+        fn program_exists(&mut self, p: &str) -> bool {
+            self.inner.program_exists(p)
+        }
+        fn emit(&mut self, ev: crate::system::ExecEvent) {
+            match ev {
+                crate::system::ExecEvent::Progress(s) => self.progress.push(s),
+                crate::system::ExecEvent::OpFinished(_) => self.finished += 1,
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn health_progress_covers_all_six_without_fabrication() {
+        let mut spy = ProgressSpy::new();
+        let (results, _, _) = run_repair_phase(&mut spy, &repair_gate(), false);
+        assert_eq!(results.len(), 6);
+        assert_eq!(health_total_units(), 6);
+        // Init (0/6) + working + advances + terminal: at least init and end.
+        assert!(spy.progress.len() >= 2);
+        let first = &spy.progress[0];
+        assert_eq!((first.completed, first.total), (0, 6));
+        let last = spy.progress.last().unwrap();
+        assert_eq!((last.completed, last.total), (6, 6));
+        assert!(!last.failed);
+        // One OpFinished per step (evidence, never timer ticks).
+        assert_eq!(spy.finished, 6);
+        // Working snapshots hold at last defensible (completed < total)
+        // with indeterminate set — never a mid-step fabricated advance.
+        let working = spy.progress.iter().filter(|p| p.indeterminate).count();
+        assert!(working >= 6, "each opaque step holds working state");
+        for w in spy.progress.iter().filter(|p| p.indeterminate) {
+            assert!(w.completed < w.total || w.total == 0);
+        }
+    }
+
+    #[test]
+    fn health_steps_record_durations() {
+        let mut m = Mock {
+            codes: HashMap::new(),
+        };
+        let (results, _, _) = run_repair_phase(&mut m, &repair_gate(), false);
+        for r in &results {
+            assert!(r.duration_ms.is_some(), "{} must carry timing", r.id);
+        }
     }
 }

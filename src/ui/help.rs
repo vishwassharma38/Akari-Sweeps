@@ -30,7 +30,7 @@ pub fn lines() -> Vec<Line<'static>> {
         Line::from("Returning to the main menu: type back, akariback (any case),"),
         Line::from("or press - . The - key works immediately when not typing;"),
         Line::from("while typing, Enter submits it like any command. 1-5 still"),
-        Line::from("launch operations — 1 never means exit."),
+        Line::from("launch operations."),
         Line::from(""),
         Line::from("Launching: type the command name (akari, akariclean, …) in"),
         Line::from("PowerShell/CMD after install, or run `akari <name>` (e.g. `akari clean`)."),
@@ -47,7 +47,7 @@ pub fn lines() -> Vec<Line<'static>> {
         Line::from("runs nothing. Viewing these screens needs no elevation."),
         Line::from(""),
         Line::from("Exit safely: q or Esc quits the interface (a running operation is"),
-        Line::from("left to finish; Ctrl+C requests cancel). c re-runs cleanup, r repair."),
+        Line::from("left to finish; Ctrl+C requests cancel)."),
     ]);
     out
 }

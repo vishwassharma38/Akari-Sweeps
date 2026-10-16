@@ -34,35 +34,68 @@ impl MaintenanceRunner for RealRunner {
             };
         }
         let before = measure_dir(path);
-        let detail = clean_dir_contents_detailed(path);
-        let after = measure_dir(path);
-        match (before, after) {
-            (Some((b_items, b_kb)), Some((a_items, _a_kb))) => {
-                let removed = b_items.saturating_sub(a_items);
-                // KB remeasured from scratch (BAT diffs KB the same way).
-                let after_kb = measure_dir(path).map(|(_, kb)| kb).unwrap_or(0);
-                let kb_removed = b_kb.saturating_sub(after_kb);
+        // BAT `:TallyDir` skips the after-measurement when the before
+        // count is 0 or unmeasurable. Mirror that: an empty dir needs no
+        // deletion pass and no second traversal.
+        match before {
+            Some((0, _)) => DirOutcome {
+                existed: true,
+                files_removed: 0,
+                kb_removed: 0,
+                files_left: 0,
+                measure_failed: false,
+                locked_skipped: 0,
+                permission_denied: 0,
+                other_unremovable: 0,
+            },
+            Some((b_items, b_kb)) => {
+                let detail = clean_dir_contents_detailed(path);
+                // Single after-measurement reused for both item and KB
+                // diffs (BAT diffs KB the same way). Previously a third
+                // full traversal remeasured KB from scratch — removed.
+                match measure_dir(path) {
+                    Some((a_items, a_kb)) => {
+                        let removed = b_items.saturating_sub(a_items);
+                        let kb_removed = b_kb.saturating_sub(a_kb);
+                        DirOutcome {
+                            existed: true,
+                            files_removed: removed,
+                            kb_removed,
+                            files_left: a_items,
+                            measure_failed: false,
+                            locked_skipped: detail.locked,
+                            permission_denied: detail.permission,
+                            other_unremovable: detail.other,
+                        }
+                    }
+                    None => DirOutcome {
+                        existed: true,
+                        files_removed: 0,
+                        kb_removed: 0,
+                        files_left: 0,
+                        measure_failed: true,
+                        locked_skipped: detail.locked,
+                        permission_denied: detail.permission,
+                        other_unremovable: detail.other,
+                    },
+                }
+            }
+            None => {
+                // Before-measurement failed: still attempt deletion
+                // (BAT does), but report measurement failure honestly.
+                let detail = clean_dir_contents_detailed(path);
+                let _ = measure_dir(path);
                 DirOutcome {
                     existed: true,
-                    files_removed: removed,
-                    kb_removed,
-                    files_left: a_items,
-                    measure_failed: false,
+                    files_removed: 0,
+                    kb_removed: 0,
+                    files_left: 0,
+                    measure_failed: true,
                     locked_skipped: detail.locked,
                     permission_denied: detail.permission,
                     other_unremovable: detail.other,
                 }
             }
-            _ => DirOutcome {
-                existed: true,
-                files_removed: 0,
-                kb_removed: 0,
-                files_left: 0,
-                measure_failed: true,
-                locked_skipped: detail.locked,
-                permission_denied: detail.permission,
-                other_unremovable: detail.other,
-            },
         }
     }
 

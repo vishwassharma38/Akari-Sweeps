@@ -96,7 +96,7 @@ fn real_main() -> i32 {
             let t = crate::commands::normalize_token(first);
             if crate::commands::from_token(&t).is_none() {
                 app.push_log(format!(
-                    "Unknown command '{first}'. Showing home — press ? for the command list."
+                    "Unknown command '{first}'. Showing home — type akarihelp for the command list."
                 ));
             }
         }
@@ -249,14 +249,6 @@ fn handle_key(
         KeyCode::Char('q') | KeyCode::Esc => return request_quit(app, pending_quit),
         KeyCode::Char('/') => app.set_input_focus(true),
         KeyCode::Enter => app.set_input_focus(true),
-        KeyCode::Char('?') => {
-            app.screen = Screen::Help;
-            *pending_quit = false;
-        }
-        KeyCode::Char('a') => {
-            app.screen = Screen::About;
-            *pending_quit = false;
-        }
         KeyCode::Char('h') => {
             activate(app, tx, AppCommand::Home);
             *pending_quit = false;
@@ -274,14 +266,6 @@ fn handle_key(
             if let Some(cmd) = crate::commands::command_from_number(d as u8 - b'0') {
                 activate(app, tx, cmd);
             }
-        }
-        KeyCode::Char('c') => {
-            *pending_quit = false;
-            activate(app, tx, AppCommand::Clean);
-        }
-        KeyCode::Char('r') => {
-            *pending_quit = false;
-            activate(app, tx, AppCommand::Health);
         }
         KeyCode::Char('t') => {
             *pending_quit = false;
@@ -351,6 +335,7 @@ fn activate(app: &mut App, tx: &Sender<ExecEvent>, cmd: AppCommand) {
         app.execution = fresh.execution;
         app.summary = None;
         app.operations.clear();
+        app.progress = crate::system::ProgressState::default();
         // Drop stale per-run UI state so back-navigation is clean.
         app.scroll = 0;
         app.input.clear();
@@ -789,13 +774,14 @@ mod input_tests {
         assert_eq!(app.screen, Screen::About);
         assert_eq!(app.log.len(), logs_after_press);
 
+        // Help remains reachable via number key 5 (no dedicated `?` shortcut).
         let (mut app, tx, mut pending) = fresh();
-        handle_key(&mut app, &tx, press(KeyCode::Char('?')), &mut pending);
+        handle_key(&mut app, &tx, press(KeyCode::Char('5')), &mut pending);
         assert_eq!(app.screen, Screen::Help);
         assert!(!handle_key(
             &mut app,
             &tx,
-            release(KeyCode::Char('?')),
+            release(KeyCode::Char('5')),
             &mut pending
         ));
 
@@ -816,9 +802,10 @@ mod input_tests {
 
         // Focused typing of shortcut letters inserts text instead of firing
         // global actions (regression: 'c' must not start Clean while typing).
+        // Removed shortcuts (c, r, ?) and 0 must remain usable as text.
         let (mut app, tx, mut pending) = fresh();
         handle_key(&mut app, &tx, press(KeyCode::Char('/')), &mut pending);
-        for ch in ['c', 'r', 't', 'a', 'h', 'q', '1', '?'] {
+        for ch in ['c', 'r', 't', 'a', 'h', 'q', '1', '?', '0'] {
             let screen_before = app.screen;
             let running_before = app.worker_running;
             handle_key(&mut app, &tx, press_char(ch), &mut pending);
@@ -830,7 +817,7 @@ mod input_tests {
             assert_eq!(app.worker_running, running_before);
             handle_key(&mut app, &tx, release_char(ch), &mut pending);
         }
-        assert_eq!(app.input, "crtahq1?");
+        assert_eq!(app.input, "crtahq1?0");
         assert!(!app.worker_running, "typing must never start a worker");
 
         // Focused 'q' types; unfocused 'q' quits. Release never quits.
@@ -992,7 +979,7 @@ mod input_tests {
     }
 
     #[test]
-    fn one_still_selects_cleanup_never_home() {
+    fn one_still_selects_cleanup_not_home() {
         let (mut app, tx, mut pending) = fresh();
         // Unfocused `1` on Home would request Clean (elevation-gated on
         // Windows). Assert dispatch mapping, not worker side effects:
@@ -1023,7 +1010,8 @@ mod input_tests {
         assert!(!app.input_focused);
         assert!(app.input.is_empty());
         // Still responsive: can navigate elsewhere without restart.
-        tap(&mut app, &tx, &mut pending, press(KeyCode::Char('?')));
+        // Help via number key 5 (dedicated `?` shortcut was removed).
+        tap(&mut app, &tx, &mut pending, press(KeyCode::Char('5')));
         assert_eq!(app.screen, Screen::Help);
     }
 
@@ -1043,5 +1031,104 @@ mod input_tests {
             app.log.iter().any(|l| l.contains("already in progress")),
             "must explain why navigation was refused"
         );
+    }
+
+    #[test]
+    fn removed_dedicated_shortcuts_do_nothing_unfocused() {
+        // `c` (clean), `r` (repair), `?` (help), `0` (exit) and `a`
+        // (about) must not trigger any action when pressed unfocused.
+        // No screen change, no worker, no quit, no focus change.
+        for ch in ['c', 'r', '?', '0', 'a'] {
+            let (mut app, tx, mut pending) = fresh();
+            let screen_before = app.screen;
+            let command_before = app.command;
+            let log_before = app.log.len();
+            let quit = tap(&mut app, &tx, &mut pending, press_char(ch));
+            assert!(!quit, "unfocused '{ch}' must not quit");
+            assert_eq!(
+                app.screen, screen_before,
+                "unfocused '{ch}' must not navigate"
+            );
+            assert_eq!(app.command, command_before);
+            assert!(!app.input_focused, "unfocused '{ch}' must not focus entry");
+            assert!(app.input.is_empty());
+            assert!(
+                !app.worker_running,
+                "unfocused '{ch}' must not start a worker"
+            );
+            assert_eq!(app.log.len(), log_before, "unfocused '{ch}' must not log");
+        }
+    }
+
+    #[test]
+    fn removed_shortcut_chars_still_type_as_text_when_focused() {
+        // Typing c, r, ?, 0, a into the command-entry field still works as
+        // ordinary text input where valid.
+        let (mut app, tx, mut pending) = fresh();
+        tap(&mut app, &tx, &mut pending, press(KeyCode::Char('/')));
+        assert!(app.input_focused);
+        for ch in ['c', 'r', '?', '0', 'a'] {
+            tap(&mut app, &tx, &mut pending, press_char(ch));
+            assert!(
+                app.input.ends_with(ch),
+                "focused '{ch}' must enter the buffer"
+            );
+        }
+        assert_eq!(app.input, "cr?0a");
+        assert_eq!(app.screen, Screen::Home);
+        assert!(!app.worker_running);
+    }
+
+    #[test]
+    fn plain_a_no_longer_opens_about_but_entry_still_does() {
+        // The standalone plain `a` shortcut was removed: unfocused `a`
+        // must not navigate, start work, or quit.
+        let (mut app, tx, mut pending) = fresh();
+        let quit = tap(&mut app, &tx, &mut pending, press_char('a'));
+        assert!(!quit);
+        assert_eq!(app.screen, Screen::Home);
+        assert_eq!(app.command, AppCommand::Home);
+        assert!(!app.input_focused);
+        assert!(app.input.is_empty());
+        assert!(!app.worker_running);
+        // About remains reachable via number key 4 and via command entry.
+        let (mut app, tx, mut pending) = fresh();
+        tap(&mut app, &tx, &mut pending, press(KeyCode::Char('4')));
+        assert_eq!(app.screen, Screen::About);
+        let (mut app, tx, mut pending) = fresh();
+        tap(&mut app, &tx, &mut pending, press(KeyCode::Char('/')));
+        type_text(&mut app, &tx, &mut pending, "akariabout");
+        handle_key(&mut app, &tx, press(KeyCode::Enter), &mut pending);
+        assert_eq!(app.screen, Screen::About);
+        assert_eq!(app.command, AppCommand::About);
+        assert!(!app.worker_running);
+    }
+
+    #[test]
+    fn numeric_selection_and_retained_navigation_stay_intact() {
+        // 1-5 still select; t/h/-/q/Esc/Up/Down/Ctrl+C behavior preserved.
+        let (mut app, tx, mut pending) = fresh();
+        tap(&mut app, &tx, &mut pending, press(KeyCode::Char('5')));
+        assert_eq!(app.screen, Screen::Help);
+        let (mut app, tx, mut pending) = fresh();
+        tap(&mut app, &tx, &mut pending, press(KeyCode::Char('4')));
+        assert_eq!(app.screen, Screen::About);
+        // `t` still selects All (maintenance dispatch, elevation-gated on
+        // Windows — assert mapping + no crash, not worker side effects).
+        assert_eq!(
+            crate::commands::command_from_input("akariall"),
+            Some(AppCommand::All)
+        );
+        // `0` never selects anything.
+        assert_eq!(crate::commands::command_from_number(0), None);
+        assert_eq!(crate::commands::command_from_input("0"), None);
+        assert!(!crate::commands::is_back_command("0"));
+        // Unknown `0` input is handled safely (no worker, stays home).
+        let (mut app, tx, mut pending) = fresh();
+        tap(&mut app, &tx, &mut pending, press(KeyCode::Char('/')));
+        type_text(&mut app, &tx, &mut pending, "0");
+        handle_key(&mut app, &tx, press(KeyCode::Enter), &mut pending);
+        assert_eq!(app.screen, Screen::Home);
+        assert!(!app.worker_running);
     }
 }

@@ -67,9 +67,8 @@ unknown names get a hint listing the valid commands. While typing,
 shortcuts suspend except Enter (run), Esc (cancel), Backspace (edit),
 and Ctrl+U (clear).
 
-Other keys: `c` cleanup · `r` repair · `t` all · `?` help · `a` about ·
-`h` home · `↑/↓` scroll · `q`/`Esc` quit · `Ctrl+C` deliberate cancel/quit
-(double-press while running).
+Other keys: `t` all · `h` home · `↑/↓` scroll · `q`/`Esc` quit ·
+`Ctrl+C` deliberate cancel/quit (double-press while running).
 
 ### Cleanup/repair isolation (guaranteed, strict)
 
@@ -111,7 +110,7 @@ Detection uses the BAT's `fltmc` probe — a real privilege check.
 1. Non-admin terminal: `akariclean` → approve UAC → cleanup runs elevated.
 2. Same, but decline UAC → "Elevation declined … was not started.",
    exit `1223`, no maintenance output.
-3. `akari` → home works unelevated; press `c` → elevation requested,
+3. `akari` → home works unelevated; press `1` → elevation requested,
    declining keeps the TUI usable with an explanatory log line.
 4. `akarihelp` works fully unelevated.
 

@@ -6,8 +6,11 @@
 //! Directory targets preserve BAT `:PhaseCleanup` order; `[18/18]` is
 //! Disk Cleanup + SilentCleanup only.
 
-use crate::system::{ExecEvent, MaintenanceRunner, OpResult, RunTotals, expand_windows_template};
+use crate::system::{
+    ExecEvent, MaintenanceRunner, OpResult, ProgressState, RunTotals, expand_windows_template,
+};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 // ---------------------------------------------------------------------------
 // Plan data (data-only so tests can verify order without side effects)
@@ -192,6 +195,78 @@ pub fn chromium_profile_subdirs() -> Vec<&'static str> {
         "Service Worker\\ScriptCache",
         "ShaderCache",
     ]
+}
+
+/// Number of program-step work units in cleanup: npm, pip, DNS,
+/// Recycle Bin, Disk Cleanup, SilentCleanup. Always 6 — skipped programs
+/// still produce a (skipped) `OpResult`, so the total stays stable.
+pub const CLEANUP_PROGRAM_STEPS: u64 = 6;
+
+/// Stable task-count total for the cleanup phase (documented
+/// approximation, not exact time/byte progress):
+/// `fixed targets + existing Chromium profile subdirs + existing Firefox
+/// profile subdirs + 6 program steps`. Dynamic counts use a cheap shallow
+/// scan (existence + one `read_dir` per root), never a full recursive
+/// walk, so no expensive extra traversal is performed solely for progress.
+pub fn cleanup_total_units() -> u64 {
+    let fixed = fixed_dir_targets_in_order().len() as u64;
+    fixed + count_existing_chromium_units() + count_existing_firefox_units() + CLEANUP_PROGRAM_STEPS
+}
+
+/// Count existing Chromium profile cache subdirs (shallow scan only).
+pub fn count_existing_chromium_units() -> u64 {
+    let mut n = 0u64;
+    for root_template in chromium_roots_in_order() {
+        let Some(root) = expand_windows_template(root_template) else {
+            continue;
+        };
+        if !root.exists() {
+            continue;
+        }
+        for profile in child_dirs(&root) {
+            for sub in chromium_profile_subdirs() {
+                if profile.join(&sub).exists() {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Count existing Firefox profile `cache2`/`startupCache` subdirs
+/// (shallow scan only; `Crash Reports` is a fixed target already counted).
+pub fn count_existing_firefox_units() -> u64 {
+    let Some(profiles) = expand_windows_template("%LOCALAPPDATA%\\Mozilla\\Firefox\\Profiles")
+    else {
+        return 0;
+    };
+    let mut n = 0u64;
+    for profile in child_dirs(&profiles) {
+        for sub in ["cache2", "startupCache"] {
+            if profile.join(sub).exists() {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Emit one evidence-based progress snapshot. Lightweight: one message per
+/// work unit plus one working-state message before each opaque
+/// long-running task (no per-file messages, no timer animation).
+pub fn emit_cleanup_progress(
+    runner: &mut dyn MaintenanceRunner,
+    completed: u64,
+    total: u64,
+    current: &str,
+    failed: bool,
+    indeterminate: bool,
+) {
+    let mut s = ProgressState::new(completed.min(total), total, current.to_string());
+    s.failed = failed;
+    s.indeterminate = indeterminate;
+    runner.emit(ExecEvent::Progress(s));
 }
 
 /// The 18 phase banners in BAT order (for TUI progress + tests).
@@ -436,12 +511,18 @@ fn run_one_dir(
             target: display.clone(),
         },
     );
+    // Lightweight monotonic timing for baseline diagnostics (stored on
+    // the result, never used for progress).
+    let t0 = Instant::now();
     let outcome = runner.clean_dir(&path);
+    let elapsed_ms = t0.elapsed().as_millis() as u64;
     if !outcome.existed {
         totals.dirs_missing += 1;
         let mut r = OpResult::skipped(&id, phase, &display, "not present - skipped".to_string());
         r.target = display.clone();
-        results.push(r);
+        r.duration_ms = Some(elapsed_ms);
+        results.push(r.clone());
+        runner.emit(ExecEvent::OpFinished(r));
         emit(
             runner,
             ExecEvent::Log(format!("Skipped (not present): {display}")),
@@ -480,7 +561,9 @@ fn run_one_dir(
         r.detail
             .push_str("; size measurement failed for this folder");
     }
-    results.push(r);
+    r.duration_ms = Some(elapsed_ms);
+    results.push(r.clone());
+    runner.emit(ExecEvent::OpFinished(r));
 }
 
 fn clean_dir_template(
@@ -494,12 +577,14 @@ fn clean_dir_template(
         Some(path) => run_one_dir(runner, totals, results, phase, path, template.to_string()),
         None => {
             totals.dirs_missing += 1;
-            results.push(OpResult::skipped(
+            let r = OpResult::skipped(
                 &format!("clean:{template}"),
                 phase,
                 template,
                 "environment variable unavailable - skipped".to_string(),
-            ));
+            );
+            results.push(r.clone());
+            runner.emit(ExecEvent::OpFinished(r));
         }
     }
 }
@@ -682,6 +767,42 @@ fn tail(s: &str, max: usize) -> String {
     }
 }
 
+/// Announce a program step so the TUI can show it as the current working
+/// task (bar holds at the last defensible percentage while it runs).
+fn prog_started(runner: &mut dyn MaintenanceRunner, id: &str, label: &str, target: &str) {
+    runner.emit(ExecEvent::OpStarted {
+        id: id.to_string(),
+        label: label.to_string(),
+        target: target.to_string(),
+    });
+}
+
+/// Record a finished program step: store timing, push the result, and
+/// stream `OpFinished` so per-op UI and task-count progress advance on
+/// real evidence (never on a timer).
+fn prog_finished(
+    runner: &mut dyn MaintenanceRunner,
+    results: &mut Vec<OpResult>,
+    mut r: OpResult,
+    elapsed_ms: u64,
+) {
+    r.duration_ms = Some(elapsed_ms);
+    results.push(r.clone());
+    runner.emit(ExecEvent::OpFinished(r));
+}
+
+/// Timed external-program invocation (monotonic clock). Returns
+/// `(outcome, elapsed_ms)`. Timing is diagnostics only — never progress.
+fn timed_run(
+    runner: &mut dyn MaintenanceRunner,
+    program: &str,
+    args: &[&str],
+) -> (crate::system::ProgramOutcome, u64) {
+    let t0 = Instant::now();
+    let out = runner.run_program(program, args);
+    (out, t0.elapsed().as_millis() as u64)
+}
+
 /// Execute the full cleanup phase. Returns (results, totals).
 /// Never panics on missing env vars, locked files, or absent programs.
 ///
@@ -697,12 +818,26 @@ pub fn run_cleanup_phase(
     let mut totals = RunTotals::default();
     let mut results: Vec<OpResult> = Vec::new();
 
+    // Cache the ordered plan once (avoids rebuilding the Vec for every
+    // phase filter) and compute the stable task-count total via a cheap
+    // shallow scan. No full recursive walk is performed for progress.
+    let plan = fixed_dir_targets_in_order();
+    let total = plan.len() as u64
+        + count_existing_chromium_units()
+        + count_existing_firefox_units()
+        + CLEANUP_PROGRAM_STEPS;
+    let phase_start = Instant::now();
+
     emit(
         runner,
         ExecEvent::PhaseStarted {
             name: "cleanup".to_string(),
         },
     );
+    // Single coherent progress source: stable total now, completions
+    // stream later as `OpFinished` evidence (App derives the bar from
+    // those — no timer, no per-file messages).
+    emit_cleanup_progress(runner, 0, total, "Starting cleanup…", false, false);
     emit(
         runner,
         ExecEvent::Log(
@@ -720,10 +855,7 @@ pub fn run_cleanup_phase(
         runner,
         ExecEvent::Log("[1/18] USER TEMPORARY FILES".to_string()),
     );
-    for t in fixed_dir_targets_in_order()
-        .iter()
-        .filter(|t| t.phase.starts_with("1/18"))
-    {
+    for t in plan.iter().filter(|t| t.phase.starts_with("1/18")) {
         clean_dir_template(runner, &mut totals, &mut results, t.phase, t.template);
     }
     // [2/18]
@@ -731,10 +863,7 @@ pub fn run_cleanup_phase(
         runner,
         ExecEvent::Log("[2/18] WINDOWS TEMPORARY FILES".to_string()),
     );
-    for t in fixed_dir_targets_in_order()
-        .iter()
-        .filter(|t| t.phase.starts_with("2/18"))
-    {
+    for t in plan.iter().filter(|t| t.phase.starts_with("2/18")) {
         clean_dir_template(runner, &mut totals, &mut results, t.phase, t.template);
     }
     // [3/18]
@@ -742,10 +871,7 @@ pub fn run_cleanup_phase(
         runner,
         ExecEvent::Log("[3/18] WINDOWS ERROR REPORTING / CRASH DUMPS".to_string()),
     );
-    for t in fixed_dir_targets_in_order()
-        .iter()
-        .filter(|t| t.phase.starts_with("3/18"))
-    {
+    for t in plan.iter().filter(|t| t.phase.starts_with("3/18")) {
         clean_dir_template(runner, &mut totals, &mut results, t.phase, t.template);
     }
     // [4/18]
@@ -753,10 +879,7 @@ pub fn run_cleanup_phase(
         runner,
         ExecEvent::Log("[4/18] THUMBNAIL / GRAPHICS SHADER CACHES".to_string()),
     );
-    for t in fixed_dir_targets_in_order()
-        .iter()
-        .filter(|t| t.phase.starts_with("4/18"))
-    {
+    for t in plan.iter().filter(|t| t.phase.starts_with("4/18")) {
         clean_dir_template(runner, &mut totals, &mut results, t.phase, t.template);
     }
 
@@ -773,10 +896,7 @@ pub fn run_cleanup_phase(
             ExecEvent::Log(format!("net stop {svc}: exit {}", out.exit_code)),
         );
     }
-    for t in fixed_dir_targets_in_order()
-        .iter()
-        .filter(|t| t.phase.starts_with("5/18"))
-    {
+    for t in plan.iter().filter(|t| t.phase.starts_with("5/18")) {
         clean_dir_template(runner, &mut totals, &mut results, t.phase, t.template);
     }
     for svc in ["bits", "wuauserv"] {
@@ -792,10 +912,7 @@ pub fn run_cleanup_phase(
         runner,
         ExecEvent::Log("[6/18] DELIVERY OPTIMIZATION CACHE".to_string()),
     );
-    for t in fixed_dir_targets_in_order()
-        .iter()
-        .filter(|t| t.phase.starts_with("6/18"))
-    {
+    for t in plan.iter().filter(|t| t.phase.starts_with("6/18")) {
         clean_dir_template(runner, &mut totals, &mut results, t.phase, t.template);
     }
 
@@ -804,10 +921,7 @@ pub fn run_cleanup_phase(
         runner,
         ExecEvent::Log("[7/18] MICROSOFT STORE CACHE".to_string()),
     );
-    for t in fixed_dir_targets_in_order()
-        .iter()
-        .filter(|t| t.phase.starts_with("7/18"))
-    {
+    for t in plan.iter().filter(|t| t.phase.starts_with("7/18")) {
         clean_dir_template(runner, &mut totals, &mut results, t.phase, t.template);
     }
 
@@ -816,10 +930,7 @@ pub fn run_cleanup_phase(
         runner,
         ExecEvent::Log("[8/18] VS CODE CACHE / LOGS".to_string()),
     );
-    for t in fixed_dir_targets_in_order()
-        .iter()
-        .filter(|t| t.phase.starts_with("8/18"))
-    {
+    for t in plan.iter().filter(|t| t.phase.starts_with("8/18")) {
         clean_dir_template(runner, &mut totals, &mut results, t.phase, t.template);
     }
 
@@ -856,10 +967,7 @@ pub fn run_cleanup_phase(
 
     // [15/18] Discord.
     emit(runner, ExecEvent::Log("[15/18] DISCORD CACHE".to_string()));
-    for t in fixed_dir_targets_in_order()
-        .iter()
-        .filter(|t| t.phase.starts_with("15/18"))
-    {
+    for t in plan.iter().filter(|t| t.phase.starts_with("15/18")) {
         clean_dir_template(runner, &mut totals, &mut results, t.phase, t.template);
     }
 
@@ -876,7 +984,8 @@ pub fn run_cleanup_phase(
             runner,
             ExecEvent::Log(format!("Cleaning npm cache via {npm_prog}...")),
         );
-        let out = runner.run_program(&npm_prog, &["cache", "clean", "--force"]);
+        prog_started(runner, "clean:npm", "16/18 NPM", "npm cache");
+        let (out, elapsed_ms) = timed_run(runner, &npm_prog, &["cache", "clean", "--force"]);
         for line in out.stdout.lines().take(5) {
             emit(runner, ExecEvent::Log(line.to_string()));
         }
@@ -894,7 +1003,7 @@ pub fn run_cleanup_phase(
                 "cache cleaned - exit code 0".to_string(),
             );
             r.exit_code = Some(0);
-            results.push(r);
+            prog_finished(runner, &mut results, r, elapsed_ms);
         } else {
             let err_tail = tail(&format!("{} {}", out.stdout, out.stderr), 160);
             if out.exit_code == 9009 {
@@ -915,19 +1024,22 @@ pub fn run_cleanup_phase(
                 npm_failure_detail(out.exit_code, &err_tail),
             );
             r.exit_code = Some(out.exit_code);
-            results.push(r);
+            prog_finished(runner, &mut results, r, elapsed_ms);
         }
     } else {
-        results.push(OpResult::skipped(
+        let r = OpResult::skipped(
             "clean:npm",
             "16/18 NPM",
             "npm cache",
             "npm not installed - skipped".to_string(),
-        ));
+        );
+        results.push(r.clone());
+        runner.emit(ExecEvent::OpFinished(r));
     }
     if runner.program_exists("pip") {
         emit(runner, ExecEvent::Log("Cleaning pip cache...".to_string()));
-        let out = runner.run_program("pip", &["cache", "purge"]);
+        prog_started(runner, "clean:pip", "16/18 PIP", "pip cache");
+        let (out, elapsed_ms) = timed_run(runner, "pip", &["cache", "purge"]);
         if out.exit_code == 0 {
             totals.add_ok();
             let mut r = OpResult::ok(
@@ -937,7 +1049,7 @@ pub fn run_cleanup_phase(
                 "cache purged - exit code 0".to_string(),
             );
             r.exit_code = Some(0);
-            results.push(r);
+            prog_finished(runner, &mut results, r, elapsed_ms);
         } else {
             totals.add_error(format!(
                 "pip cache purge failed with exit code {}.",
@@ -950,15 +1062,17 @@ pub fn run_cleanup_phase(
                 format!("FAILED - exit code {}", out.exit_code),
             );
             r.exit_code = Some(out.exit_code);
-            results.push(r);
+            prog_finished(runner, &mut results, r, elapsed_ms);
         }
     } else {
-        results.push(OpResult::skipped(
+        let r = OpResult::skipped(
             "clean:pip",
             "16/18 PIP",
             "pip cache",
             "pip not installed - skipped".to_string(),
-        ));
+        );
+        results.push(r.clone());
+        runner.emit(ExecEvent::OpFinished(r));
     }
 
     // [17/18] DNS + Recycle Bin.
@@ -967,7 +1081,8 @@ pub fn run_cleanup_phase(
         ExecEvent::Log("[17/18] DNS + RECYCLE BIN".to_string()),
     );
     {
-        let out = runner.run_program("ipconfig", &["/flushdns"]);
+        prog_started(runner, "clean:dns", "17/18 DNS", "DNS resolver cache");
+        let (out, elapsed_ms) = timed_run(runner, "ipconfig", &["/flushdns"]);
         // Stream last lines for live output.
         for line in out.stdout.lines().take(5) {
             emit(runner, ExecEvent::Log(line.to_string()));
@@ -981,7 +1096,7 @@ pub fn run_cleanup_phase(
                 "flushed - exit code 0".to_string(),
             );
             r.exit_code = Some(0);
-            results.push(r);
+            prog_finished(runner, &mut results, r, elapsed_ms);
         } else {
             totals.add_error(format!(
                 "DNS cache flush failed with exit code {}.",
@@ -994,11 +1109,18 @@ pub fn run_cleanup_phase(
                 format!("FAILED - exit code {}", out.exit_code),
             );
             r.exit_code = Some(out.exit_code);
-            results.push(r);
+            prog_finished(runner, &mut results, r, elapsed_ms);
         }
     }
     {
-        let out = runner.run_program(
+        prog_started(
+            runner,
+            "clean:recyclebin",
+            "17/18 RECYCLE BIN",
+            "Recycle Bin",
+        );
+        let (out, elapsed_ms) = timed_run(
+            runner,
             "powershell",
             &[
                 "-NoProfile",
@@ -1038,7 +1160,7 @@ pub fn run_cleanup_phase(
                 "command issued - exit code 0 - result not independently verified".to_string(),
             );
             r.exit_code = Some(0);
-            results.push(r);
+            prog_finished(runner, &mut results, r, elapsed_ms);
         } else {
             let err_tail = tail(&format!("{} {}", out.stdout, out.stderr), 160);
             totals.add_warning(format!(
@@ -1059,7 +1181,7 @@ pub fn run_cleanup_phase(
                 ),
             );
             r.exit_code = Some(out.exit_code);
-            results.push(r);
+            prog_finished(runner, &mut results, r, elapsed_ms);
         }
     }
 
@@ -1075,7 +1197,13 @@ pub fn run_cleanup_phase(
             runner,
             ExecEvent::Log("Running Windows Disk Cleanup...".to_string()),
         );
-        let out = runner.run_program("cleanmgr.exe", &["/verylowdisk"]);
+        prog_started(
+            runner,
+            "clean:cleanmgr",
+            "18/18 DISK CLEANUP",
+            "cleanmgr /verylowdisk",
+        );
+        let (out, elapsed_ms) = timed_run(runner, "cleanmgr.exe", &["/verylowdisk"]);
         if out.exit_code == 0 {
             totals.add_ok();
             let mut r = OpResult::ok(
@@ -1086,7 +1214,7 @@ pub fn run_cleanup_phase(
                     .to_string(),
             );
             r.exit_code = Some(0);
-            results.push(r);
+            prog_finished(runner, &mut results, r, elapsed_ms);
         } else {
             totals.add_warning(format!(
                 "Disk Cleanup exited with code {}; its exit codes are not documented, so the result is unknown.",
@@ -1102,7 +1230,7 @@ pub fn run_cleanup_phase(
                 ),
             );
             r.exit_code = Some(out.exit_code);
-            results.push(r);
+            prog_finished(runner, &mut results, r, elapsed_ms);
         }
     }
     {
@@ -1110,6 +1238,13 @@ pub fn run_cleanup_phase(
             runner,
             ExecEvent::Log("Running Windows SilentCleanup task...".to_string()),
         );
+        prog_started(
+            runner,
+            "clean:silent",
+            "18/18 SILENTCLEANUP",
+            "SilentCleanup task",
+        );
+        let silent_start = Instant::now();
         let out = runner.run_program(
             "schtasks.exe",
             &[
@@ -1131,6 +1266,7 @@ pub fn run_cleanup_phase(
                     "try { Start-Sleep -Seconds 3; $sw = [Diagnostics.Stopwatch]::StartNew(); while ((Get-ScheduledTask -TaskPath '\\Microsoft\\Windows\\DiskCleanup\\' -TaskName 'SilentCleanup' -ErrorAction Stop).State -eq 'Running') { if ($sw.Elapsed.TotalMinutes -ge 20) { exit 2 }; Start-Sleep -Seconds 5 }; exit 0 } catch { exit 1 }",
                 ],
             );
+            let elapsed_ms = silent_start.elapsed().as_millis() as u64;
             match wait.exit_code {
                 0 => {
                     totals.add_ok();
@@ -1141,41 +1277,55 @@ pub fn run_cleanup_phase(
                         "task finished - amount freed is not reported by Windows".to_string(),
                     );
                     r.exit_code = Some(0);
-                    results.push(r);
+                    prog_finished(runner, &mut results, r, elapsed_ms);
                 }
                 2 => {
                     totals.add_warning("SilentCleanup was still running after 20 minutes; the script continued without waiting.".to_string());
-                    results.push(OpResult::warning(
-                        "clean:silent",
-                        "18/18 SILENTCLEANUP",
-                        "SilentCleanup task",
-                        "still running after 20 minutes - not waited for any longer".to_string(),
-                    ));
+                    prog_finished(
+                        runner,
+                        &mut results,
+                        OpResult::warning(
+                            "clean:silent",
+                            "18/18 SILENTCLEANUP",
+                            "SilentCleanup task",
+                            "still running after 20 minutes - not waited for any longer"
+                                .to_string(),
+                        ),
+                        elapsed_ms,
+                    );
                 }
                 _ => {
                     totals.add_warning(
                         "SilentCleanup was started, but its completion could not be verified."
                             .to_string(),
                     );
-                    results.push(OpResult::warning(
-                        "clean:silent",
-                        "18/18 SILENTCLEANUP",
-                        "SilentCleanup task",
-                        "started - completion could not be verified".to_string(),
-                    ));
+                    prog_finished(
+                        runner,
+                        &mut results,
+                        OpResult::warning(
+                            "clean:silent",
+                            "18/18 SILENTCLEANUP",
+                            "SilentCleanup task",
+                            "started - completion could not be verified".to_string(),
+                        ),
+                        elapsed_ms,
+                    );
                 }
             }
         } else {
+            let elapsed_ms = silent_start.elapsed().as_millis() as u64;
             totals.add_warning(format!(
                 "SilentCleanup task could not be started; schtasks exit code {}.",
                 out.exit_code
             ));
-            results.push(OpResult::warning(
+            let mut r = OpResult::warning(
                 "clean:silent",
                 "18/18 SILENTCLEANUP",
                 "SilentCleanup task",
                 format!("NOT STARTED - schtasks exit code {}", out.exit_code),
-            ));
+            );
+            r.exit_code = Some(out.exit_code);
+            prog_finished(runner, &mut results, r, elapsed_ms);
         }
     }
     // Strict separation: no DISM /StartComponentCleanup here. It now
@@ -1214,6 +1364,26 @@ pub fn run_cleanup_phase(
             totals.measure_fail
         ));
     }
+
+    // Final evidence-based snapshot + lightweight phase timing (monotonic).
+    // Completed units = OpResults produced; total = pre-scanned stable
+    // total. Failures never render as success (failed flag is sticky).
+    let completed = results.len() as u64;
+    let failed = totals.err_count > 0;
+    let done_label = if failed {
+        "Cleanup finished with failures"
+    } else {
+        "Cleanup complete"
+    };
+    emit_cleanup_progress(runner, completed, total, done_label, failed, false);
+    let phase_ms = phase_start.elapsed().as_millis() as u64;
+    emit(
+        runner,
+        ExecEvent::Log(format!(
+            "cleanup phase: {completed}/{total} task units settled in {phase_ms} ms \
+             (task-count approx; external Windows utilities dominate where present)"
+        )),
+    );
 
     emit(
         runner,
@@ -1680,5 +1850,112 @@ mod tests {
         let missing = dir.join("does-not-exist-xyz");
         let d2 = clean_dir_contents_detailed(&missing);
         assert!(d2.locked + d2.permission + d2.other >= 1 || true);
+    }
+
+    // --- Performance + progress regression tests (prompt §4) ---
+
+    #[test]
+    fn cleanup_total_matches_produced_results() {
+        // Stable denominator: the pre-scanned total must equal the number
+        // of OpResults the phase actually produces (mocks have no dynamic
+        // profiles, so fixed 33 + 6 programs).
+        let total = cleanup_total_units();
+        let mut runner = MockRunner::all_ok();
+        let gate = crate::commands::PhaseGate::for_command(crate::commands::AppCommand::Clean)
+            .0
+            .unwrap();
+        let (results, _) = run_cleanup_phase(&mut runner, &gate);
+        assert_eq!(
+            results.len() as u64,
+            total,
+            "total {total} must match {} results (stable denominator, no reset)",
+            results.len()
+        );
+    }
+
+    #[test]
+    fn cleanup_emits_progress_init_and_completions() {
+        let mut runner = MockRunner::all_ok();
+        let gate = crate::commands::PhaseGate::for_command(crate::commands::AppCommand::Clean)
+            .0
+            .unwrap();
+        let _ = run_cleanup_phase(&mut runner, &gate);
+        let progress: Vec<_> = runner
+            .events
+            .iter()
+            .filter(|e| matches!(e, ExecEvent::Progress(_)))
+            .collect();
+        assert!(
+            progress.len() >= 2,
+            "must emit init + terminal progress, got {}",
+            progress.len()
+        );
+        let finished = runner
+            .events
+            .iter()
+            .filter(|e| matches!(e, ExecEvent::OpFinished(_)))
+            .count();
+        assert_eq!(
+            finished,
+            cleanup_total_units() as usize,
+            "one OpFinished per work unit (evidence, not per-file)"
+        );
+    }
+
+    #[test]
+    fn cleanup_event_count_stays_batched_not_per_file() {
+        // ~39 units × (OpStarted + OpFinished) + banners + 2 progress +
+        // phase events must stay well under per-file chatter. A regression
+        // emitting per-file channel messages would exceed this generously.
+        let mut runner = MockRunner::all_ok();
+        let gate = crate::commands::PhaseGate::for_command(crate::commands::AppCommand::Clean)
+            .0
+            .unwrap();
+        let _ = run_cleanup_phase(&mut runner, &gate);
+        assert!(
+            runner.events.len() < 200,
+            "batched events expected, got {} (per-file chatter?)",
+            runner.events.len()
+        );
+    }
+
+    #[test]
+    fn program_steps_record_durations() {
+        let mut runner = MockRunner::all_ok();
+        let gate = crate::commands::PhaseGate::for_command(crate::commands::AppCommand::Clean)
+            .0
+            .unwrap();
+        let (results, _) = run_cleanup_phase(&mut runner, &gate);
+        for id in ["clean:npm", "clean:pip", "clean:dns", "clean:silent"] {
+            let r = results.iter().find(|x| x.id == id).unwrap();
+            assert!(
+                r.duration_ms.is_some(),
+                "{id} must carry monotonic timing (diagnostics, not progress)"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_dir_short_circuits_without_wasted_traversal() {
+        // Real empty temp dir: RealRunner must report existed with zero
+        // removals and no measurement failure (BAT TallyDir skips the
+        // after-measurement when before == 0).
+        use crate::commands::runner::RealRunner;
+        use crate::system::MaintenanceRunner;
+        let dir = std::env::temp_dir().join(format!(
+            "akari-test-empty-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut runner = RealRunner::new(None);
+        let out = runner.clean_dir(&dir);
+        assert!(out.existed);
+        assert_eq!(out.files_removed, 0);
+        assert_eq!(out.files_left, 0);
+        assert!(!out.measure_failed);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

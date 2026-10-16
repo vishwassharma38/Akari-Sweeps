@@ -459,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn one_never_means_exit_it_selects_cleanup() {
+    fn one_selects_cleanup() {
         assert_eq!(command_from_number(1), Some(AppCommand::Clean));
         assert_ne!(command_from_number(1), Some(AppCommand::Home));
         assert_eq!(command_from_input("1"), None, "typed 1 is not a command");

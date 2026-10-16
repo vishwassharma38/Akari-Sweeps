@@ -3,7 +3,7 @@
 use crate::akari::animation::{AnimationMode, AnimationSet, Animator};
 use crate::akari::sprites::{SpriteFrame, load_sweep_frames_best_effort};
 use crate::commands::AppCommand;
-use crate::system::{AppSummary, ExecEvent, OpResult, OpStatus};
+use crate::system::{AppSummary, ExecEvent, OpResult, OpStatus, ProgressState};
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
@@ -33,6 +33,11 @@ pub struct App {
     pub execution: ExecutionState,
     pub log: Vec<String>,
     pub operations: Vec<OpItem>,
+    /// Evidence-based operation progress (single coherent model for
+    /// clean/health/combined). Total comes from the worker's `Progress`
+    /// init (stable per run); completions advance on `OpFinished`
+    /// evidence; the running task shows as working without advancing.
+    pub progress: ProgressState,
     pub animator: Animator,
     pub frames: Vec<SpriteFrame>,
     pub sprite_error: Option<String>,
@@ -85,9 +90,10 @@ impl App {
             screen,
             execution,
             log: vec![format!(
-                "{PRODUCT_LABEL} — type a command or press ? for help."
+                "{PRODUCT_LABEL} — type a command (e.g. akarihelp for help)."
             )],
             operations: Vec::new(),
+            progress: ProgressState::default(),
             animator: Animator::new(AnimationSet::Sweep),
             frames,
             sprite_error,
@@ -165,6 +171,12 @@ impl App {
             }
             ExecEvent::OpStarted { id, label, target } => {
                 self.upsert_op(&id, &label, &target, OpStatus::Running);
+                // Working state: hold at the last defensible percentage and
+                // name the current task (no fabricated advance).
+                if self.progress.total > 0 {
+                    self.progress.current = format!("{label} — {target}");
+                    self.progress.indeterminate = true;
+                }
                 self.push_log(format!("▶ {label} — {target}"));
                 false
             }
@@ -184,12 +196,18 @@ impl App {
                 self.push_log(format!("━━ {name} finished ━━"));
                 false
             }
+            ExecEvent::Progress(p) => {
+                self.apply_progress(p);
+                false
+            }
             ExecEvent::Finished(summary) => {
                 self.apply_summary(summary);
                 true
             }
             ExecEvent::Error(e) => {
                 self.execution = ExecutionState::Error;
+                self.progress.failed = true;
+                self.progress.indeterminate = false;
                 self.push_log(format!("ERROR: {e}"));
                 self.status_line = e;
                 self.sync_animation();
@@ -198,10 +216,79 @@ impl App {
         }
     }
 
+    /// Merge a worker progress snapshot. Single coherent model:
+    /// - First init (or larger combined total) establishes the stable
+    ///   denominator; smaller per-phase inits during a combined run are
+    ///   ignored for the total so the bar never resets.
+    /// - Completions advance only via `OpFinished` evidence (see
+    ///   `apply_result`); snapshots carry totals and working states, never
+    ///   timer-based percentages.
+    /// - Failure is sticky: once any task fails, the bar stays FAILED.
+    fn apply_progress(&mut self, p: ProgressState) {
+        if self.progress.total == 0 {
+            self.progress = p;
+            return;
+        }
+        if p.total > self.progress.total {
+            // Larger combined total arriving (e.g. akariall init after a
+            // phase init): keep accumulated completions, adopt the total.
+            let completed = self.progress.completed;
+            let failed = self.progress.failed || p.failed;
+            self.progress = p;
+            self.progress.completed = completed.min(self.progress.total);
+            self.progress.failed = failed;
+            return;
+        }
+        if p.total < self.progress.total {
+            // Smaller per-phase init/update during a combined run: keep the
+            // combined total so progress never resets or moves backward.
+            // Adopt working-state details without touching the total.
+            if !p.current.is_empty() {
+                self.progress.current = p.current;
+            }
+            self.progress.failed = self.progress.failed || p.failed;
+            // Only adopt indeterminate when it names real work; terminal
+            // per-phase "complete" messages must not clear the combined
+            // working state prematurely (completions drive that).
+            if p.indeterminate {
+                self.progress.indeterminate = true;
+            }
+            return;
+        }
+        // Same total: monotonic completions only (never backward), sticky
+        // failure, latest working state.
+        if p.completed > self.progress.completed {
+            self.progress.completed = p.completed.min(self.progress.total);
+        }
+        if !p.current.is_empty() {
+            self.progress.current = p.current;
+        }
+        self.progress.failed = self.progress.failed || p.failed;
+        self.progress.indeterminate = p.indeterminate;
+        if p.cancelled {
+            self.progress.cancelled = true;
+        }
+    }
+
     fn apply_result(&mut self, r: &OpResult) {
         self.upsert_op(&r.id, &r.label, &r.target, r.status);
         if let Some(op) = self.operations.iter_mut().find(|o| o.id == r.id) {
             op.detail = r.detail.clone();
+        }
+        // Evidence-based advance: one completed work unit per settled
+        // operation (success, warning, failure, or skip all count — they
+        // all represent attempted work). Clamped to the stable total so a
+        // filesystem race can never push past 100%; monotonic by
+        // construction since completions only increment here.
+        if self.progress.total > 0 {
+            self.progress.completed = (self.progress.completed + 1).min(self.progress.total);
+            self.progress.indeterminate = false;
+            self.progress.current = format!("{} — {}", r.label, r.detail);
+            if r.status == OpStatus::Failed {
+                self.progress.failed = true;
+            }
+        } else if r.status == OpStatus::Failed {
+            self.progress.failed = true;
         }
         let mark = match r.status {
             OpStatus::Success => "✓",
@@ -224,6 +311,19 @@ impl App {
             if let Some(op) = self.operations.iter_mut().find(|o| o.id == r.id) {
                 op.detail = r.detail.clone();
             }
+        }
+        // Terminal progress: 100% only when all required work is accounted
+        // for. Failures render as FAILED (never plain success); the bar
+        // never claims completion early and never moves backward here.
+        if self.progress.total > 0 {
+            self.progress.completed = self.progress.total;
+            self.progress.indeterminate = false;
+            if summary.totals.err_count > 0 {
+                self.progress.failed = true;
+            }
+            self.progress.current = summary.overall.clone();
+        } else if summary.totals.err_count > 0 {
+            self.progress.failed = true;
         }
         self.push_log(format!("━━ summary: {} ━━", summary.overall));
         for w in &summary.totals.warnings {
@@ -254,6 +354,7 @@ impl App {
         self.worker_running = true;
         self.execution = ExecutionState::Running;
         self.operations.clear();
+        self.progress = ProgressState::default();
         self.summary = None;
         self.sync_animation();
     }
@@ -404,5 +505,251 @@ mod tests {
         assert_eq!(app.execution, ExecutionState::Done);
         assert!(!app.worker_running);
         // No further events are produced by completion itself.
+    }
+
+    // --- Progress model regression tests (prompt §4.2) ---
+
+    fn progress_app(total: u64) -> App {
+        let mut app = App::new(AppCommand::Clean);
+        app.mark_started(1);
+        app.on_event(ExecEvent::Progress(ProgressState::new(
+            0,
+            total,
+            "Starting…".to_string(),
+        )));
+        app
+    }
+
+    fn ok_result(id: &str) -> OpResult {
+        OpResult::ok(id, id, id, "done".to_string())
+    }
+
+    #[test]
+    fn progress_begins_at_initial_state() {
+        let app = progress_app(39);
+        assert_eq!(app.progress.completed, 0);
+        assert_eq!(app.progress.total, 39);
+        assert_eq!(app.progress.fraction(), 0.0);
+        assert!(!app.progress.failed);
+        assert!(!app.progress.cancelled);
+    }
+
+    #[test]
+    fn completed_tasks_advance_progress() {
+        let mut app = progress_app(4);
+        for (i, id) in ["a", "b", "c"].iter().enumerate() {
+            app.on_event(ExecEvent::OpFinished(ok_result(id)));
+            assert_eq!(app.progress.completed, (i + 1) as u64);
+        }
+        assert_eq!(app.progress.fraction(), 0.75);
+    }
+
+    #[test]
+    fn intermediate_advances_only_on_evidence() {
+        // OpStarted (working) must not advance; only OpFinished does.
+        let mut app = progress_app(4);
+        app.on_event(ExecEvent::OpStarted {
+            id: "x".into(),
+            label: "X".into(),
+            target: "t".into(),
+        });
+        assert_eq!(app.progress.completed, 0);
+        assert!(app.progress.indeterminate);
+        assert!(app.progress.current.contains('X'));
+        // A bare Progress snapshot with the same completed must not invent
+        // intermediate percentages either.
+        app.on_event(ExecEvent::Progress(ProgressState::new(
+            0,
+            4,
+            "X — working…".to_string(),
+        )));
+        assert_eq!(app.progress.completed, 0);
+        app.on_event(ExecEvent::OpFinished(ok_result("x")));
+        assert_eq!(app.progress.completed, 1);
+    }
+
+    #[test]
+    fn opaque_tasks_hold_without_fabrication() {
+        // While an opaque DISM runs, the bar holds at the last defensible
+        // percentage and names the task; it never creeps upward on its own.
+        let mut app = progress_app(6);
+        app.on_event(ExecEvent::OpFinished(ok_result("r1")));
+        app.on_event(ExecEvent::OpFinished(ok_result("r2")));
+        assert!((app.progress.percent() - 100.0 * 2.0 / 6.0).abs() < 1e-9);
+        app.on_event(ExecEvent::OpStarted {
+            id: "repair:restorehealth".into(),
+            label: "[Repair 4/6] DISM - REPAIR".into(),
+            target: "DISM.exe /RestoreHealth".into(),
+        });
+        // Still 2/6 (33.3%), now marked working.
+        assert_eq!(app.progress.completed, 2);
+        assert!(app.progress.indeterminate);
+        let line = app.progress.status_line(12);
+        assert!(line.contains("33.3%"));
+        assert!(line.contains("working:"));
+        assert!(!line.contains("100.0%"));
+    }
+
+    #[test]
+    fn combined_progress_spans_both_phases_without_resetting() {
+        // Combined total 45: cleanup 39 units then health 6 units.
+        let mut app = progress_app(45);
+        for i in 0..39 {
+            app.on_event(ExecEvent::OpFinished(ok_result(&format!("c{i}"))));
+        }
+        assert_eq!(app.progress.completed, 39);
+        // Per-phase init with a smaller total must not reset the bar.
+        app.on_event(ExecEvent::Progress(ProgressState::new(
+            0,
+            6,
+            "Starting system repair…".to_string(),
+        )));
+        assert_eq!(app.progress.completed, 39);
+        assert_eq!(app.progress.total, 45);
+        // Health completions continue from 39 upward (never backward).
+        let mut last = app.progress.completed;
+        for i in 0..6 {
+            app.on_event(ExecEvent::OpFinished(ok_result(&format!("r{i}"))));
+            assert!(app.progress.completed >= last);
+            last = app.progress.completed;
+        }
+        assert_eq!(app.progress.completed, 45);
+    }
+
+    #[test]
+    fn progress_never_moves_backward() {
+        let mut app = progress_app(10);
+        app.on_event(ExecEvent::OpFinished(ok_result("a")));
+        app.on_event(ExecEvent::OpFinished(ok_result("b")));
+        assert_eq!(app.progress.completed, 2);
+        // Stale/duplicate snapshot with fewer completions is ignored.
+        app.on_event(ExecEvent::Progress(ProgressState::new(
+            1,
+            10,
+            "stale".to_string(),
+        )));
+        assert_eq!(app.progress.completed, 2);
+    }
+
+    #[test]
+    fn failure_does_not_appear_as_success() {
+        let mut app = progress_app(3);
+        app.on_event(ExecEvent::OpFinished(ok_result("a")));
+        let mut bad = OpResult::failed("b", "B", "t", "boom".into());
+        bad.exit_code = Some(1);
+        app.on_event(ExecEvent::OpFinished(bad));
+        assert!(app.progress.failed);
+        app.on_event(ExecEvent::OpFinished(ok_result("c")));
+        // All work accounted for (3/3) but flagged FAILED, not success.
+        let totals = {
+            let mut t = RunTotals::default();
+            t.add_ok();
+            t.add_error("boom".into());
+            t
+        };
+        let summary = AppSummary::compute(
+            "completed".into(),
+            "ran".into(),
+            true,
+            totals,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        app.on_event(ExecEvent::Finished(summary));
+        assert_eq!(app.progress.completed, app.progress.total);
+        assert!(app.progress.failed);
+        let line = app.progress.status_line(10);
+        assert!(line.contains("FAILED"));
+    }
+
+    #[test]
+    fn cancellation_stays_below_full_and_marked() {
+        let mut app = progress_app(6);
+        app.on_event(ExecEvent::OpFinished(ok_result("a")));
+        app.on_event(ExecEvent::OpFinished(ok_result("b")));
+        let mut p = ProgressState::new(2, 6, "DISM ScanHealth".to_string());
+        p.cancelled = true;
+        app.on_event(ExecEvent::Progress(p));
+        assert!(app.progress.cancelled);
+        assert!(app.progress.completed < app.progress.total);
+        let line = app.progress.status_line(10);
+        assert!(line.contains("cancelled"));
+        assert!(!line.contains("100.0%"));
+    }
+
+    #[test]
+    fn reaches_full_only_at_terminal_completion() {
+        let mut app = progress_app(2);
+        app.on_event(ExecEvent::OpFinished(ok_result("a")));
+        assert!(app.progress.completed < app.progress.total);
+        assert_ne!(app.progress.percent_text(), "100.0%");
+        let summary = AppSummary::compute(
+            "completed".into(),
+            "ran".into(),
+            false,
+            RunTotals::default(),
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        app.on_event(ExecEvent::Finished(summary));
+        assert_eq!(app.progress.completed, app.progress.total);
+        assert_eq!(app.progress.percent_text(), "100.0%");
+    }
+
+    #[test]
+    fn fast_commands_without_output_do_not_break_progress() {
+        let mut app = progress_app(3);
+        // No stdout, immediate exit 0 — still one evidence unit each.
+        for id in ["fast1", "fast2", "fast3"] {
+            app.on_event(ExecEvent::OpStarted {
+                id: id.into(),
+                label: id.into(),
+                target: "t".into(),
+            });
+            app.on_event(ExecEvent::OpFinished(ok_result(id)));
+        }
+        assert_eq!(app.progress.completed, 3);
+        assert_eq!(app.progress.percent_text(), "100.0%");
+        assert!(!app.progress.failed);
+    }
+
+    #[test]
+    fn progress_updates_do_not_hide_final_result() {
+        let mut app = progress_app(1);
+        app.on_event(ExecEvent::OpFinished(ok_result("only")));
+        let summary = AppSummary::compute(
+            "completed".into(),
+            "not run".into(),
+            false,
+            RunTotals::default(),
+            vec![ok_result("only")],
+            vec![],
+            None,
+            None,
+        );
+        assert!(app.on_event(ExecEvent::Finished(summary)));
+        assert!(app.summary.is_some());
+        assert_eq!(app.execution, ExecutionState::Done);
+        assert_eq!(app.progress.completed, app.progress.total);
+    }
+
+    #[test]
+    fn progress_event_burst_stays_responsive() {
+        // 200 synthetic completions must drain quickly (generous bound —
+        // not a brittle benchmark, just a stall guard). Real runs emit
+        // ~45 completions; per-file chatter would be orders more.
+        use std::time::Instant;
+        let mut app = progress_app(200);
+        let t0 = Instant::now();
+        for i in 0..200 {
+            app.on_event(ExecEvent::OpFinished(ok_result(&format!("u{i}"))));
+        }
+        let ms = t0.elapsed().as_millis();
+        assert_eq!(app.progress.completed, 200);
+        assert!(ms < 2000, "200 progress updates took {ms} ms");
     }
 }
