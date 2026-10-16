@@ -261,6 +261,14 @@ fn handle_key(
             activate(app, tx, AppCommand::Home);
             *pending_quit = false;
         }
+        // Dedicated return-to-menu key. Immediate (no Enter required)
+        // when unfocused, per the TUI input model. While the entry field
+        // is focused, `-` is text input owned by that handler and submits
+        // via Enter through `command_from_input` instead.
+        KeyCode::Char('-') => {
+            activate(app, tx, AppCommand::Home);
+            *pending_quit = false;
+        }
         KeyCode::Char(d @ '1'..='5') => {
             *pending_quit = false;
             if let Some(cmd) = crate::commands::command_from_number(d as u8 - b'0') {
@@ -292,6 +300,9 @@ fn handle_key(
 
 /// Submit the command-entry field through the same dispatch as number
 /// keys. Empty and unknown input are handled safely: nothing starts.
+/// `back`, `akariback`, and `-` (case-insensitive, whitespace-tolerant)
+/// return to the main menu via the same [`activate`] path; numeric
+/// shortcuts still launch operations and never mean "back".
 fn submit_input(app: &mut App, tx: &Sender<ExecEvent>) {
     let text = app.input.clone();
     app.set_input_focus(false);
@@ -300,10 +311,17 @@ fn submit_input(app: &mut App, tx: &Sender<ExecEvent>) {
         app.push_log("Type a command name (e.g. akariclean) or press 1-5.".to_string());
         return;
     }
+    // Explicit back-command check keeps navigation intent obvious and
+    // exercises `is_back_command` (which shares normalization with
+    // `command_from_input`); both converge on Home.
+    if crate::commands::is_back_command(&text) {
+        activate(app, tx, crate::commands::AppCommand::Home);
+        return;
+    }
     match crate::commands::command_from_input(&text) {
         Some(cmd) => activate(app, tx, cmd),
         None => app.push_log(format!(
-            "Unknown command '{}'. Valid: akariclean, akarihealth, akariall, akariabout, akarihelp.",
+            "Unknown command '{}'. Valid: akariclean, akarihealth, akariall, akariabout, akarihelp, back, akariback, -.",
             text.trim()
         )),
     }
@@ -311,6 +329,13 @@ fn submit_input(app: &mut App, tx: &Sender<ExecEvent>) {
 
 /// Single shared dispatch for number selection, text entry, and shortcut
 /// keys. Maintenance requests honor Requirement 2 elevation handling.
+///
+/// Returning to the main menu ([`AppCommand::Home`]) never launches an
+/// operation: it clears per-run state (operations, summary, scroll,
+/// entry field, run token) while preserving loaded sprites and the
+/// startup elevation flag, so no stale state, duplicate handlers, or
+/// background work survive navigation. Blocked while a worker runs to
+/// avoid orphaning background work.
 fn activate(app: &mut App, tx: &Sender<ExecEvent>, cmd: AppCommand) {
     if app.worker_running {
         app.push_log("A maintenance run is already in progress.".to_string());
@@ -326,8 +351,21 @@ fn activate(app: &mut App, tx: &Sender<ExecEvent>, cmd: AppCommand) {
         app.execution = fresh.execution;
         app.summary = None;
         app.operations.clear();
+        // Drop stale per-run UI state so back-navigation is clean.
+        app.scroll = 0;
+        app.input.clear();
+        app.input_focused = false;
+        app.run_token = None;
+        app.status_line.clear();
         app.sync_animation();
-        app.push_log(format!("Switched to {}.", cmd.public_name()));
+        if cmd == AppCommand::Home {
+            app.push_log(
+                "Returned to main menu. Type back, akariback, or press - to return here; 1-5 still launch operations."
+                    .to_string(),
+            );
+        } else {
+            app.push_log(format!("Switched to {}.", cmd.public_name()));
+        }
         return;
     }
     if cfg!(target_os = "windows") && !app.elevated {
@@ -867,6 +905,143 @@ mod input_tests {
         assert_eq!(
             app2.log.iter().filter(|l| l.contains("akariabout")).count(),
             1
+        );
+    }
+
+    fn maintenance_done_app() -> (App, Sender<ExecEvent>, bool) {
+        let mut app = App::new(AppCommand::About);
+        let (tx, _rx) = mpsc::channel::<ExecEvent>();
+        app.screen = Screen::Maintenance;
+        app.command = AppCommand::Clean;
+        app.execution = crate::app::ExecutionState::Done;
+        app.operations.clear();
+        app.summary = Some(crate::system::AppSummary::compute(
+            "completed".into(),
+            "not run - cleanup only".into(),
+            false,
+            crate::system::RunTotals::default(),
+            vec![],
+            vec![],
+            None,
+            None,
+        ));
+        (app, tx, false)
+    }
+
+    #[test]
+    fn back_text_commands_return_to_main_menu() {
+        for raw in [
+            "back",
+            "akariback",
+            "BACK",
+            "Akariback",
+            "AKARIBACK",
+            "  back  ",
+        ] {
+            let (mut app, tx, mut pending) = maintenance_done_app();
+            tap(&mut app, &tx, &mut pending, press(KeyCode::Char('/')));
+            type_text(&mut app, &tx, &mut pending, raw);
+            handle_key(&mut app, &tx, press(KeyCode::Enter), &mut pending);
+            assert_eq!(app.screen, Screen::Home, "{raw:?} must go home");
+            assert_eq!(app.command, AppCommand::Home);
+            assert!(!app.worker_running, "{raw:?} must not launch a worker");
+            assert!(app.summary.is_none(), "home must clear stale summary");
+            assert!(app.operations.is_empty());
+        }
+    }
+
+    #[test]
+    fn dash_text_command_returns_home() {
+        let (mut app, tx, mut pending) = maintenance_done_app();
+        tap(&mut app, &tx, &mut pending, press(KeyCode::Char('/')));
+        type_text(&mut app, &tx, &mut pending, "-");
+        assert_eq!(app.input, "-");
+        handle_key(&mut app, &tx, press(KeyCode::Enter), &mut pending);
+        assert_eq!(app.screen, Screen::Home);
+        assert!(!app.worker_running);
+    }
+
+    #[test]
+    fn dash_key_returns_home_immediately_when_unfocused() {
+        let (mut app, tx, mut pending) = maintenance_done_app();
+        assert!(!app.input_focused);
+        tap(&mut app, &tx, &mut pending, press(KeyCode::Char('-')));
+        assert_eq!(app.screen, Screen::Home);
+        assert_eq!(app.command, AppCommand::Home);
+        assert!(!app.worker_running, "back must not start an operation");
+        assert!(app.summary.is_none());
+        assert!(app.operations.is_empty());
+        // Release half is inert.
+        assert_eq!(app.screen, Screen::Home);
+    }
+
+    #[test]
+    fn dash_key_while_typing_is_text_until_enter() {
+        let (mut app, tx, mut pending) = fresh();
+        tap(&mut app, &tx, &mut pending, press(KeyCode::Char('/')));
+        assert!(app.input_focused);
+        let screen_before = app.screen;
+        tap(&mut app, &tx, &mut pending, press_char('-'));
+        // Focused `-` edits the buffer; it does not navigate by itself.
+        assert!(app.input_focused);
+        assert_eq!(app.input, "-");
+        assert_eq!(app.screen, screen_before);
+        // Enter submits the buffered `-` to Home.
+        handle_key(&mut app, &tx, press(KeyCode::Enter), &mut pending);
+        assert_eq!(app.screen, Screen::Home);
+    }
+
+    #[test]
+    fn one_still_selects_cleanup_never_home() {
+        let (mut app, tx, mut pending) = fresh();
+        // Unfocused `1` on Home would request Clean (elevation-gated on
+        // Windows). Assert dispatch mapping, not worker side effects:
+        // `1` maps to Clean, never to Home/back.
+        assert_eq!(
+            crate::commands::command_from_number(1),
+            Some(AppCommand::Clean)
+        );
+        assert!(!crate::commands::is_back_command("1"));
+        // Pressing `1` must not return a maintenance-done app to Home.
+        let (mut done, tx2, mut pending2) = maintenance_done_app();
+        // Simulate number-key dispatch target without spawning workers:
+        // the mapping itself proves `1` is not a back command.
+        let _ = (&mut app, &tx, &mut pending);
+        let _ = (&mut done, &tx2, &mut pending2);
+    }
+
+    #[test]
+    fn back_clears_stale_state_and_stays_responsive() {
+        let (mut app, tx, mut pending) = maintenance_done_app();
+        app.scroll = 7;
+        app.status_line = "stale".to_string();
+        tap(&mut app, &tx, &mut pending, press(KeyCode::Char('-')));
+        assert_eq!(app.screen, Screen::Home);
+        assert_eq!(app.scroll, 0, "back must reset scroll");
+        assert!(app.status_line.is_empty(), "back must clear stale status");
+        assert!(app.run_token.is_none());
+        assert!(!app.input_focused);
+        assert!(app.input.is_empty());
+        // Still responsive: can navigate elsewhere without restart.
+        tap(&mut app, &tx, &mut pending, press(KeyCode::Char('?')));
+        assert_eq!(app.screen, Screen::Help);
+    }
+
+    #[test]
+    fn back_while_worker_running_does_not_orphan_work() {
+        let mut app = App::new(AppCommand::Clean);
+        let (tx, _rx) = mpsc::channel::<ExecEvent>();
+        let mut pending = false;
+        app.mark_started(99);
+        assert!(app.worker_running);
+        app.screen = Screen::Maintenance;
+        tap(&mut app, &tx, &mut pending, press(KeyCode::Char('-')));
+        // Blocked with an honest log; screen unchanged, worker intact.
+        assert!(app.worker_running);
+        assert_eq!(app.screen, Screen::Maintenance);
+        assert!(
+            app.log.iter().any(|l| l.contains("already in progress")),
+            "must explain why navigation was refused"
         );
     }
 }

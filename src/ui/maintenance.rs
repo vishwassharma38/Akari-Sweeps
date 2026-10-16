@@ -57,6 +57,23 @@ pub fn summary_lines(app: &App) -> Vec<Line<'static>> {
                 _ => "unavailable".to_string(),
             }
         )));
+        // Unambiguous return navigation once the run settled. Numeric
+        // keys still launch operations; `1` never means exit.
+        if matches!(
+            app.execution,
+            crate::app::ExecutionState::Done | crate::app::ExecutionState::Error
+        ) {
+            out.push(Line::from(
+                "Type back, akariback, or press - to return to the main menu.",
+            ));
+        }
+    } else if matches!(
+        app.execution,
+        crate::app::ExecutionState::Done | crate::app::ExecutionState::Error
+    ) {
+        out.push(Line::from(
+            "Type back, akariback, or press - to return to the main menu.",
+        ));
     }
     out
 }

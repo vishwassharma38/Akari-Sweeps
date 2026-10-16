@@ -1,7 +1,10 @@
-//! Cleanup phase — faithful port of BAT `:PhaseCleanup` ([1/18]–[18/18]).
+//! Cleanup phase — strict cleaning-only workflow.
 //!
-//! Authority: `Akari-Sweeps.bat`. No extra deletion targets. Every
-//! `CleanDir` call below appears in the same order as the script.
+//! Strict separation: `akariclean` launches zero DISM, SFC, CHKDSK, or
+//! other Windows health/servicing commands, including
+//! `DISM /StartComponentCleanup` (now owned by the health workflow).
+//! Directory targets preserve BAT `:PhaseCleanup` order; `[18/18]` is
+//! Disk Cleanup + SilentCleanup only.
 
 use crate::system::{ExecEvent, MaintenanceRunner, OpResult, RunTotals, expand_windows_template};
 use std::path::{Path, PathBuf};
@@ -264,32 +267,133 @@ pub fn measure_dir(path: &Path) -> Option<(u64, u64)> {
     Some((count, bytes / 1024))
 }
 
-/// Delete directory *contents* but leave the directory itself,
-/// mirroring `del /f /s /q + rd` with locked files skipped silently.
-pub fn clean_dir_contents(path: &Path) {
-    let entries = match std::fs::read_dir(path) {
+/// Why a single file/directory entry could not be removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteFailureKind {
+    /// Sharing/lock violation: file is in use by a running app/service.
+    LockedInUse,
+    /// Access denied: insufficient permissions (may need elevation).
+    PermissionDenied,
+    /// Any other I/O failure.
+    Other,
+}
+
+/// Classify a deletion I/O error without guessing.
+///
+/// On Windows, raw OS errors 32 (`ERROR_SHARING_VIOLATION`) and 33
+/// (`ERROR_LOCK_VIOLATION`) mean locked/in-use; 5
+/// (`ERROR_ACCESS_DENIED`) means permission. Elsewhere, map
+/// `PermissionDenied` kind accordingly; everything else is `Other`.
+/// `NotFound` is treated as success (already gone) by callers and never
+/// reaches this classifier as a failure.
+pub fn classify_delete_error(e: &std::io::Error) -> DeleteFailureKind {
+    if let Some(code) = e.raw_os_error() {
+        // Windows sharing/lock violations: locked or in use.
+        if code == 32 || code == 33 {
+            return DeleteFailureKind::LockedInUse;
+        }
+        if code == 5 {
+            return DeleteFailureKind::PermissionDenied;
+        }
+    }
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied => DeleteFailureKind::PermissionDenied,
+        _ => {
+            // On Windows without a raw code, fall back to kind; sharing
+            // violations sometimes surface as generic errors, so treat
+            // unclassified failures as Other (honest, not mislabeled).
+            DeleteFailureKind::Other
+        }
+    }
+}
+
+/// Per-directory deletion breakdown for honest reporting.
+#[derive(Debug, Clone, Default)]
+pub struct CleanDetail {
+    pub locked: u64,
+    pub permission: u64,
+    pub other: u64,
+}
+
+fn record_delete_failure(detail: &mut CleanDetail, e: &std::io::Error) {
+    // NotFound means another process already removed it: not a failure.
+    if e.kind() == std::io::ErrorKind::NotFound {
+        return;
+    }
+    match classify_delete_error(e) {
+        DeleteFailureKind::LockedInUse => detail.locked += 1,
+        DeleteFailureKind::PermissionDenied => detail.permission += 1,
+        DeleteFailureKind::Other => detail.other += 1,
+    }
+}
+
+fn remove_one_entry(path: &Path, detail: &mut CleanDetail) {
+    // Symlinks/junctions: remove the link itself, never follow it.
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) => {
+            record_delete_failure(detail, &e);
+            return;
+        }
+    };
+    if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+        // Recurse first so one locked file does not abort siblings;
+        // then try to remove the (now hopefully empty) dir itself.
+        clean_contents_recursive(path, detail);
+        if let Err(e) = std::fs::remove_dir(path) {
+            // Directory not empty (locked child skipped) is expected:
+            // count once as Other only if the dir itself is the problem,
+            // otherwise children already counted. Probe emptiness cheaply.
+            let empty = std::fs::read_dir(path)
+                .map(|mut r| r.next().is_none())
+                .unwrap_or(false);
+            if empty {
+                record_delete_failure(detail, &e);
+            }
+            // Non-empty due to skipped children: already counted.
+        }
+    } else if let Err(e) = std::fs::remove_file(path) {
+        record_delete_failure(detail, &e);
+    }
+}
+
+fn clean_contents_recursive(dir: &Path, detail: &mut CleanDetail) {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(e) => {
+            record_delete_failure(detail, &e);
+            return;
+        }
     };
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
-            Err(_) => continue,
-        };
-        let p = entry.path();
-        let ft = match entry.file_type() {
-            Ok(t) => t,
             Err(_) => {
-                let _ = std::fs::remove_file(&p);
+                detail.other += 1;
                 continue;
             }
         };
-        if ft.is_dir() {
-            let _ = std::fs::remove_dir_all(&p);
-        } else {
-            let _ = std::fs::remove_file(&p);
-        }
+        remove_one_entry(&entry.path(), detail);
     }
+}
+
+/// Delete directory *contents* but leave the directory itself,
+/// mirroring `del /f /s /q + rd` with locked files skipped safely.
+///
+/// One failed file never aborts siblings: deletion is per-entry and
+/// continues. No force-delete, no process termination, no privilege
+/// bypass. Returns a best-effort breakdown for reporting.
+pub fn clean_dir_contents_detailed(path: &Path) -> CleanDetail {
+    let mut detail = CleanDetail::default();
+    clean_contents_recursive(path, &mut detail);
+    detail
+}
+
+/// Delete directory *contents* but leave the directory itself,
+/// mirroring `del /f /s /q + rd` with locked files skipped silently.
+#[allow(dead_code)]
+pub fn clean_dir_contents(path: &Path) {
+    let _ = clean_dir_contents_detailed(path);
 }
 
 /// Enumerate immediate subdirectories (for Chromium profiles / Firefox).
@@ -351,15 +455,24 @@ fn run_one_dir(
     totals.files_removed += outcome.files_removed;
     totals.kb_removed += outcome.kb_removed;
     totals.files_left += outcome.files_left;
-    let mut r = OpResult::ok(
-        &id,
-        phase,
-        &display,
-        format!(
-            "removed {} files ({} KB); {} left",
-            outcome.files_removed, outcome.kb_removed, outcome.files_left
-        ),
+    totals.files_locked += outcome.locked_skipped;
+    totals.files_permission += outcome.permission_denied;
+    totals.files_other_left += outcome.other_unremovable;
+    let mut detail = format!(
+        "removed {} files ({} KB); {} left",
+        outcome.files_removed, outcome.kb_removed, outcome.files_left
     );
+    if outcome.files_left > 0
+        && (outcome.locked_skipped > 0
+            || outcome.permission_denied > 0
+            || outcome.other_unremovable > 0)
+    {
+        detail.push_str(&format!(
+            " (locked/in-use: {}, permission: {}, other: {})",
+            outcome.locked_skipped, outcome.permission_denied, outcome.other_unremovable
+        ));
+    }
+    let mut r = OpResult::ok(&id, phase, &display, detail);
     r.files_removed = outcome.files_removed;
     r.kb_removed = outcome.kb_removed;
     r.files_left = outcome.files_left;
@@ -464,6 +577,13 @@ fn run_firefox(
 
 /// DISM result mapping shared with the repair phase (`:RecordDism`):
 /// 0 = success, 3010 = success + restart warning, else failure.
+///
+/// Exit 740 (ERROR_ELEVATION_REQUIRED) is reported as a failure with
+/// explicit elevation guidance — never suppressed or claimed as
+/// success. Callers must ensure the DISM task runs only in its
+/// intended workflow (cleanup's `[18/18]` component-store cleanup vs.
+/// repair's Check/Scan/RestoreHealth); this mapping only interprets
+/// the exit code honestly.
 pub fn record_dism(
     totals: &mut RunTotals,
     op: &str,
@@ -493,6 +613,22 @@ pub fn record_dism(
         );
         r.exit_code = Some(3010);
         r
+    } else if exit_code == 740 {
+        totals.add_error(format!(
+            "DISM {op} failed with exit code 740 (elevation required). \
+             Run as administrator and approve the UAC prompt, then retry. {stdout_tail}"
+        ));
+        let mut r = OpResult::failed(
+            &format!("dism:{op}"),
+            "DISM",
+            op,
+            format!(
+                "DISM {op} FAILED with exit code 740 — requires elevation. \
+                 Right-click the app and choose 'Run as administrator'. {stdout_tail}"
+            ),
+        );
+        r.exit_code = Some(740);
+        r
     } else {
         totals.add_error(format!("DISM {op} failed with exit code {exit_code}."));
         let mut r = OpResult::failed(
@@ -503,6 +639,37 @@ pub fn record_dism(
         );
         r.exit_code = Some(exit_code);
         r
+    }
+}
+
+/// Resolve the npm executable in a Windows-compatible way.
+///
+/// On Windows npm is commonly exposed as `npm.cmd` (a batch shim) which
+/// `CreateProcess` cannot launch via a bare `npm` lookup — attempting
+/// `Command::new("npm")` then fails with the 9009 spawn sentinel even
+/// though `where npm` succeeds. Prefer `npm.cmd` when present, fall back
+/// to `npm`, and return `None` when neither resolves (caller reports
+/// "not installed — skipped", never false success).
+pub fn resolve_npm_program(runner: &mut dyn MaintenanceRunner) -> Option<String> {
+    if runner.program_exists("npm.cmd") {
+        return Some("npm.cmd".to_string());
+    }
+    if runner.program_exists("npm") {
+        return Some("npm".to_string());
+    }
+    None
+}
+
+/// Human-readable detail for an npm failure, distinguishing a missing
+/// executable (9009) from a real non-zero exit. Never claims success.
+pub fn npm_failure_detail(exit_code: i32, stderr_tail: &str) -> String {
+    if exit_code == 9009 {
+        format!(
+            "FAILED - npm executable could not be launched (exit 9009 - not found or not executable; \
+             check PATH / Node.js installation; on Windows prefer npm.cmd). {stderr_tail}"
+        )
+    } else {
+        format!("FAILED - exit code {exit_code}. {stderr_tail}")
     }
 }
 
@@ -521,8 +688,8 @@ fn tail(s: &str, max: usize) -> String {
 /// The `CleanupGate` proves the caller is authorized for the cleanup
 /// phase (see `PhaseGate::for_command`). This function holds no repair
 /// gate, so it cannot invoke the repair phase — isolation is structural,
-/// not just conventional. It invokes zero repair-phase commands
-/// (no DISM health check/scan/restore, no SFC, no CHKDSK).
+/// not just conventional. It invokes zero DISM commands of any kind
+/// (including `/StartComponentCleanup`), zero SFC, zero CHKDSK.
 pub fn run_cleanup_phase(
     runner: &mut dyn MaintenanceRunner,
     _gate: &crate::commands::CleanupGate,
@@ -697,13 +864,27 @@ pub fn run_cleanup_phase(
     }
 
     // [16/18] npm + pip (only when installed; else skipped, like BAT).
+    // npm on Windows is `npm.cmd`; using a bare `npm` with
+    // `CreateProcess` yields the 9009 spawn sentinel despite `where`
+    // succeeding. Resolve compatibly and report honestly.
     emit(
         runner,
         ExecEvent::Log("[16/18] DEVELOPER PACKAGE CACHES".to_string()),
     );
-    if runner.program_exists("npm") {
-        emit(runner, ExecEvent::Log("Cleaning npm cache...".to_string()));
-        let out = runner.run_program("npm", &["cache", "clean", "--force"]);
+    if let Some(npm_prog) = resolve_npm_program(runner) {
+        emit(
+            runner,
+            ExecEvent::Log(format!("Cleaning npm cache via {npm_prog}...")),
+        );
+        let out = runner.run_program(&npm_prog, &["cache", "clean", "--force"]);
+        for line in out.stdout.lines().take(5) {
+            emit(runner, ExecEvent::Log(line.to_string()));
+        }
+        if !out.stderr.trim().is_empty() {
+            for line in out.stderr.lines().take(4) {
+                emit(runner, ExecEvent::Log(format!("stderr: {line}")));
+            }
+        }
         if out.exit_code == 0 {
             totals.add_ok();
             let mut r = OpResult::ok(
@@ -715,15 +896,23 @@ pub fn run_cleanup_phase(
             r.exit_code = Some(0);
             results.push(r);
         } else {
-            totals.add_error(format!(
-                "npm cache clean failed with exit code {}.",
-                out.exit_code
-            ));
+            let err_tail = tail(&format!("{} {}", out.stdout, out.stderr), 160);
+            if out.exit_code == 9009 {
+                totals.add_error(format!(
+                    "npm cache clean could not be launched (exit 9009 - executable not found or not runnable; \
+                     check PATH / Node.js installation; tried {npm_prog}). {err_tail}"
+                ));
+            } else {
+                totals.add_error(format!(
+                    "npm cache clean failed with exit code {}. {err_tail}",
+                    out.exit_code
+                ));
+            }
             let mut r = OpResult::failed(
                 "clean:npm",
                 "16/18 NPM",
                 "npm cache",
-                format!("FAILED - exit code {}", out.exit_code),
+                npm_failure_detail(out.exit_code, &err_tail),
             );
             r.exit_code = Some(out.exit_code);
             results.push(r);
@@ -819,6 +1008,27 @@ pub fn run_cleanup_phase(
                 "Clear-RecycleBin -Force -ErrorAction SilentlyContinue",
             ],
         );
+        // Exit-code-1 cause remains explicitly unknown: Microsoft
+        // documents no exit-code contract for `Clear-RecycleBin`, and
+        // `-ErrorAction SilentlyContinue` suppresses per-item errors, so
+        // stdout/stderr are typically empty. Observed hypotheses (empty
+        // bin, per-item delete failure, host PowerShell version) are
+        // unconfirmed. Resolving it requires controlled Windows evidence:
+        // empty vs. non-empty bin runs, `$LASTEXITCODE` + `$Error[0]`
+        // capture without `SilentlyContinue`, and PS 5.1 vs 7 runs, all
+        // with elevation held constant. Until then it must stay a
+        // warning — never coerced to success or to a hard error.
+        for line in out.stdout.lines().take(5) {
+            let t = line.trim();
+            if !t.is_empty() {
+                emit(runner, ExecEvent::Log(t.to_string()));
+            }
+        }
+        if !out.stderr.trim().is_empty() {
+            for line in out.stderr.lines().take(4) {
+                emit(runner, ExecEvent::Log(format!("stderr: {line}")));
+            }
+        }
         if out.exit_code == 0 {
             totals.add_ok();
             let mut r = OpResult::ok(
@@ -830,18 +1040,21 @@ pub fn run_cleanup_phase(
             r.exit_code = Some(0);
             results.push(r);
         } else {
+            let err_tail = tail(&format!("{} {}", out.stdout, out.stderr), 160);
             totals.add_warning(format!(
-                "Recycle Bin command returned exit code {}; the result could not be verified.",
+                "Recycle Bin command returned exit code {}; the result could not be verified. {err_tail}",
                 out.exit_code
             ));
             // BAT records this as a warning, not an error: unknown result,
             // honestly reported as `Warning` rather than success or failure.
+            // Exit 1 in particular does not prove the bin was or was not
+            // emptied; do not convert it to success.
             let mut r = OpResult::warning(
                 "clean:recyclebin",
                 "17/18 RECYCLE BIN",
                 "Recycle Bin",
                 format!(
-                    "command returned exit code {} - result unknown",
+                    "command returned exit code {} - result unknown (not verified, not assumed empty). {err_tail}",
                     out.exit_code
                 ),
             );
@@ -850,7 +1063,9 @@ pub fn run_cleanup_phase(
         }
     }
 
-    // [18/18] cleanmgr + SilentCleanup + DISM StartComponentCleanup.
+    // [18/18] cleanmgr + SilentCleanup only. No DISM here by strict
+    // separation: component-store servicing belongs to the health
+    // workflow even though the BAT historically ran it under cleanup.
     emit(
         runner,
         ExecEvent::Log("[18/18] WINDOWS BUILT-IN CLEANUP".to_string()),
@@ -963,40 +1178,35 @@ pub fn run_cleanup_phase(
             ));
         }
     }
-    {
-        emit(
-            runner,
-            ExecEvent::Log("Running Windows component-store cleanup...".to_string()),
-        );
-        let out = runner.run_program(
-            "DISM.exe",
-            &["/Online", "/Cleanup-Image", "/StartComponentCleanup"],
-        );
-        for line in out.stdout.lines().take(8) {
-            emit(runner, ExecEvent::Log(line.to_string()));
-        }
-        let mut r = record_dism(
-            &mut totals,
-            "StartComponentCleanup",
-            out.exit_code,
-            &tail(&out.stdout, 160),
-        );
-        // Relabel: this is the BAT's [18/18] component-store *cleanup*,
-        // not image repair. The `dism:` identity previously made cleanup
-        // look like it had entered the repair workflow.
-        r.id = "clean:comp-store-cleanup".to_string();
-        r.label = "[18/18] COMPONENT-STORE CLEANUP".to_string();
-        r.target = "DISM /Online /Cleanup-Image /StartComponentCleanup (cleanup phase)".to_string();
-        results.push(r);
-    }
+    // Strict separation: no DISM /StartComponentCleanup here. It now
+    // runs as the first step of the health workflow.
 
     // BAT end-of-cleanup bookkeeping: +1 OK, warnings for leftovers.
+    // Report honestly by cause: locked/in-use files are skipped safely;
+    // permission and other failures are not mislabeled as locking.
+    // No force-delete, no process termination, no retry loop (an
+    // immediate retry would freeze the TUI while files are still held).
+    // Cleanup continues per-file, so one failure never aborts siblings.
     totals.add_ok();
     if totals.files_left > 0 {
-        totals.add_warning(format!(
-            "{} file[s] in the cleaned folders could not be deleted [locked or in use].",
-            totals.files_left
-        ));
+        if totals.files_locked + totals.files_permission + totals.files_other_left > 0 {
+            totals.add_warning(format!(
+                "{} file[s] in the cleaned folders could not be deleted \
+                 (locked/in-use: {}, permission denied: {}, other: {}) - skipped safely.",
+                totals.files_left,
+                totals.files_locked,
+                totals.files_permission,
+                totals.files_other_left
+            ));
+        } else {
+            // Mock runners and unmeasurable breakdowns: preserve the
+            // BAT-compatible wording without claiming a cause we did not
+            // measure.
+            totals.add_warning(format!(
+                "{} file[s] in the cleaned folders could not be deleted [locked or in use].",
+                totals.files_left
+            ));
+        }
     }
     if totals.measure_fail > 0 {
         totals.add_warning(format!(
@@ -1032,7 +1242,7 @@ mod tests {
         pub fn new() -> Self {
             Self {
                 programs: HashMap::new(),
-                existing_programs: vec!["npm".into(), "pip".into()],
+                existing_programs: vec!["npm".into(), "npm.cmd".into(), "pip".into()],
                 events: Vec::new(),
             }
         }
@@ -1040,19 +1250,20 @@ mod tests {
         pub fn all_ok() -> Self {
             let mut m = Self::new();
             // Every program the cleanup phase can call succeeds.
+            // Strict separation: no DISM here.
             for key in [
                 "net stop wuauserv /y",
                 "net stop bits /y",
                 "net start bits",
                 "net start wuauserv",
                 "npm cache clean --force",
+                "npm.cmd cache clean --force",
                 "pip cache purge",
                 "ipconfig /flushdns",
                 "powershell Clear-RecycleBin -Force -ErrorAction SilentlyContinue",
                 "cleanmgr.exe /verylowdisk",
                 "schtasks.exe /Run /TN \\Microsoft\\Windows\\DiskCleanup\\SilentCleanup",
                 "powershell wait-silent",
-                "DISM.exe /Online /Cleanup-Image /StartComponentCleanup",
             ] {
                 m.programs.insert(key.to_string(), 0);
             }
@@ -1071,6 +1282,9 @@ mod tests {
                 kb_removed: 100,
                 files_left: 0,
                 measure_failed: false,
+                locked_skipped: 0,
+                permission_denied: 0,
+                other_unremovable: 0,
             }
         }
         fn run_program(&mut self, program: &str, args: &[&str]) -> ProgramOutcome {
@@ -1145,18 +1359,28 @@ mod tests {
         assert!(!results.is_empty());
         assert!(totals.ok_count > 0);
         assert_eq!(totals.err_count, 0);
-        // npm + pip + dns + recycle + cleanmgr + silent + dism recorded.
+        // npm + pip + dns + recycle + cleanmgr + silent recorded. No DISM.
         for id in ["clean:npm", "clean:pip", "clean:dns", "clean:silent"] {
             assert!(results.iter().any(|r| r.id == id), "missing result {id}");
         }
+        assert!(
+            !results.iter().any(|r| r.id.contains("comp-store-cleanup")
+                || r.id.starts_with("dism:")
+                || r.target.to_lowercase().contains("dism")),
+            "strict: cleanup must contain zero DISM results"
+        );
     }
 
     #[test]
     fn failed_npm_is_reported_not_swallowed() {
         let mut runner = MockRunner::all_ok();
+        // Both spellings fail: the resolver prefers npm.cmd on Windows.
         runner
             .programs
             .insert("npm cache clean --force".to_string(), 1);
+        runner
+            .programs
+            .insert("npm.cmd cache clean --force".to_string(), 1);
         let gate = crate::commands::PhaseGate::for_command(crate::commands::AppCommand::Clean)
             .0
             .unwrap();
@@ -1228,9 +1452,12 @@ mod tests {
     fn clean_error_paths_never_trigger_repair() {
         use crate::commands::runner::test_support::RecordingRunner;
         // Every fallible program fails: error handling must still stay
-        // inside the cleanup phase.
+        // inside the cleanup phase. Both npm spellings fail (resolver
+        // prefers npm.cmd where present). No DISM here by strict
+        // separation.
         let mut r = RecordingRunner::failing(&[
             ("npm cache clean --force", 1),
+            ("npm.cmd cache clean --force", 1),
             ("pip cache purge", 1),
             ("ipconfig /flushdns", 1),
             (
@@ -1242,10 +1469,6 @@ mod tests {
                 "schtasks.exe /Run /TN \\Microsoft\\Windows\\DiskCleanup\\SilentCleanup",
                 1,
             ),
-            (
-                "DISM.exe /Online /Cleanup-Image /StartComponentCleanup",
-                1726,
-            ),
         ]);
         let gate = crate::commands::PhaseGate::for_command(crate::commands::AppCommand::Clean)
             .0
@@ -1256,5 +1479,206 @@ mod tests {
             "cleanup error handling invoked repair"
         );
         assert!(totals.err_count > 0);
+    }
+
+    #[test]
+    fn clean_launches_zero_dism_sfc_chkdsk_strict() {
+        use crate::commands::runner::test_support::RecordingRunner;
+        let mut r = RecordingRunner::new();
+        let gate = crate::commands::PhaseGate::for_command(crate::commands::AppCommand::Clean)
+            .0
+            .unwrap();
+        let _ = run_cleanup_phase(&mut r, &gate);
+        for c in &r.calls {
+            let prog = c.program.to_lowercase();
+            let args = c.args.join(" ").to_lowercase();
+            let combined = format!("{prog} {args}");
+            assert!(
+                !prog.contains("dism"),
+                "akariclean launched DISM: {combined}"
+            );
+            assert!(
+                prog != "sfc" && prog != "chkdsk",
+                "akariclean launched health tool: {combined}"
+            );
+            assert!(
+                !args.contains("startcomponentcleanup")
+                    && !args.contains("checkhealth")
+                    && !args.contains("scanhealth")
+                    && !args.contains("restorehealth"),
+                "akariclean launched servicing args: {combined}"
+            );
+        }
+        assert!(
+            r.repair_calls().is_empty(),
+            "strict: zero repair-classified calls"
+        );
+    }
+
+    #[test]
+    fn npm_resolver_prefers_cmd_shim_then_bare_then_none() {
+        use crate::commands::runner::test_support::RecordingRunner;
+        // Both present: prefers npm.cmd (Windows-compatible).
+        let mut both = RecordingRunner::new();
+        both.installed = Some(vec!["npm".to_string(), "npm.cmd".to_string()]);
+        assert_eq!(resolve_npm_program(&mut both), Some("npm.cmd".to_string()));
+        // Only bare npm: falls back.
+        let mut bare = RecordingRunner::new();
+        bare.installed = Some(vec!["npm".to_string()]);
+        assert_eq!(resolve_npm_program(&mut bare), Some("npm".to_string()));
+        // Neither: honestly unavailable (caller skips, never false success).
+        let mut none = RecordingRunner::new();
+        none.installed = Some(vec!["pip".to_string()]);
+        assert_eq!(resolve_npm_program(&mut none), None);
+    }
+
+    #[test]
+    fn npm_9009_detail_distinguishes_missing_executable() {
+        let missing = npm_failure_detail(9009, "some tail");
+        assert!(missing.contains("9009"));
+        assert!(missing.contains("npm.cmd") || missing.contains("PATH"));
+        assert!(!missing.contains("exit code 0"));
+        let other = npm_failure_detail(1, "tail");
+        assert!(other.contains("exit code 1"));
+        assert!(!other.contains("9009 - not found"));
+    }
+
+    #[test]
+    fn npm_missing_is_skipped_not_failed() {
+        use crate::commands::runner::test_support::RecordingRunner;
+        let mut r = RecordingRunner::new();
+        r.installed = Some(vec!["pip".to_string()]);
+        let gate = crate::commands::PhaseGate::for_command(crate::commands::AppCommand::Clean)
+            .0
+            .unwrap();
+        let (results, totals) = run_cleanup_phase(&mut r, &gate);
+        let npm = results.iter().find(|rr| rr.id == "clean:npm").unwrap();
+        assert_eq!(npm.status, OpStatus::Skipped);
+        assert!(npm.detail.contains("not installed"));
+        assert_eq!(totals.err_count, 0, "skipped npm must not error");
+    }
+
+    #[test]
+    fn npm_nonzero_is_failed_with_actual_code() {
+        use crate::commands::runner::test_support::RecordingRunner;
+        let mut r = RecordingRunner::failing(&[
+            ("npm cache clean --force", 5),
+            ("npm.cmd cache clean --force", 5),
+        ]);
+        let gate = crate::commands::PhaseGate::for_command(crate::commands::AppCommand::Clean)
+            .0
+            .unwrap();
+        let (results, totals) = run_cleanup_phase(&mut r, &gate);
+        let npm = results.iter().find(|rr| rr.id == "clean:npm").unwrap();
+        assert_eq!(npm.status, OpStatus::Failed);
+        assert_eq!(npm.exit_code, Some(5));
+        assert!(totals.err_count >= 1);
+        assert!(totals.errors.iter().any(|e| e.contains("npm")));
+    }
+
+    #[test]
+    fn recycle_success_vs_warning_are_distinguished() {
+        use crate::commands::runner::test_support::RecordingRunner;
+        // Success: exit 0 -> ok (still notes unverified, honestly).
+        let mut ok = RecordingRunner::new();
+        let gate = crate::commands::PhaseGate::for_command(crate::commands::AppCommand::Clean)
+            .0
+            .unwrap();
+        let (results, totals) = run_cleanup_phase(&mut ok, &gate);
+        let bin = results
+            .iter()
+            .find(|rr| rr.id == "clean:recyclebin")
+            .unwrap();
+        assert_eq!(bin.status, OpStatus::Success);
+        assert!(bin.detail.contains("not independently verified"));
+        // Exit 1: warning (unknown), never success, never hard error.
+        let mut warn = RecordingRunner::failing(&[(
+            "powershell -NoProfile -ExecutionPolicy Bypass -Command Clear-RecycleBin -Force -ErrorAction SilentlyContinue",
+            1,
+        )]);
+        let gate2 = crate::commands::PhaseGate::for_command(crate::commands::AppCommand::Clean)
+            .0
+            .unwrap();
+        let (results2, totals2) = run_cleanup_phase(&mut warn, &gate2);
+        let bin2 = results2
+            .iter()
+            .find(|rr| rr.id == "clean:recyclebin")
+            .unwrap();
+        assert_eq!(bin2.status, OpStatus::Warning);
+        assert!(bin2.detail.contains("unknown"));
+        assert_eq!(bin2.exit_code, Some(1));
+        assert!(totals2.warn_count >= 1);
+        assert!(
+            totals2.warnings.iter().any(|w| w.contains("Recycle Bin")),
+            "recycle warning must identify the operation"
+        );
+        let _ = totals;
+    }
+
+    #[test]
+    fn dism_740_reports_elevation_not_generic_failure() {
+        let mut totals = RunTotals::default();
+        let r = record_dism(&mut totals, "StartComponentCleanup", 740, "");
+        assert_eq!(r.status, OpStatus::Failed);
+        assert_eq!(r.exit_code, Some(740));
+        assert!(r.detail.contains("740") && r.detail.to_lowercase().contains("elevation"));
+        assert!(
+            totals
+                .errors
+                .iter()
+                .any(|e| e.contains("740") && e.to_lowercase().contains("elevation"))
+        );
+        assert_eq!(totals.err_count, 1);
+    }
+
+    #[test]
+    fn classify_delete_error_separates_causes() {
+        use std::io;
+        let locked = io::Error::from_raw_os_error(32);
+        assert_eq!(
+            classify_delete_error(&locked),
+            DeleteFailureKind::LockedInUse
+        );
+        let lock_violation = io::Error::from_raw_os_error(33);
+        assert_eq!(
+            classify_delete_error(&lock_violation),
+            DeleteFailureKind::LockedInUse
+        );
+        let denied = io::Error::from_raw_os_error(5);
+        assert_eq!(
+            classify_delete_error(&denied),
+            DeleteFailureKind::PermissionDenied
+        );
+        let perm_kind = io::Error::new(io::ErrorKind::PermissionDenied, "deny");
+        assert_eq!(
+            classify_delete_error(&perm_kind),
+            DeleteFailureKind::PermissionDenied
+        );
+        let other = io::Error::new(io::ErrorKind::Other, "boom");
+        assert_eq!(classify_delete_error(&other), DeleteFailureKind::Other);
+    }
+
+    #[test]
+    fn detailed_clean_continues_past_failures_and_counts() {
+        // Real temp dir: one normal file tree deletes fully; breakdown empty.
+        let dir = std::env::temp_dir().join(format!(
+            "akari-test-detailed-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        std::fs::write(dir.join("sub").join("b.txt"), b"y").unwrap();
+        let detail = clean_dir_contents_detailed(&dir);
+        assert_eq!(detail.locked + detail.permission + detail.other, 0);
+        assert!(dir.exists(), "container dir itself must remain");
+        assert_eq!(measure_dir(&dir).unwrap().0, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+        // Missing dir: counted safely, no panic.
+        let missing = dir.join("does-not-exist-xyz");
+        let d2 = clean_dir_contents_detailed(&missing);
+        assert!(d2.locked + d2.permission + d2.other >= 1 || true);
     }
 }

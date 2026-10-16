@@ -56,7 +56,8 @@ fn run_all_phases_gated(
     let (repair_results, repair_totals, entered) =
         run_repair_phase(runner, repair_gate, repair_already_entered);
 
-    // Merge repair bookkeeping into the shared totals.
+    // Merge repair bookkeeping into the shared totals. Filesystem
+    // breakdowns come only from cleanup (repair deletes nothing).
     let merged = RunTotals {
         ok_count: totals.ok_count + repair_totals.ok_count,
         err_count: totals.err_count + repair_totals.err_count,
@@ -67,6 +68,9 @@ fn run_all_phases_gated(
         kb_removed: totals.kb_removed,
         files_left: totals.files_left,
         measure_fail: totals.measure_fail,
+        files_locked: totals.files_locked,
+        files_permission: totals.files_permission,
+        files_other_left: totals.files_other_left,
         warnings: {
             let mut w = totals.warnings.clone();
             w.extend(repair_totals.warnings.clone());
@@ -117,6 +121,9 @@ mod tests {
                 kb_removed: 1,
                 files_left: 0,
                 measure_failed: false,
+                locked_skipped: 0,
+                permission_denied: 0,
+                other_unremovable: 0,
             }
         }
         fn run_program(&mut self, _p: &str, _a: &[&str]) -> ProgramOutcome {
@@ -143,7 +150,7 @@ mod tests {
         let summary = run_all_phases(&mut m, false);
         assert!(summary.repair_entered);
         assert!(!summary.cleanup_results.is_empty());
-        assert_eq!(summary.repair_results.len(), 5);
+        assert_eq!(summary.repair_results.len(), 6);
         assert_eq!(summary.cleanup_status, "completed");
         assert_eq!(summary.exit_code, 0);
     }
@@ -159,6 +166,9 @@ mod tests {
                     kb_removed: 0,
                     files_left: 0,
                     measure_failed: false,
+                    locked_skipped: 0,
+                    permission_denied: 0,
+                    other_unremovable: 0,
                 }
             }
             fn run_program(&mut self, program: &str, _a: &[&str]) -> ProgramOutcome {
@@ -190,7 +200,7 @@ mod tests {
         // Simulate the real sequencing: repair starts after cleanup ends.
         let _ = run_repair_phase(&mut r, &rg, false);
         assert!(!r.cleanup_dir_calls().is_empty());
-        assert_eq!(r.repair_calls().len(), 5);
+        assert_eq!(r.repair_calls().len(), 6);
         assert!(
             r.cleanup_before_repair(),
             "every cleanup op must finish before the first repair op starts"
@@ -200,22 +210,43 @@ mod tests {
     #[test]
     fn cleanup_failure_still_runs_repair_but_poisons_summary() {
         // Documented failure policy: repair is not skipped, success is
-        // never reported.
+        // never reported. Fail a cleanup-only task (npm); health must
+        // still run (6 calls) with poisoned summary and strict ordering.
         let mut r = RecordingRunner::failing(&[
             ("npm cache clean --force", 1),
-            (
-                "DISM.exe /Online /Cleanup-Image /StartComponentCleanup",
-                1726,
-            ),
+            ("npm.cmd cache clean --force", 1),
         ]);
         let summary = run_all_phases(&mut r, false);
         assert_eq!(
             r.repair_calls().len(),
-            5,
+            6,
             "repair must still run after cleanup errors"
         );
         assert!(summary.exit_code != 0, "errors must poison the summary");
         assert!(!summary.totals.errors.is_empty());
         assert!(r.cleanup_before_repair());
+    }
+
+    #[test]
+    fn all_preserves_order_with_strict_separation() {
+        // End-to-end via run_all_phases: every cleanup before first repair,
+        // and no DISM/SFC/CHKDSK inside the cleanup prefix.
+        let mut r = RecordingRunner::new();
+        let summary = run_all_phases(&mut r, false);
+        assert!(r.cleanup_before_repair());
+        assert_eq!(r.repair_calls().len(), 6);
+        assert!(!summary.cleanup_results.is_empty());
+        assert_eq!(summary.repair_results.len(), 6);
+        // Cleanup prefix contains zero health programs.
+        let first_repair = r.repair_calls().iter().map(|c| c.seq).min().unwrap();
+        for c in r.calls.iter().filter(|c| c.seq < first_repair) {
+            if let Some(dir) = &c.dir {
+                let _ = dir;
+                continue;
+            }
+            let prog = c.program.to_lowercase();
+            assert!(!prog.contains("dism"), "cleanup ran DISM: {}", c.program);
+            assert!(prog != "sfc" && prog != "chkdsk");
+        }
     }
 }

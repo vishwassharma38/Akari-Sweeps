@@ -123,6 +123,13 @@ pub struct DirOutcome {
     pub kb_removed: u64,
     pub files_left: u64,
     pub measure_failed: bool,
+    /// Breakdown of why `files_left` remain, where the runner could
+    /// determine it. `locked` = sharing/lock violation (in use);
+    /// `permission_denied` = access denied; `other_unremovable` = any
+    /// other I/O failure. Best-effort: sums to ≤ `files_left`.
+    pub locked_skipped: u64,
+    pub permission_denied: u64,
+    pub other_unremovable: u64,
 }
 
 /// Outcome of an external program run.
@@ -182,6 +189,11 @@ pub struct RunTotals {
     pub kb_removed: u64,
     pub files_left: u64,
     pub measure_fail: u64,
+    /// Best-effort breakdown of `files_left` by cause. Populated from
+    /// per-file delete-error classification; never force-deletes.
+    pub files_locked: u64,
+    pub files_permission: u64,
+    pub files_other_left: u64,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
 }

@@ -187,16 +187,35 @@ pub fn normalize_token(raw: &str) -> String {
 
 /// Map one normalized token to a command. Accepts full public names
 /// (`akariclean`), bare phase words (`clean`), and help flags.
+///
+/// Main-menu navigation: `back`, `akariback`, and `-` all resolve to
+/// [`AppCommand::Home`]. Matching is done on the caller-normalized
+/// (trimmed, lower-cased) token, so `BACK`, `Akariback`, and
+/// `  back  ` behave identically. A bare `-` never collides with
+/// `--help`/`-h`, which remain [`AppCommand::Help`].
+/// Numeric keys (`1`–`5`) are handled separately via
+/// [`command_from_number`] and never mean "back": `1` always selects
+/// cleanup, never returns to the menu.
 pub fn from_token(token: &str) -> Option<AppCommand> {
     match token {
         "akari" | "home" | "" => Some(AppCommand::Home),
+        // Dedicated, unambiguous return-to-menu commands. `1` is
+        // intentionally NOT a back command.
+        "back" | "akariback" | "-" => Some(AppCommand::Home),
         "akariclean" | "clean" | "akariclean.exe" => Some(AppCommand::Clean),
         "akarihealth" | "health" | "repair" => Some(AppCommand::Health),
         "akariall" | "all" => Some(AppCommand::All),
         "akariabout" | "about" => Some(AppCommand::About),
-        "akarihelp" | "help" | "--help" | "-h" | "/?" => Some(AppCommand::Help),
+        "akarihelp" | "help" | "--help" | "-h" | "/?" | "?" => Some(AppCommand::Help),
         _ => None,
     }
+}
+
+/// True when the raw input text is a dedicated back-to-menu command
+/// (`back`, `akariback`, `-`), matched case-insensitively with
+/// surrounding whitespace ignored.
+pub fn is_back_command(raw: &str) -> bool {
+    matches!(normalize_token(raw).as_str(), "back" | "akariback" | "-")
 }
 
 /// Resolve the requested command from `(exe_path, cli_args)`.
@@ -391,5 +410,68 @@ mod tests {
                 "akarihelp"
             ]
         );
+    }
+
+    #[test]
+    fn back_commands_return_to_main_menu() {
+        for raw in ["back", "akariback", "-"] {
+            assert_eq!(
+                command_from_input(raw),
+                Some(AppCommand::Home),
+                "{raw} must return to main menu"
+            );
+            assert!(is_back_command(raw), "{raw} must be a back command");
+        }
+    }
+
+    #[test]
+    fn back_matching_is_case_insensitive_and_trims_whitespace() {
+        for raw in [
+            "BACK",
+            "Back",
+            "Akariback",
+            "AKARIBACK",
+            "  back  ",
+            "  AKARIBACK\t",
+            "  -  ",
+        ] {
+            assert_eq!(
+                command_from_input(raw),
+                Some(AppCommand::Home),
+                "{raw:?} must return home"
+            );
+            assert!(is_back_command(raw));
+        }
+        // Non-back commands are not back commands.
+        for raw in ["akariclean", "clean", "1", "", "   ", "format c:"] {
+            assert!(!is_back_command(raw), "{raw:?} must not be back");
+        }
+    }
+
+    #[test]
+    fn dash_does_not_collide_with_help_flags() {
+        assert_eq!(command_from_input("-"), Some(AppCommand::Home));
+        assert_eq!(command_from_input("--help"), Some(AppCommand::Help));
+        assert_eq!(command_from_input("-h"), Some(AppCommand::Help));
+        assert_eq!(command_from_input("/?"), Some(AppCommand::Help));
+        assert!(!is_back_command("--help"));
+        assert!(!is_back_command("-h"));
+    }
+
+    #[test]
+    fn one_never_means_exit_it_selects_cleanup() {
+        assert_eq!(command_from_number(1), Some(AppCommand::Clean));
+        assert_ne!(command_from_number(1), Some(AppCommand::Home));
+        assert_eq!(command_from_input("1"), None, "typed 1 is not a command");
+        assert!(!is_back_command("1"));
+    }
+
+    #[test]
+    fn numeric_shortcuts_still_launch_correct_operations() {
+        assert_eq!(command_from_number(1), Some(AppCommand::Clean));
+        assert_eq!(command_from_number(2), Some(AppCommand::Health));
+        assert_eq!(command_from_number(3), Some(AppCommand::All));
+        assert_eq!(command_from_number(4), Some(AppCommand::About));
+        assert_eq!(command_from_number(5), Some(AppCommand::Help));
     }
 }

@@ -1,12 +1,14 @@
 //! Real side-effect runner: filesystem + subprocesses + event fan-out.
 
-use crate::commands::clean::{clean_dir_contents, measure_dir};
+use crate::commands::clean::{clean_dir_contents_detailed, measure_dir};
 use crate::system::process::{program_exists, run_program_capture};
 use crate::system::{DirOutcome, EventTx, ExecEvent, MaintenanceRunner, ProgramOutcome};
 use std::path::Path;
 
 /// Production runner. `clean_dir` mirrors BAT `:CleanDir`/`:TallyDir`;
-/// locked files are skipped, measurements are best-effort.
+/// locked files are skipped safely, measurements are best-effort, and
+/// deletion failures are classified (locked vs. permission vs. other)
+/// for honest reporting. Never force-deletes or bypasses protections.
 pub struct RealRunner {
     tx: Option<EventTx>,
 }
@@ -26,10 +28,13 @@ impl MaintenanceRunner for RealRunner {
                 kb_removed: 0,
                 files_left: 0,
                 measure_failed: false,
+                locked_skipped: 0,
+                permission_denied: 0,
+                other_unremovable: 0,
             };
         }
         let before = measure_dir(path);
-        clean_dir_contents(path);
+        let detail = clean_dir_contents_detailed(path);
         let after = measure_dir(path);
         match (before, after) {
             (Some((b_items, b_kb)), Some((a_items, _a_kb))) => {
@@ -43,6 +48,9 @@ impl MaintenanceRunner for RealRunner {
                     kb_removed,
                     files_left: a_items,
                     measure_failed: false,
+                    locked_skipped: detail.locked,
+                    permission_denied: detail.permission,
+                    other_unremovable: detail.other,
                 }
             }
             _ => DirOutcome {
@@ -51,6 +59,9 @@ impl MaintenanceRunner for RealRunner {
                 kb_removed: 0,
                 files_left: 0,
                 measure_failed: true,
+                locked_skipped: detail.locked,
+                permission_denied: detail.permission,
+                other_unremovable: detail.other,
             },
         }
     }
@@ -70,15 +81,13 @@ impl MaintenanceRunner for RealRunner {
     }
 }
 
-/// Operation classification for isolation tests.
+/// Operation classification for strict isolation tests.
 ///
-/// Repair commands are exactly the five `[Repair 1/5]`–`[5/5]` operations:
-/// `DISM /CheckHealth`, `DISM /ScanHealth`, `DISM /RestoreHealth`,
-/// `sfc /scannow`, `chkdsk … /scan`.
-///
-/// `DISM /StartComponentCleanup` is **not** repair: the BAT runs it as
-/// `[18/18]` inside the cleanup phase ("Windows component-store
-/// cleanup", listed under CLEANS), so it classifies as cleanup.
+/// Repair/health commands are the six `[Repair 1/6]`–`[6/6]` operations:
+/// `DISM /StartComponentCleanup`, `DISM /CheckHealth`,
+/// `DISM /ScanHealth`, `DISM /RestoreHealth`, `sfc /scannow`,
+/// `chkdsk … /scan`. Strict separation: `akariclean` must launch none
+/// of these, including component-store cleanup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg(test)]
 pub enum CallKind {
@@ -94,7 +103,8 @@ impl CallKind {
         let joined = args.join(" ").to_lowercase();
         let is_dism = p.contains("dism");
         if (is_dism
-            && (joined.contains("checkhealth")
+            && (joined.contains("startcomponentcleanup")
+                || joined.contains("checkhealth")
                 || joined.contains("scanhealth")
                 || joined.contains("restorehealth")))
             || p == "sfc"
@@ -216,6 +226,9 @@ pub mod test_support {
                 kb_removed: 16,
                 files_left: 0,
                 measure_failed: false,
+                locked_skipped: 0,
+                permission_denied: 0,
+                other_unremovable: 0,
             }
         }
 
@@ -258,13 +271,13 @@ pub mod test_support {
                 CallKind::classify_program("chkdsk", &["C:", "/scan"]),
                 CallKind::RepairProgram
             );
-            // Component-store cleanup belongs to the cleanup phase.
+            // Strict separation: component-store servicing is health work.
             assert_eq!(
                 CallKind::classify_program(
                     "DISM.exe",
                     &["/Online", "/Cleanup-Image", "/StartComponentCleanup"]
                 ),
-                CallKind::CleanupProgram
+                CallKind::RepairProgram
             );
             assert_eq!(
                 CallKind::classify_program("cleanmgr.exe", &["/verylowdisk"]),

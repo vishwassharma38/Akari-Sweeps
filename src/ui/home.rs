@@ -25,10 +25,13 @@ pub fn lines() -> Vec<Line<'static>> {
     }
     out.push(Line::from(""));
     out.push(Line::from(
-        "Keys: 1-5 select · / command entry · ? help · a about · q/Esc quit.",
+        "Keys: 1-5 select · / command entry · -/back home · ? help · a about · q/Esc quit.",
     ));
     out.push(Line::from(
         "Cleanup/repair start only from their explicit commands.",
+    ));
+    out.push(Line::from(
+        "After an operation: type back, akariback, or press - to return here. 1 never means exit.",
     ));
     out
 }

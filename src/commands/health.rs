@@ -1,22 +1,38 @@
-//! Repair phase — faithful port of BAT `:PhaseRepair` ([Repair 1/5]–[5/5]).
+//! Health/servicing phase — strict separation owner of all DISM work.
 //!
 //! Exact commands, in order:
-//! 1. `DISM.exe /Online /Cleanup-Image /CheckHealth`
-//! 2. `DISM.exe /Online /Cleanup-Image /ScanHealth`
-//! 3. `DISM.exe /Online /Cleanup-Image /RestoreHealth`
-//! 4. `sfc /scannow`
-//! 5. `chkdsk %SystemDrive% /scan` (online scan; no reboot)
+//! 1. `DISM.exe /Online /Cleanup-Image /StartComponentCleanup`
+//! 2. `DISM.exe /Online /Cleanup-Image /CheckHealth`
+//! 3. `DISM.exe /Online /Cleanup-Image /ScanHealth`
+//! 4. `DISM.exe /Online /Cleanup-Image /RestoreHealth`
+//! 5. `sfc /scannow`
+//! 6. `chkdsk %SystemDrive% /scan` (online scan; no reboot)
+//!
+//! `StartComponentCleanup` was historically BAT `[18/18]` cleanup; it
+//! now runs here so `akariclean` launches zero DISM commands.
 
 use crate::commands::clean::record_dism;
 use crate::system::windows::system_drive;
 use crate::system::{ExecEvent, MaintenanceRunner, OpResult, RunTotals};
 
-/// The five repair steps in BAT order: (id, banner, program, args).
+/// The six health steps in order: (id, banner, program, args).
+/// `StartComponentCleanup` runs first so servicing cleanup precedes
+/// diagnostics; remaining order preserves the BAT repair sequence.
 pub fn repair_plan() -> Vec<(String, String, String, Vec<String>)> {
     vec![
         (
+            "repair:compcleanup".to_string(),
+            "[Repair 1/6] DISM - COMPONENT STORE CLEANUP".to_string(),
+            "DISM.exe".to_string(),
+            vec![
+                "/Online".to_string(),
+                "/Cleanup-Image".to_string(),
+                "/StartComponentCleanup".to_string(),
+            ],
+        ),
+        (
             "repair:checkhealth".to_string(),
-            "[Repair 1/5] DISM - COMPONENT STORE HEALTH CHECK".to_string(),
+            "[Repair 2/6] DISM - COMPONENT STORE HEALTH CHECK".to_string(),
             "DISM.exe".to_string(),
             vec![
                 "/Online".to_string(),
@@ -26,7 +42,7 @@ pub fn repair_plan() -> Vec<(String, String, String, Vec<String>)> {
         ),
         (
             "repair:scanhealth".to_string(),
-            "[Repair 2/5] DISM - COMPONENT STORE DEEP SCAN".to_string(),
+            "[Repair 3/6] DISM - COMPONENT STORE DEEP SCAN".to_string(),
             "DISM.exe".to_string(),
             vec![
                 "/Online".to_string(),
@@ -36,7 +52,7 @@ pub fn repair_plan() -> Vec<(String, String, String, Vec<String>)> {
         ),
         (
             "repair:restorehealth".to_string(),
-            "[Repair 3/5] DISM - COMPONENT STORE REPAIR".to_string(),
+            "[Repair 4/6] DISM - COMPONENT STORE REPAIR".to_string(),
             "DISM.exe".to_string(),
             vec![
                 "/Online".to_string(),
@@ -46,13 +62,13 @@ pub fn repair_plan() -> Vec<(String, String, String, Vec<String>)> {
         ),
         (
             "repair:sfc".to_string(),
-            "[Repair 4/5] SYSTEM FILE CHECKER - SFC".to_string(),
+            "[Repair 5/6] SYSTEM FILE CHECKER - SFC".to_string(),
             "sfc".to_string(),
             vec!["/scannow".to_string()],
         ),
         (
             "repair:chkdsk".to_string(),
-            "[Repair 5/5] FILESYSTEM HEALTH CHECK".to_string(),
+            "[Repair 6/6] FILESYSTEM HEALTH CHECK".to_string(),
             "chkdsk".to_string(),
             vec![system_drive(), "/scan".to_string()],
         ),
@@ -65,7 +81,7 @@ pub fn record_sfc(totals: &mut RunTotals, exit_code: i32) -> OpResult {
         totals.add_ok();
         let mut r = OpResult::ok(
             "repair:sfc",
-            "[Repair 4/5] SFC",
+            "[Repair 5/6] SFC",
             "sfc /scannow",
             "SFC completed with exit code 0.".to_string(),
         );
@@ -77,7 +93,7 @@ pub fn record_sfc(totals: &mut RunTotals, exit_code: i32) -> OpResult {
         ));
         let mut r = OpResult::failed(
             "repair:sfc",
-            "[Repair 4/5] SFC",
+            "[Repair 5/6] SFC",
             "sfc /scannow",
             format!("SFC returned exit code {exit_code}."),
         );
@@ -94,7 +110,7 @@ pub fn record_chkdsk(totals: &mut RunTotals, exit_code: i32, drive: &str) -> OpR
             totals.add_ok();
             let mut r = OpResult::ok(
                 "repair:chkdsk",
-                "[Repair 5/5] CHKDSK",
+                "[Repair 6/6] CHKDSK",
                 &format!("chkdsk {drive} /scan"),
                 "CHKDSK online scan completed. No errors were found.".to_string(),
             );
@@ -108,7 +124,7 @@ pub fn record_chkdsk(totals: &mut RunTotals, exit_code: i32, drive: &str) -> OpR
             );
             let mut r = OpResult::ok(
                 "repair:chkdsk",
-                "[Repair 5/5] CHKDSK",
+                "[Repair 6/6] CHKDSK",
                 &format!("chkdsk {drive} /scan"),
                 "CHKDSK completed. Errors were found and fixed.".to_string(),
             );
@@ -119,7 +135,7 @@ pub fn record_chkdsk(totals: &mut RunTotals, exit_code: i32, drive: &str) -> OpR
             totals.add_ok();
             let mut r = OpResult::ok(
                 "repair:chkdsk",
-                "[Repair 5/5] CHKDSK",
+                "[Repair 6/6] CHKDSK",
                 &format!("chkdsk {drive} /scan"),
                 "CHKDSK completed with informational exit code 2.".to_string(),
             );
@@ -131,7 +147,7 @@ pub fn record_chkdsk(totals: &mut RunTotals, exit_code: i32, drive: &str) -> OpR
                 .add_error("CHKDSK could not complete or errors remain [exit code 3].".to_string());
             let mut r = OpResult::failed(
                 "repair:chkdsk",
-                "[Repair 5/5] CHKDSK",
+                "[Repair 6/6] CHKDSK",
                 &format!("chkdsk {drive} /scan"),
                 "CHKDSK returned exit code 3.".to_string(),
             );
@@ -142,7 +158,7 @@ pub fn record_chkdsk(totals: &mut RunTotals, exit_code: i32, drive: &str) -> OpR
             totals.add_error(format!("CHKDSK returned unexpected exit code {other}."));
             let mut r = OpResult::failed(
                 "repair:chkdsk",
-                "[Repair 5/5] CHKDSK",
+                "[Repair 6/6] CHKDSK",
                 &format!("chkdsk {drive} /scan"),
                 format!("CHKDSK returned exit code {other}."),
             );
@@ -158,8 +174,8 @@ pub fn record_chkdsk(totals: &mut RunTotals, exit_code: i32, drive: &str) -> OpR
 /// The `RepairGate` proves the caller is authorized for the repair phase
 /// (see `PhaseGate::for_command`). This function holds no cleanup gate,
 /// so it cannot delete temporary files or invoke cleanup — isolation is
-/// structural. It invokes only the five repair commands
-/// (DISM Check/Scan/RestoreHealth, SFC, CHKDSK).
+/// structural. It invokes only the six health commands
+/// (DISM StartComponentCleanup, Check/Scan/RestoreHealth, SFC, CHKDSK).
 pub fn run_repair_phase(
     runner: &mut dyn MaintenanceRunner,
     _gate: &crate::commands::RepairGate,
@@ -216,6 +232,7 @@ pub fn run_repair_phase(
             record_chkdsk(&mut totals, out.exit_code, &drive)
         } else {
             let op = match id.as_str() {
+                "repair:compcleanup" => "StartComponentCleanup",
                 "repair:checkhealth" => "CheckHealth",
                 "repair:scanhealth" => "ScanHealth",
                 _ => "RestoreHealth",
@@ -251,6 +268,9 @@ mod tests {
                 kb_removed: 0,
                 files_left: 0,
                 measure_failed: false,
+                locked_skipped: 0,
+                permission_denied: 0,
+                other_unremovable: 0,
             }
         }
         fn run_program(&mut self, program: &str, args: &[&str]) -> ProgramOutcome {
@@ -270,15 +290,17 @@ mod tests {
     #[test]
     fn plan_preserves_bat_sequence_and_args() {
         let plan = repair_plan();
-        assert_eq!(plan.len(), 5);
-        assert!(plan[0].3.contains(&"/CheckHealth".to_string()));
-        assert!(plan[1].3.contains(&"/ScanHealth".to_string()));
-        assert!(plan[2].3.contains(&"/RestoreHealth".to_string()));
-        assert_eq!(plan[3].0, "repair:sfc");
-        assert_eq!(plan[4].0, "repair:chkdsk");
-        assert!(plan[4].3.contains(&"/scan".to_string()));
-        // DISM prefix identical across the three DISM calls.
-        for i in 0..3 {
+        assert_eq!(plan.len(), 6);
+        assert!(plan[0].3.contains(&"/StartComponentCleanup".to_string()));
+        assert_eq!(plan[0].0, "repair:compcleanup");
+        assert!(plan[1].3.contains(&"/CheckHealth".to_string()));
+        assert!(plan[2].3.contains(&"/ScanHealth".to_string()));
+        assert!(plan[3].3.contains(&"/RestoreHealth".to_string()));
+        assert_eq!(plan[4].0, "repair:sfc");
+        assert_eq!(plan[5].0, "repair:chkdsk");
+        assert!(plan[5].3.contains(&"/scan".to_string()));
+        // DISM prefix identical across the four DISM calls.
+        for i in 0..4 {
             assert_eq!(plan[i].2, "DISM.exe");
             assert_eq!(plan[i].3[0], "/Online");
             assert_eq!(plan[i].3[1], "/Cleanup-Image");
@@ -326,15 +348,15 @@ mod tests {
     }
 
     #[test]
-    fn repair_all_ok_counts_five() {
+    fn repair_all_ok_counts_six() {
         let mut m = Mock {
             codes: HashMap::new(),
         };
         let (results, totals, entered) = run_repair_phase(&mut m, &repair_gate(), false);
         assert!(entered);
-        assert_eq!(results.len(), 5);
+        assert_eq!(results.len(), 6);
         assert_eq!(totals.err_count, 0);
-        assert_eq!(totals.ok_count, 5);
+        assert_eq!(totals.ok_count, 6);
     }
 
     // --- Requirement 3 regression tests: repair never cleans ---
@@ -345,7 +367,7 @@ mod tests {
         let mut r = RecordingRunner::new();
         let (results, totals, entered) = run_repair_phase(&mut r, &repair_gate(), false);
         assert!(entered);
-        assert_eq!(results.len(), 5);
+        assert_eq!(results.len(), 6);
         assert!(
             r.cleanup_dir_calls().is_empty(),
             "akarihealth deleted files: {:?}",
@@ -362,7 +384,7 @@ mod tests {
                 .map(|c| format!("{} {}", c.program, c.args.join(" ")))
                 .collect::<Vec<_>>()
         );
-        assert_eq!(r.repair_calls().len(), 5);
+        assert_eq!(r.repair_calls().len(), 6);
         let _ = totals;
     }
 
@@ -371,6 +393,10 @@ mod tests {
         use crate::commands::runner::test_support::RecordingRunner;
         // Every repair command fails: error handling must stay in-phase.
         let mut r = RecordingRunner::failing(&[
+            (
+                "DISM.exe /Online /Cleanup-Image /StartComponentCleanup",
+                1726,
+            ),
             ("DISM.exe /Online /Cleanup-Image /CheckHealth", 1726),
             ("DISM.exe /Online /Cleanup-Image /ScanHealth", 1726),
             ("DISM.exe /Online /Cleanup-Image /RestoreHealth", 1726),
@@ -379,9 +405,37 @@ mod tests {
         let (results, totals, _) = run_repair_phase(&mut r, &repair_gate(), false);
         assert!(r.cleanup_dir_calls().is_empty());
         assert!(r.cleanup_program_calls().is_empty());
-        // chkdsk uses the live system drive; only the four scripted
+        // chkdsk uses the live system drive; only the five scripted
         // failures are asserted here via totals.
-        assert!(totals.err_count >= 4, "failures must be recorded");
-        assert_eq!(results.len(), 5);
+        assert!(totals.err_count >= 5, "failures must be recorded");
+        assert_eq!(results.len(), 6);
+    }
+
+    #[test]
+    fn dism_740_in_repair_is_elevation_failure_not_success() {
+        use crate::commands::runner::test_support::RecordingRunner;
+        let mut r = RecordingRunner::failing(&[
+            (
+                "DISM.exe /Online /Cleanup-Image /StartComponentCleanup",
+                740,
+            ),
+            ("DISM.exe /Online /Cleanup-Image /CheckHealth", 740),
+            ("DISM.exe /Online /Cleanup-Image /ScanHealth", 740),
+            ("DISM.exe /Online /Cleanup-Image /RestoreHealth", 740),
+            ("sfc /scannow", 0),
+        ]);
+        let (results, totals, _) = run_repair_phase(&mut r, &repair_gate(), false);
+        assert_eq!(results.len(), 6);
+        assert!(totals.err_count >= 4, "740s must be errors");
+        for res in results.iter().filter(|x| x.id.starts_with("dism:")) {
+            if res.exit_code == Some(740) {
+                assert_eq!(res.status, OpStatus::Failed);
+                assert!(res.detail.to_lowercase().contains("elevation"));
+            }
+        }
+        assert!(
+            totals.errors.iter().any(|e| e.contains("740")),
+            "error log must identify the 740 operation"
+        );
     }
 }

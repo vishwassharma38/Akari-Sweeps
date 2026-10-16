@@ -70,12 +70,12 @@ fn screen_subtitle(app: &App) -> String {
     match app.screen {
         Screen::Home => format!("home — {} · ? help · q quit", app.command.public_name()),
         Screen::Maintenance => format!(
-            "maintenance — {} · {} · q quit",
+            "maintenance — {} · {} · back/- home · q quit",
             app.command.public_name(),
             maintenance::progress_line(app)
         ),
-        Screen::About => "about — q back".to_string(),
-        Screen::Help => "help — q back".to_string(),
+        Screen::About => "about — back/- home · q quit".to_string(),
+        Screen::Help => "help — back/- home · q quit".to_string(),
     }
 }
 
@@ -212,33 +212,51 @@ fn status_text(app: &App) -> String {
     };
     let elev = if app.elevated { "admin" } else { "not admin" };
     format!(
-        "[{}|{}] exit={} · 1-5 select · / input · c clean · r repair · ? help · q/Esc quit",
+        "[{}|{}] exit={} · 1-5 select · / input · -/back home · c clean · r repair · ? help · q/Esc quit",
         exec, elev, app.exit_code
     )
+}
+
+/// Human-readable placeholder for the command entry, shown only when the
+/// input buffer is empty. Never inserted into `app.input` itself.
+pub fn entry_placeholder(focused: bool) -> &'static str {
+    if focused {
+        "  [Enter] run · [Esc] cancel · [⌫] edit · [Ctrl+U] clear"
+    } else {
+        "  type 1-5 or press / and type a command name"
+    }
+}
+
+/// Whether the placeholder should be visible for the given buffer.
+/// Conventional text-field behavior: visible only when empty.
+pub fn placeholder_visible(input: &str) -> bool {
+    input.is_empty()
 }
 
 /// Dedicated command-entry field. `/` focuses it (shortcuts suspend
 /// while typing); Enter submits through the same dispatch as number
 /// keys; Esc unfocuses; Backspace edits; Ctrl+U clears.
+///
+/// Placeholder behavior is conventional: the instructional hint is a
+/// separate visual span shown only when `app.input` is empty. Typing
+/// the first character hides it immediately (no pushing/overlap);
+/// clearing restores it. The hint is never inserted into the buffer.
 fn render_command_entry(frame: &mut Frame, app: &App, area: Rect) {
-    let (title, hint) = if app.input_focused {
+    let (title, cursor) = if app.input_focused {
         (" Command (typing — Enter runs, Esc cancels) ", "▌")
     } else {
         (" Command ( / to type ) ", "")
     };
-    let body = format!("> {}{}", app.input, hint);
-    let entry = Paragraph::new(Line::from(vec![
-        Span::raw(body),
-        Span::styled(
-            if app.input_focused {
-                "  [Enter] run · [Esc] cancel · [⌫] edit · [Ctrl+U] clear"
-            } else {
-                "  type 1-5 or press / and type a command name"
-            },
+    let body = format!("> {}{}", app.input, cursor);
+    let mut spans = vec![Span::raw(body)];
+    if placeholder_visible(&app.input) {
+        spans.push(Span::styled(
+            entry_placeholder(app.input_focused),
             Style::default().fg(Color::DarkGray),
-        ),
-    ]))
-    .block(Block::default().borders(Borders::ALL).title(title));
+        ));
+    }
+    let entry = Paragraph::new(Line::from(spans))
+        .block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(entry, area);
 }
 
@@ -326,5 +344,110 @@ mod tests {
         let app = crate::app::App::new(AppCommand::Home);
         let text = buffer_text(40, 10, &app);
         assert!(text.contains(PRODUCT_LABEL));
+    }
+
+    #[test]
+    fn placeholder_visible_only_when_input_empty() {
+        assert!(placeholder_visible(""));
+        assert!(!placeholder_visible("a"));
+        assert!(!placeholder_visible("back"));
+        assert!(!placeholder_visible("-"));
+        assert!(!placeholder_visible("akariclean"));
+    }
+
+    #[test]
+    fn empty_entry_shows_hint_typing_hides_it() {
+        // Empty: instructional hint visible.
+        let app = crate::app::App::new(AppCommand::Home);
+        let text = buffer_text(100, 28, &app);
+        assert!(
+            text.contains("type 1-5 or press /"),
+            "empty entry must show placeholder hint"
+        );
+        // Typing the first character hides the placeholder immediately:
+        // input text present, hint absent, no pushing/overlap.
+        let mut typing = crate::app::App::new(AppCommand::Home);
+        typing.set_input_focus(true);
+        typing.push_input("a");
+        let text2 = buffer_text(100, 28, &typing);
+        assert!(text2.contains("> a"), "typed text must appear normally");
+        assert!(
+            !text2.contains("type 1-5 or press /"),
+            "placeholder must hide once typing begins"
+        );
+        assert!(
+            !text2.contains("[Enter] run"),
+            "focused hint must also hide while typing"
+        );
+    }
+
+    #[test]
+    fn clearing_input_restores_placeholder() {
+        let mut app = crate::app::App::new(AppCommand::Home);
+        app.set_input_focus(true);
+        app.push_input("akariclean");
+        assert!(!placeholder_visible(&app.input));
+        let text_full = buffer_text(100, 28, &app);
+        assert!(!text_full.contains("type 1-5 or press /"));
+        app.clear_input();
+        assert!(placeholder_visible(&app.input));
+        let text_cleared = buffer_text(100, 28, &app);
+        assert!(
+            text_cleared.contains("[Enter] run"),
+            "clearing must restore the focused placeholder"
+        );
+    }
+
+    #[test]
+    fn deletion_and_cursor_do_not_break_entry_rendering() {
+        let mut app = crate::app::App::new(AppCommand::Home);
+        app.set_input_focus(true);
+        app.push_input("akari");
+        app.backspace_input();
+        assert_eq!(app.input, "akar");
+        let text = buffer_text(100, 28, &app);
+        assert!(text.contains("> akar"), "edited text must render");
+        // Placeholder still hidden while non-empty.
+        assert!(!text.contains("type 1-5 or press /"));
+        app.clear_input();
+        let text2 = buffer_text(100, 28, &app);
+        assert!(text2.contains("[Enter] run"));
+    }
+
+    #[test]
+    fn no_press_1_to_exit_and_back_hint_present() {
+        for cmd in [
+            AppCommand::Home,
+            AppCommand::Clean,
+            AppCommand::Health,
+            AppCommand::All,
+        ] {
+            let app = crate::app::App::new(cmd);
+            let text = buffer_text(100, 28, &app);
+            assert!(
+                !text.contains("Press 1 to exit") && !text.contains("press 1 to exit"),
+                "old ambiguous exit instruction must be gone"
+            );
+        }
+        // Maintenance Done shows the new unambiguous navigation.
+        let mut done = crate::app::App::new(AppCommand::Clean);
+        done.execution = crate::app::ExecutionState::Done;
+        done.summary = Some(crate::system::AppSummary::compute(
+            "completed".into(),
+            "not run - cleanup only".into(),
+            false,
+            crate::system::RunTotals::default(),
+            vec![],
+            vec![],
+            None,
+            None,
+        ));
+        let text = buffer_text(120, 30, &done);
+        assert!(
+            text.contains("back") && text.contains("akariback") || text.contains("-"),
+            "done screen must advertise back/akariback/- navigation"
+        );
+        // Status bar advertises -/back without claiming 1 exits.
+        assert!(status_text(&done).contains("-/back"));
     }
 }

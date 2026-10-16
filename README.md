@@ -7,9 +7,13 @@ file remains as the auditable baseline, not the runtime engine.
 
 ## Purpose
 
-- Reproduce the BAT's junk-cleanup phase ([1/18]–[18/18]) and optional
-  Windows image-repair phase ([Repair 1/5]–[5/5]) with identical ordering,
-  targets, arguments, and exit-code semantics.
+- Reproduce the BAT's junk-cleanup targets ([1/18]–[18/18] directories,
+  npm/pip, DNS/Recycle Bin, Disk Cleanup/SilentCleanup) and Windows
+  servicing/repair commands with identical arguments and exit-code
+  semantics, under strict cleaning/repair separation (see below).
+  Note: `DISM /StartComponentCleanup` historically ran as BAT `[18/18]`
+  cleanup; it now runs as the first health step so `akariclean`
+  launches zero DISM commands.
 - Present live output + per-operation results in a responsive Ratatui TUI
   while Akari sweeps in a dedicated right-side panel.
 - Never claim success from "command launched" — only from measured results
@@ -22,8 +26,8 @@ src/main.rs          entry, exe-name dispatch, elevation startup, event loop
 src/app.rs           App state (screen, execution, log, ops, input, animator)
 src/commands/mod.rs  command registry, 5-item selection, input mapping,
                      phase identity (Phase) + capability gates (PhaseGate)
-src/commands/clean.rs cleanup plan ([1/18]–[18/18]) + BAT-faithful executor
-src/commands/health.rs repair plan (DISM×3, SFC, CHKDSK) + exit-code mapping
+src/commands/clean.rs cleanup plan ([1/18]–[18/18] dirs/programs, no DISM) + executor
+src/commands/health.rs health plan (DISM StartComponentCleanup + Check/Scan/Restore, SFC, CHKDSK) + exit-code mapping
 src/commands/all.rs  akariall sequencing (cleanup, then repair, merged summary)
 src/commands/runner.rs RealRunner + RecordingRunner (isolation tests)
 src/system/mod.rs    OpStatus/OpResult/ExecEvent/MaintenanceRunner/AppSummary
@@ -46,9 +50,9 @@ selectable (keys `1`–`5`):
 
 | Key | Command      | Action                                        | Maintenance? |
 | --- | ------------ | --------------------------------------------- | ------------ |
-| `1` | `akariclean` | Cleanup phase only ([1/18]–[18/18])           | Cleanup only |
-| `2` | `akarihealth`| System-image repair only ([Repair 1/5]–[5/5]) | Repair only  |
-| `3` | `akariall`   | Cleanup, then repair, then combined summary   | Both, in order |
+| `1` | `akariclean` | Cleanup only, zero DISM/SFC/CHKDSK            | Cleanup only |
+| `2` | `akarihealth`| Health/servicing only ([Repair 1/6]–[6/6])   | Repair only  |
+| `3` | `akariall`   | Cleanup, then health, then combined summary   | Both, in order |
 | `4` | `akariabout` | About (name, V00.1, purpose, repo/license)    | No           |
 | `5` | `akarihelp`  | Usage, per-command help, exit instructions    | No           |
 
@@ -67,15 +71,14 @@ Other keys: `c` cleanup · `r` repair · `t` all · `?` help · `a` about ·
 `h` home · `↑/↓` scroll · `q`/`Esc` quit · `Ctrl+C` deliberate cancel/quit
 (double-press while running).
 
-### Cleanup/repair isolation (guaranteed)
+### Cleanup/repair isolation (guaranteed, strict)
 
-- `akariclean` runs only cleanup. It invokes zero repair-phase commands
-  (no DISM health check/scan/restore, no SFC, no CHKDSK). Note: the BAT's
-  `[18/18]` component-store cleanup (`DISM /StartComponentCleanup`) is a
-  *cleanup* operation and stays in the cleanup phase, now labeled
-  `[18/18] COMPONENT-STORE CLEANUP` so it can't be mistaken for repair.
-- `akarihealth` runs only the five repair commands. It deletes no files
-  and invokes no cleanup.
+- `akariclean` runs only cleanup. It invokes zero DISM commands of any
+  kind (including `/StartComponentCleanup`), zero SFC, zero CHKDSK.
+  `[18/18]` is Disk Cleanup + SilentCleanup only.
+- `akarihealth` runs only the six health/servicing commands (DISM
+  StartComponentCleanup, Check/Scan/RestoreHealth, SFC, CHKDSK). It
+  deletes no files and invokes no cleanup.
 - `akariall` runs cleanup to completion, then repair — never concurrent,
   never a second cleanup. **Failure policy:** cleanup errors never block
   repair, but they poison the combined summary, so overall status/exit
@@ -195,8 +198,10 @@ extend `akari::animation::AnimationSet`; the TUI panel needs no rewrite.
 ## Tests
 
 ```powershell
-cargo test   # 75 tests: dispatch, input, elevation, isolation, sprites,
-             # rendering, timing, exit codes (mock runners + temp dirs only)
+cargo test   # 110 tests: dispatch, input/back-nav, placeholder, elevation,
+             # strict isolation (zero-DISM clean, 6-step health, ordering),
+             # npm/Recycle/DISM-740/filesystem, sprites, rendering, exit codes
+             # (mock runners + temp dirs only)
 ```
 
 Destructive/real servicing ops never run in tests. TUI resize/exit-code
