@@ -1,6 +1,6 @@
 # Akari sweep frames
 
-Place the eight separate, processed sprite images here. Example filenames:
+Eight separate, processed sprite images used during maintenance:
 
 - `akari_sweep_001.png`
 - `akari_sweep_002.png`
@@ -11,4 +11,5 @@ Place the eight separate, processed sprite images here. Example filenames:
 - `akari_sweep_007.png`
 - `akari_sweep_008.png`
 
-Use the actual extension produced by your image workflow. The Rust app does not load these images yet.
+Each frame must be 256×320 RGBA. The Rust app validates and loads them
+in order without modifying the source PNGs.

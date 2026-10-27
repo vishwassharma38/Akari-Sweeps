@@ -1,16 +1,39 @@
-//! Frame sequencing and timing. Future animation sets (idle/health/…)
-//! plug in here without touching the TUI.
+//! Frame sequencing and timing. Animation sets (sweep/idle, and future
+//! health/about/help) plug in here without touching the TUI.
 
-use crate::akari::sprites::{SWEEP_FRAMES, SWEEP_INTERVAL_MS};
+use crate::akari::sprites::{SWEEP_INTERVAL_MS, SpriteSetSpec};
 
-/// Which animation set is displayed. Only Sweep ships in V00.1.
+/// Which animation set is displayed. Sweep runs during maintenance; Idle
+/// is the book-reading loop shown while Home waits for input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum AnimationSet {
     Sweep,
-    /// Reserved: shown as sweep fallback (never misrepresents status —
-    /// the label always names the real operation).
     Idle,
+}
+
+impl AnimationSet {
+    pub const COUNT: usize = 2;
+    /// Every set with shipped frames, in load order.
+    pub const ALL: [Self; Self::COUNT] = [Self::Sweep, Self::Idle];
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::Sweep => 0,
+            Self::Idle => 1,
+        }
+    }
+
+    /// Asset metadata used by the shared discovery/loading pipeline.
+    pub fn sprite_set(self) -> SpriteSetSpec {
+        match self {
+            Self::Sweep => SpriteSetSpec::SWEEP,
+            Self::Idle => SpriteSetSpec::IDLE,
+        }
+    }
+
+    pub fn frame_count(self) -> usize {
+        self.sprite_set().frame_count
+    }
 }
 
 /// Playback state driven by `App::execution_state`.
@@ -25,7 +48,6 @@ pub enum AnimationMode {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct Animator {
     set: AnimationSet,
     mode: AnimationMode,
@@ -41,8 +63,22 @@ impl Animator {
             mode: AnimationMode::Ambient,
             frame: 0,
             last_advance_ms: 0,
-            frame_count: SWEEP_FRAMES,
+            frame_count: set.frame_count(),
         }
+    }
+
+    /// Select a new animation set without ever retaining an out-of-range
+    /// frame index from the previous set. The timing anchor is rebased to
+    /// `now_ms` so a switch never fast-forwards the new loop.
+    pub fn select_set(&mut self, set: AnimationSet, now_ms: u64) -> bool {
+        if self.set == set {
+            return false;
+        }
+        self.set = set;
+        self.frame_count = set.frame_count();
+        self.frame = 0;
+        self.last_advance_ms = now_ms;
+        true
     }
 
     pub fn set_mode(&mut self, mode: AnimationMode) {
@@ -58,7 +94,6 @@ impl Animator {
         self.mode
     }
 
-    #[allow(dead_code)]
     pub fn set(&self) -> AnimationSet {
         self.set
     }
@@ -117,6 +152,7 @@ impl Animator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::akari::sprites::{IDLE_FRAMES, SWEEP_FRAMES};
 
     #[test]
     fn loops_through_eight_frames() {
@@ -183,5 +219,51 @@ mod tests {
         assert_eq!(Animator::frame_at_tick(0, 8), 0);
         assert_eq!(Animator::frame_at_tick(8, 8), 0);
         assert_eq!(Animator::frame_at_tick(9, 8), 1);
+    }
+
+    #[test]
+    fn idle_set_uses_its_own_frame_count() {
+        assert_eq!(AnimationSet::Idle.frame_count(), IDLE_FRAMES);
+        assert_eq!(AnimationSet::Idle.sprite_set(), SpriteSetSpec::IDLE);
+        let a = Animator::new(AnimationSet::Idle);
+        assert_eq!(a.set(), AnimationSet::Idle);
+    }
+
+    #[test]
+    fn idle_ambient_loops_through_all_frames() {
+        let interval = SWEEP_INTERVAL_MS * 3;
+        let mut a = Animator::new(AnimationSet::Idle);
+        a.set_mode(AnimationMode::Ambient);
+        assert_eq!(a.ms_until_next_frame(0), interval);
+        let mut seen = std::collections::HashSet::new();
+        let mut t = 0u64;
+        for _ in 0..(IDLE_FRAMES * 2) {
+            t += interval;
+            assert!(a.tick(t), "ambient idle frame should advance");
+            seen.insert(a.current_frame());
+        }
+        assert_eq!(seen.len(), IDLE_FRAMES);
+        assert_eq!(a.current_frame(), 0, "loop returns to the first frame");
+    }
+
+    #[test]
+    fn switching_sets_resets_frame_and_stays_in_range() {
+        let mut a = Animator::new(AnimationSet::Sweep);
+        a.set_mode(AnimationMode::Sweeping);
+        // Advance to the final sweep frame.
+        a.tick(SWEEP_INTERVAL_MS * (SWEEP_FRAMES as u64 - 1));
+        assert_eq!(a.current_frame(), SWEEP_FRAMES - 1);
+
+        assert!(a.select_set(AnimationSet::Idle, 10_000));
+        assert_eq!(a.current_frame(), 0);
+        for step in 1..=(IDLE_FRAMES as u64 * 2) {
+            a.tick(10_000 + step * SWEEP_INTERVAL_MS);
+            assert!(a.current_frame() < AnimationSet::Idle.frame_count());
+        }
+
+        assert!(a.select_set(AnimationSet::Sweep, 20_000));
+        assert_eq!(a.current_frame(), 0);
+        assert!(a.current_frame() < AnimationSet::Sweep.frame_count());
+        assert!(!a.select_set(AnimationSet::Sweep, 21_000));
     }
 }

@@ -328,8 +328,7 @@ fn activate(app: &mut App, tx: &Sender<ExecEvent>, cmd: AppCommand) {
     if !cmd.starts_maintenance() {
         let fresh = App::new(cmd);
         // Preserve loaded sprites and elevation state across navigation.
-        app.frames = fresh.frames;
-        app.sprite_error = fresh.sprite_error;
+        app.sprites = fresh.sprites;
         app.command = fresh.command;
         app.screen = fresh.screen;
         app.execution = fresh.execution;
@@ -373,6 +372,7 @@ fn activate(app: &mut App, tx: &Sender<ExecEvent>, cmd: AppCommand) {
 fn request_in_tui_elevation(app: &mut App, tx: &Sender<ExecEvent>, cmd: AppCommand) {
     app.command = cmd;
     app.screen = Screen::Maintenance;
+    app.sync_animation();
     app.push_log(format!(
         "Administrator rights required — requesting elevation for {} via UAC…",
         cmd.public_name()

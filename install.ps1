@@ -13,7 +13,7 @@
     <InstallDir>\akariall.exe     (copy)
     <InstallDir>\akariabout.exe   (copy)
     <InstallDir>\akarihelp.exe    (copy)
-    <InstallDir>\assets\akari\sweep\*.png
+    <InstallDir>\assets\akari\{sweep,idle}\*.png
   Adds <InstallDir> to the USER PATH (undo via uninstall.ps1).
 .PARAMETER InstallDir
   Defaults to "$env:LOCALAPPDATA\Akari-Sweeps".

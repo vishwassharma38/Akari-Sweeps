@@ -1,3 +1,7 @@
-# Akari idle assets
+# Akari idle frames
 
-Reserved for future idle-screen character assets.
+Eight book-reading frames shown while the Home screen waits for input:
+
+- `idle_001.png` … `idle_008.png` (each 367×564, RGBA)
+
+The Rust app validates all eight in order and plays them in ambient mode.

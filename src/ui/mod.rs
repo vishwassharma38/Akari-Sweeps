@@ -161,13 +161,18 @@ fn render_animation_panel(frame: &mut Frame, app: &App, area: Rect) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    if app.frames.is_empty() {
+    let frames = app.frames();
+    if frames.is_empty() {
+        let activity = match app.animator.set() {
+            crate::akari::animation::AnimationSet::Idle => "…reading…",
+            crate::akari::animation::AnimationSet::Sweep => "…sweeping…",
+        };
         let msg = Paragraph::new(vec![
-            Line::from("…sweeping…"),
+            Line::from(activity),
             Line::from(""),
             Line::from(
-                app.sprite_error
-                    .clone()
+                app.sprite_error()
+                    .map(str::to_string)
                     .unwrap_or_else(|| "sprite assets unavailable".to_string()),
             ),
         ])
@@ -178,21 +183,27 @@ fn render_animation_panel(frame: &mut Frame, app: &App, area: Rect) {
     let idx = app
         .animator
         .current_frame()
-        .min(app.frames.len().saturating_sub(1));
-    let lines = widgets::render_sprite_halfblock(
-        &app.frames[idx],
-        inner.width as usize,
-        inner.height as usize,
-    );
+        .min(frames.len().saturating_sub(1));
+    let shown = &frames[idx];
+    // Leave the last row for the activity/source caption.
+    let sprite_height = inner.height.saturating_sub(1);
+    let lines =
+        widgets::render_sprite_halfblock(shown, inner.width as usize, sprite_height as usize);
     // Caption: honest about fallback rendering + current activity.
     let mode = match app.animator.mode() {
         crate::akari::animation::AnimationMode::Sweeping => "sweeping…",
         crate::akari::animation::AnimationMode::Settled => "done",
-        _ => "idle",
+        crate::akari::animation::AnimationMode::Ambient => match app.animator.set() {
+            crate::akari::animation::AnimationSet::Idle => "reading",
+            crate::akari::animation::AnimationSet::Sweep => "idle",
+        },
     };
     let mut all = lines;
     all.push(Line::from(Span::styled(
-        format!("{mode} · terminal approx. (256×320 source)"),
+        format!(
+            "{mode} · terminal approx. ({}×{} source)",
+            shown.width, shown.height
+        ),
         Style::default().fg(Color::DarkGray),
     )));
     // Trim to fit without overflow.
@@ -361,11 +372,41 @@ mod tests {
     #[test]
     fn missing_sprites_fall_back_without_crashing() {
         let mut app = crate::app::App::new(AppCommand::Home);
-        app.frames.clear();
-        app.sprite_error = Some("test: assets missing".to_string());
+        let set = app.animator.set();
+        app.sprites.get_mut(set).frames.clear();
+        app.sprites.get_mut(set).error = Some("test: assets missing".to_string());
         let text = buffer_text(100, 28, &app);
         assert!(text.contains(PRODUCT_LABEL));
         assert!(text.contains("test: assets missing"));
+    }
+
+    #[test]
+    fn idle_panel_reports_real_source_dimensions() {
+        use crate::akari::sprites::SpriteFrame;
+
+        let mut app = crate::app::App::new(AppCommand::Home);
+        let set = app.animator.set();
+        let assets = app.sprites.get_mut(set);
+        assets.error = None;
+        assets.frames = vec![SpriteFrame {
+            width: 2,
+            height: 4,
+            rgba: vec![255, 0, 0, 255].repeat(8),
+        }];
+        let text = buffer_text(160, 40, &app);
+        assert!(text.contains("reading"), "idle caption must be reading");
+        assert!(text.contains("2×4 source"), "caption must use frame size");
+        assert!(
+            !text.contains("256×320"),
+            "idle caption must not claim sweep dimensions"
+        );
+    }
+
+    #[test]
+    fn sweep_panel_still_reports_maintenance_caption() {
+        let app = crate::app::App::new(AppCommand::Clean);
+        let text = buffer_text(100, 28, &app);
+        assert!(text.contains("sweeping"), "running sweep caption preserved");
     }
 
     #[test]

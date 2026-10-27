@@ -1,7 +1,7 @@
 //! Application state, screen navigation, and worker-event handling.
 
 use crate::akari::animation::{AnimationMode, AnimationSet, Animator};
-use crate::akari::sprites::{SpriteFrame, load_sweep_frames_best_effort};
+use crate::akari::sprites::SpriteFrame;
 use crate::commands::AppCommand;
 use crate::system::{AppSummary, ExecEvent, OpResult, OpStatus, ProgressState};
 use std::sync::mpsc::Receiver;
@@ -27,6 +27,52 @@ pub enum ExecutionState {
     Error,
 }
 
+/// Loaded frames plus a diagnostic for one animation set.
+#[derive(Debug)]
+pub struct SpriteFrames {
+    pub frames: Vec<SpriteFrame>,
+    pub error: Option<String>,
+}
+
+impl SpriteFrames {
+    fn load(set: AnimationSet) -> Self {
+        match set.sprite_set().load_frames_best_effort() {
+            Ok(frames) => Self {
+                frames,
+                error: None,
+            },
+            Err(error) => Self {
+                frames: Vec::new(),
+                error: Some(error),
+            },
+        }
+    }
+}
+
+/// One entry per implemented `AnimationSet`, loaded through the shared
+/// sprite pipeline so selection only swaps which cached set is rendered.
+#[derive(Debug)]
+pub struct SpriteLibrary {
+    sets: [SpriteFrames; AnimationSet::COUNT],
+}
+
+impl SpriteLibrary {
+    pub fn load_all() -> Self {
+        Self {
+            sets: AnimationSet::ALL.map(SpriteFrames::load),
+        }
+    }
+
+    pub fn get(&self, set: AnimationSet) -> &SpriteFrames {
+        &self.sets[set.index()]
+    }
+
+    #[cfg(test)]
+    pub fn get_mut(&mut self, set: AnimationSet) -> &mut SpriteFrames {
+        &mut self.sets[set.index()]
+    }
+}
+
 pub struct App {
     pub command: AppCommand,
     pub screen: Screen,
@@ -39,8 +85,7 @@ pub struct App {
     /// evidence; the running task shows as working without advancing.
     pub progress: ProgressState,
     pub animator: Animator,
-    pub frames: Vec<SpriteFrame>,
-    pub sprite_error: Option<String>,
+    pub sprites: SpriteLibrary,
     pub summary: Option<AppSummary>,
     pub exit_code: i32,
     pub started: Instant,
@@ -69,10 +114,6 @@ pub struct OpItem {
 
 impl App {
     pub fn new(command: AppCommand) -> Self {
-        let (frames, sprite_error) = match load_sweep_frames_best_effort() {
-            Ok(f) => (f, None),
-            Err(e) => (Vec::new(), Some(e)),
-        };
         let screen = match command {
             AppCommand::About => Screen::About,
             AppCommand::Help => Screen::Help,
@@ -95,8 +136,7 @@ impl App {
             operations: Vec::new(),
             progress: ProgressState::default(),
             animator: Animator::new(AnimationSet::Sweep),
-            frames,
-            sprite_error,
+            sprites: SpriteLibrary::load_all(),
             summary: None,
             exit_code: 0,
             started: Instant::now(),
@@ -116,13 +156,31 @@ impl App {
         self.started.elapsed().as_millis() as u64
     }
 
-    /// Keep the animation honest: sweep only while work runs.
+    /// Frames belonging to the currently selected animation set.
+    pub fn frames(&self) -> &[SpriteFrame] {
+        &self.sprites.get(self.animator.set()).frames
+    }
+
+    /// Load diagnostic for the currently selected animation set.
+    pub fn sprite_error(&self) -> Option<&str> {
+        self.sprites.get(self.animator.set()).error.as_deref()
+    }
+
+    /// Keep the animation honest: idle reading on Home, sweep only while
+    /// maintenance is involved, settle when work ends.
     pub fn sync_animation(&mut self) {
-        let mode = match self.execution {
-            ExecutionState::Running => AnimationMode::Sweeping,
-            ExecutionState::Done | ExecutionState::Error => AnimationMode::Settled,
-            _ => AnimationMode::Ambient,
+        let (set, mode) = match self.execution {
+            ExecutionState::Running => (AnimationSet::Sweep, AnimationMode::Sweeping),
+            ExecutionState::Done | ExecutionState::Error => {
+                (AnimationSet::Sweep, AnimationMode::Settled)
+            }
+            ExecutionState::Idle => match self.screen {
+                Screen::Home => (AnimationSet::Idle, AnimationMode::Ambient),
+                _ => (AnimationSet::Sweep, AnimationMode::Ambient),
+            },
         };
+        let now_ms = self.elapsed_ms();
+        self.animator.select_set(set, now_ms);
         self.animator.set_mode(mode);
     }
 
@@ -403,7 +461,40 @@ mod tests {
         let app = App::new(AppCommand::Home);
         assert_eq!(app.screen, Screen::Home);
         assert_eq!(app.execution, ExecutionState::Idle);
+        assert_eq!(app.animator.set(), AnimationSet::Idle);
+        assert_eq!(app.animator.mode(), AnimationMode::Ambient);
         assert!(app.summary.is_none());
+    }
+
+    #[test]
+    fn home_selects_idle_while_waiting_for_input() {
+        let mut app = App::new(AppCommand::Home);
+        app.set_input_focus(true);
+        app.push_input("akari");
+        app.sync_animation();
+        assert_eq!(app.animator.set(), AnimationSet::Idle);
+        assert_eq!(app.animator.mode(), AnimationMode::Ambient);
+    }
+
+    #[test]
+    fn selected_set_resolves_to_matching_loaded_frames() {
+        for (cmd, expected) in [
+            (AppCommand::Home, AnimationSet::Idle),
+            (AppCommand::Clean, AnimationSet::Sweep),
+        ] {
+            let app = App::new(cmd);
+            assert_eq!(app.animator.set(), expected);
+            if app.frames().is_empty() {
+                eprintln!("skipping: {} assets not in tree", expected.sprite_set().dir);
+                continue;
+            }
+            let spec = expected.sprite_set();
+            assert_eq!(app.frames().len(), spec.frame_count);
+            assert_eq!(
+                (app.frames()[0].width, app.frames()[0].height),
+                (spec.width, spec.height)
+            );
+        }
     }
 
     #[test]
@@ -412,6 +503,8 @@ mod tests {
             let app = App::new(cmd);
             assert_eq!(app.screen, Screen::Maintenance);
             assert_eq!(app.execution, ExecutionState::Running);
+            assert_eq!(app.animator.set(), AnimationSet::Sweep);
+            assert_eq!(app.animator.mode(), AnimationMode::Sweeping);
         }
     }
 
@@ -421,6 +514,9 @@ mod tests {
             let app = App::new(cmd);
             assert_eq!(app.execution, ExecutionState::Idle);
             assert!(app.summary.is_none());
+            // Preserve their current ambient sweep behavior.
+            assert_eq!(app.animator.set(), AnimationSet::Sweep);
+            assert_eq!(app.animator.mode(), AnimationMode::Ambient);
         }
     }
 
@@ -451,18 +547,64 @@ mod tests {
         );
         app.on_event(ExecEvent::Finished(summary));
         assert_eq!(app.execution, ExecutionState::Done);
+        assert_eq!(app.animator.set(), AnimationSet::Sweep);
+        assert_eq!(app.animator.mode(), AnimationMode::Settled);
+        assert_eq!(
+            app.animator.current_frame(),
+            AnimationSet::Sweep.frame_count() - 1
+        );
+    }
+
+    #[test]
+    fn error_settles_the_sweep_animation() {
+        let mut app = App::new(AppCommand::Clean);
+        app.on_event(ExecEvent::Error("test failure".into()));
+        assert_eq!(app.execution, ExecutionState::Error);
+        assert_eq!(app.animator.set(), AnimationSet::Sweep);
         assert_eq!(app.animator.mode(), AnimationMode::Settled);
     }
 
     #[test]
     fn animation_sweeps_only_while_running() {
         let idle = App::new(AppCommand::Home);
+        assert_eq!(idle.animator.set(), AnimationSet::Idle);
         assert_eq!(idle.animator.mode(), AnimationMode::Ambient);
         let mut running = App::new(AppCommand::Clean);
+        assert_eq!(running.animator.set(), AnimationSet::Sweep);
         assert_eq!(running.animator.mode(), AnimationMode::Sweeping);
         running.execution = ExecutionState::Done;
         running.sync_animation();
         assert_eq!(running.animator.mode(), AnimationMode::Settled);
+    }
+
+    #[test]
+    fn starting_and_finishing_maintenance_switch_sets_safely() {
+        let mut app = App::new(AppCommand::Home);
+        for t in [1_000u64, 2_000, 3_000, 4_000] {
+            app.animator.tick(t);
+        }
+        assert_eq!(app.animator.set(), AnimationSet::Idle);
+
+        app.mark_started(1);
+        assert_eq!(app.screen, Screen::Home);
+        assert_eq!(app.animator.set(), AnimationSet::Sweep);
+        assert_eq!(app.animator.mode(), AnimationMode::Sweeping);
+        assert!(app.animator.current_frame() < AnimationSet::Sweep.frame_count());
+
+        app.execution = ExecutionState::Done;
+        app.sync_animation();
+        assert_eq!(app.animator.set(), AnimationSet::Sweep);
+        assert_eq!(app.animator.mode(), AnimationMode::Settled);
+        assert_eq!(
+            app.animator.current_frame(),
+            AnimationSet::Sweep.frame_count() - 1
+        );
+
+        app.execution = ExecutionState::Idle;
+        app.sync_animation();
+        assert_eq!(app.animator.set(), AnimationSet::Idle);
+        assert_eq!(app.animator.mode(), AnimationMode::Ambient);
+        assert!(app.animator.current_frame() < AnimationSet::Idle.frame_count());
     }
 
     #[test]
