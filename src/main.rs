@@ -334,6 +334,7 @@ fn activate(app: &mut App, tx: &Sender<ExecEvent>, cmd: AppCommand) {
         app.execution = fresh.execution;
         app.summary = None;
         app.operations.clear();
+        app.phase = None;
         app.progress = crate::system::ProgressState::default();
         // Drop stale per-run UI state so back-navigation is clean.
         app.scroll = 0;
@@ -372,6 +373,7 @@ fn activate(app: &mut App, tx: &Sender<ExecEvent>, cmd: AppCommand) {
 fn request_in_tui_elevation(app: &mut App, tx: &Sender<ExecEvent>, cmd: AppCommand) {
     app.command = cmd;
     app.screen = Screen::Maintenance;
+    app.phase = None;
     app.sync_animation();
     app.push_log(format!(
         "Administrator rights required — requesting elevation for {} via UAC…",

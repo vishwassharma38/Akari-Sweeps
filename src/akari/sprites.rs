@@ -13,12 +13,15 @@ pub const SWEEP_FRAMES: usize = 8;
 pub const IDLE_WIDTH: u32 = 367;
 pub const IDLE_HEIGHT: u32 = 564;
 pub const IDLE_FRAMES: usize = 8;
+pub const HEALTH_WIDTH: u32 = 358;
+pub const HEALTH_HEIGHT: u32 = 575;
+pub const HEALTH_FRAMES: usize = 8;
 /// Target 6 frames per second (≈166.7 ms per frame). All animation sets
 /// share this timing policy through `Animator`.
 pub const SWEEP_INTERVAL_MS: u64 = 167;
 
 /// Filesystem identity and validation constraints for one animation set.
-/// Future sets (health/about/help) add a constant here.
+/// Future sets (about/help) add a constant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpriteSetSpec {
     /// Asset subdirectory under `assets/akari/`.
@@ -45,6 +48,14 @@ impl SpriteSetSpec {
         frame_count: IDLE_FRAMES,
         width: IDLE_WIDTH,
         height: IDLE_HEIGHT,
+    };
+
+    pub const HEALTH: Self = Self {
+        dir: "health",
+        prefix: "health",
+        frame_count: HEALTH_FRAMES,
+        width: HEALTH_WIDTH,
+        height: HEALTH_HEIGHT,
     };
 
     /// Canonical file name for frame `index` (0-based).
@@ -283,11 +294,31 @@ mod tests {
                 "idle_008.png",
             ]
         );
+        let health: Vec<_> = (0..HEALTH_FRAMES)
+            .map(|i| SpriteSetSpec::HEALTH.frame_name(i))
+            .collect();
+        assert_eq!(
+            health,
+            vec![
+                "health_001.png",
+                "health_002.png",
+                "health_003.png",
+                "health_004.png",
+                "health_005.png",
+                "health_006.png",
+                "health_007.png",
+                "health_008.png",
+            ]
+        );
     }
 
     #[test]
     fn real_assets_load_at_documented_size() {
-        for spec in [SpriteSetSpec::SWEEP, SpriteSetSpec::IDLE] {
+        for spec in [
+            SpriteSetSpec::SWEEP,
+            SpriteSetSpec::IDLE,
+            SpriteSetSpec::HEALTH,
+        ] {
             let dir = manifest_dir(spec);
             if !dir.join(spec.frame_name(0)).exists() {
                 eprintln!("skipping: {} assets not in tree", spec.dir);
@@ -334,6 +365,45 @@ mod tests {
     }
 
     #[test]
+    fn health_frames_are_loaded_in_order() {
+        let spec = SpriteSetSpec::HEALTH;
+        let dir = manifest_dir(spec);
+        if !dir.join(spec.frame_name(0)).exists() {
+            eprintln!("skipping: health assets not in tree");
+            return;
+        }
+        let frames = spec.load_frames(&dir).expect("health frames must decode");
+        assert_eq!(frames.len(), HEALTH_FRAMES);
+        for (i, frame) in frames.iter().enumerate() {
+            let expected = image::open(dir.join(spec.frame_name(i)))
+                .expect("source frame must decode")
+                .to_rgba8();
+            assert_eq!(
+                frame.rgba,
+                expected.into_raw(),
+                "health frame {i} loaded out of order"
+            );
+        }
+    }
+
+    #[test]
+    fn health_dir_is_discovered() {
+        let spec = SpriteSetSpec::HEALTH;
+        if !manifest_dir(spec).join(spec.frame_name(0)).exists() {
+            eprintln!("skipping: health assets not in tree");
+            return;
+        }
+        let dir = spec
+            .resolve_dir()
+            .expect("health assets must be discovered");
+        assert!(
+            dir.ends_with(Path::new("assets").join("akari").join("health")),
+            "resolved {}",
+            dir.display()
+        );
+    }
+
+    #[test]
     fn missing_frame_diagnostic() {
         let dir = std::env::temp_dir().join("akari-no-such-sweep-dir");
         let err = SpriteSetSpec::SWEEP.load_frames(&dir).unwrap_err();
@@ -358,6 +428,53 @@ mod tests {
         let err = SpriteSetSpec::IDLE.load_frames(&dir).unwrap_err();
         assert!(matches!(err, SpriteError::Load { .. }));
         assert!(err.to_string().contains("cannot decode"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_health_frame_diagnostic() {
+        let dir = temp_dir("missing-health");
+        let err = SpriteSetSpec::HEALTH.load_frames(&dir).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("missing sprite frame 1"));
+        assert!(msg.contains("for health set"));
+        assert!(msg.contains("assets/akari/health/health_001..008.png"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incomplete_health_set_reports_first_missing_frame() {
+        let dir = temp_dir("incomplete-health");
+        let img = image::RgbaImage::new(HEALTH_WIDTH, HEALTH_HEIGHT);
+        img.save(dir.join(SpriteSetSpec::HEALTH.frame_name(0)))
+            .unwrap();
+        let err = SpriteSetSpec::HEALTH.load_frames(&dir).unwrap_err();
+        assert!(matches!(err, SpriteError::Missing { index: 1, .. }));
+        assert!(err.to_string().contains("missing sprite frame 2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_health_frame_diagnostic() {
+        let dir = temp_dir("corrupt-health");
+        std::fs::write(dir.join(SpriteSetSpec::HEALTH.frame_name(0)), b"not a png").unwrap();
+        let err = SpriteSetSpec::HEALTH.load_frames(&dir).unwrap_err();
+        assert!(matches!(err, SpriteError::Load { .. }));
+        assert!(err.to_string().contains("cannot decode"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bad_health_dimensions_report_health_size() {
+        let dir = temp_dir("bad-health-dim");
+        let img = image::RgbaImage::new(4, 4);
+        img.save(dir.join(SpriteSetSpec::HEALTH.frame_name(0)))
+            .unwrap();
+        let err = SpriteSetSpec::HEALTH.load_frames(&dir).unwrap_err();
+        assert!(matches!(err, SpriteError::BadDimensions { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("expected 358x575"));
+        assert!(msg.contains("health animation"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

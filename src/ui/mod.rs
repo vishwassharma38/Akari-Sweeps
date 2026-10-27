@@ -166,6 +166,7 @@ fn render_animation_panel(frame: &mut Frame, app: &App, area: Rect) {
         let activity = match app.animator.set() {
             crate::akari::animation::AnimationSet::Idle => "…reading…",
             crate::akari::animation::AnimationSet::Sweep => "…sweeping…",
+            crate::akari::animation::AnimationSet::Health => "…repairing…",
         };
         let msg = Paragraph::new(vec![
             Line::from(activity),
@@ -191,11 +192,15 @@ fn render_animation_panel(frame: &mut Frame, app: &App, area: Rect) {
         widgets::render_sprite_halfblock(shown, inner.width as usize, sprite_height as usize);
     // Caption: honest about fallback rendering + current activity.
     let mode = match app.animator.mode() {
-        crate::akari::animation::AnimationMode::Sweeping => "sweeping…",
+        crate::akari::animation::AnimationMode::Sweeping => match app.animator.set() {
+            crate::akari::animation::AnimationSet::Health => "repairing…",
+            _ => "sweeping…",
+        },
         crate::akari::animation::AnimationMode::Settled => "done",
         crate::akari::animation::AnimationMode::Ambient => match app.animator.set() {
             crate::akari::animation::AnimationSet::Idle => "reading",
             crate::akari::animation::AnimationSet::Sweep => "idle",
+            crate::akari::animation::AnimationSet::Health => "health",
         },
     };
     let mut all = lines;
@@ -407,6 +412,50 @@ mod tests {
         let app = crate::app::App::new(AppCommand::Clean);
         let text = buffer_text(100, 28, &app);
         assert!(text.contains("sweeping"), "running sweep caption preserved");
+    }
+
+    #[test]
+    fn health_panel_reports_health_caption_and_source_dimensions() {
+        use crate::akari::sprites::SpriteFrame;
+
+        let mut app = crate::app::App::new(AppCommand::Health);
+        assert_eq!(
+            app.animator.set(),
+            crate::akari::animation::AnimationSet::Health
+        );
+        let assets = app
+            .sprites
+            .get_mut(crate::akari::animation::AnimationSet::Health);
+        assets.error = None;
+        assets.frames = vec![SpriteFrame {
+            width: 2,
+            height: 4,
+            rgba: vec![255, 0, 0, 255].repeat(8),
+        }];
+        let text = buffer_text(160, 40, &app);
+        assert!(
+            text.contains("repairing"),
+            "health caption must report health work"
+        );
+        assert!(text.contains("2×4 source"), "caption must use frame size");
+        assert!(
+            !text.contains("sweeping") && !text.contains("256×320"),
+            "health caption must not claim sweep activity or dimensions"
+        );
+    }
+
+    #[test]
+    fn missing_health_frames_show_diagnostic_not_sweep_frames() {
+        let mut app = crate::app::App::new(AppCommand::Health);
+        let assets = app
+            .sprites
+            .get_mut(crate::akari::animation::AnimationSet::Health);
+        assets.frames.clear();
+        assets.error = Some("missing sprite frame 1 for health set".to_string());
+        let text = buffer_text(120, 30, &app);
+        assert!(text.contains("repairing"));
+        assert!(text.contains("missing sprite frame 1 for health set"));
+        assert!(!text.contains("sweeping"));
     }
 
     #[test]

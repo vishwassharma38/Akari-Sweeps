@@ -2,7 +2,7 @@
 
 use crate::akari::animation::{AnimationMode, AnimationSet, Animator};
 use crate::akari::sprites::SpriteFrame;
-use crate::commands::AppCommand;
+use crate::commands::{AppCommand, Phase};
 use crate::system::{AppSummary, ExecEvent, OpResult, OpStatus, ProgressState};
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
@@ -79,6 +79,10 @@ pub struct App {
     pub execution: ExecutionState,
     pub log: Vec<String>,
     pub operations: Vec<OpItem>,
+    /// Latest maintenance phase reported by the worker. Selection uses the
+    /// phase (not just the command alias), so `akariall` can show sweep
+    /// during cleanup and health during repair. Reset when a new run starts.
+    pub phase: Option<Phase>,
     /// Evidence-based operation progress (single coherent model for
     /// clean/health/combined). Total comes from the worker's `Progress`
     /// init (stable per run); completions advance on `OpFinished`
@@ -112,6 +116,15 @@ pub struct OpItem {
     pub detail: String,
 }
 
+/// Map the worker's phase banner to the phase identity it represents.
+fn phase_from_name(name: &str) -> Option<Phase> {
+    match name {
+        "cleanup" => Some(Phase::Cleanup),
+        "repair" => Some(Phase::Repair),
+        _ => None,
+    }
+}
+
 impl App {
     pub fn new(command: AppCommand) -> Self {
         let screen = match command {
@@ -134,6 +147,7 @@ impl App {
                 "{PRODUCT_LABEL} — type a command (e.g. akarihelp for help)."
             )],
             operations: Vec::new(),
+            phase: None,
             progress: ProgressState::default(),
             animator: Animator::new(AnimationSet::Sweep),
             sprites: SpriteLibrary::load_all(),
@@ -166,13 +180,27 @@ impl App {
         self.sprites.get(self.animator.set()).error.as_deref()
     }
 
-    /// Keep the animation honest: idle reading on Home, sweep only while
-    /// maintenance is involved, settle when work ends.
+    /// Set matching the current maintenance phase: cleanup uses Sweep,
+    /// repair uses Health. Before the worker announces a phase, the command
+    /// determines the first phase (Health-only vs cleanup-first).
+    fn maintenance_set(&self) -> AnimationSet {
+        match self.phase {
+            Some(Phase::Cleanup) => AnimationSet::Sweep,
+            Some(Phase::Repair) => AnimationSet::Health,
+            None => match self.command {
+                AppCommand::Health => AnimationSet::Health,
+                _ => AnimationSet::Sweep,
+            },
+        }
+    }
+
+    /// Keep the animation honest: idle reading on Home, the phase-matched
+    /// set only while maintenance is involved, settle when work ends.
     pub fn sync_animation(&mut self) {
         let (set, mode) = match self.execution {
-            ExecutionState::Running => (AnimationSet::Sweep, AnimationMode::Sweeping),
+            ExecutionState::Running => (self.maintenance_set(), AnimationMode::Sweeping),
             ExecutionState::Done | ExecutionState::Error => {
-                (AnimationSet::Sweep, AnimationMode::Settled)
+                (self.maintenance_set(), AnimationMode::Settled)
             }
             ExecutionState::Idle => match self.screen {
                 Screen::Home => (AnimationSet::Idle, AnimationMode::Ambient),
@@ -248,9 +276,16 @@ impl App {
             }
             ExecEvent::PhaseStarted { name } => {
                 self.push_log(format!("━━ {name} started ━━"));
+                if let Some(phase) = phase_from_name(&name) {
+                    self.phase = Some(phase);
+                    self.sync_animation();
+                }
                 false
             }
             ExecEvent::PhaseFinished { name } => {
+                // Keep the phase until the next one starts (or the run
+                // settles) so a completed repair does not briefly fall back
+                // to sweep before the final summary arrives.
                 self.push_log(format!("━━ {name} finished ━━"));
                 false
             }
@@ -412,6 +447,7 @@ impl App {
         self.worker_running = true;
         self.execution = ExecutionState::Running;
         self.operations.clear();
+        self.phase = None;
         self.progress = ProgressState::default();
         self.summary = None;
         self.sync_animation();
@@ -481,6 +517,7 @@ mod tests {
         for (cmd, expected) in [
             (AppCommand::Home, AnimationSet::Idle),
             (AppCommand::Clean, AnimationSet::Sweep),
+            (AppCommand::Health, AnimationSet::Health),
         ] {
             let app = App::new(cmd);
             assert_eq!(app.animator.set(), expected);
@@ -498,14 +535,149 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_aliases_enter_running_screen() {
-        for cmd in [AppCommand::Clean, AppCommand::Health, AppCommand::All] {
+    fn maintenance_aliases_enter_running_screen_with_phase_matched_sets() {
+        for (cmd, expected) in [
+            (AppCommand::Clean, AnimationSet::Sweep),
+            (AppCommand::Health, AnimationSet::Health),
+            (AppCommand::All, AnimationSet::Sweep),
+        ] {
             let app = App::new(cmd);
             assert_eq!(app.screen, Screen::Maintenance);
             assert_eq!(app.execution, ExecutionState::Running);
-            assert_eq!(app.animator.set(), AnimationSet::Sweep);
+            assert_eq!(app.animator.set(), expected);
             assert_eq!(app.animator.mode(), AnimationMode::Sweeping);
         }
+    }
+
+    #[test]
+    fn all_switches_from_sweep_to_health_on_repair_phase() {
+        let mut app = App::new(AppCommand::All);
+        app.animator.tick(1_000);
+        assert_eq!(app.animator.set(), AnimationSet::Sweep);
+        assert_eq!(app.animator.mode(), AnimationMode::Sweeping);
+
+        app.on_event(ExecEvent::PhaseStarted {
+            name: "cleanup".into(),
+        });
+        assert_eq!(app.phase, Some(Phase::Cleanup));
+        assert_eq!(app.animator.set(), AnimationSet::Sweep);
+
+        app.on_event(ExecEvent::PhaseFinished {
+            name: "cleanup".into(),
+        });
+        // Phase completion alone must not restart or fall back.
+        assert_eq!(app.animator.set(), AnimationSet::Sweep);
+        assert_eq!(app.animator.mode(), AnimationMode::Sweeping);
+
+        app.on_event(ExecEvent::PhaseStarted {
+            name: "repair".into(),
+        });
+        assert_eq!(app.phase, Some(Phase::Repair));
+        assert_eq!(app.animator.set(), AnimationSet::Health);
+        assert_eq!(app.animator.mode(), AnimationMode::Sweeping);
+        assert!(app.animator.current_frame() < AnimationSet::Health.frame_count());
+        assert_eq!(app.execution, ExecutionState::Running);
+    }
+
+    #[test]
+    fn health_phase_completion_settles_health_not_sweep() {
+        let mut app = App::new(AppCommand::All);
+        app.on_event(ExecEvent::PhaseStarted {
+            name: "cleanup".into(),
+        });
+        app.on_event(ExecEvent::PhaseStarted {
+            name: "repair".into(),
+        });
+        app.on_event(ExecEvent::PhaseFinished {
+            name: "repair".into(),
+        });
+        let summary = AppSummary::compute(
+            "completed".into(),
+            "ran".into(),
+            true,
+            RunTotals::default(),
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        app.on_event(ExecEvent::Finished(summary));
+        assert_eq!(app.execution, ExecutionState::Done);
+        assert_eq!(app.animator.set(), AnimationSet::Health);
+        assert_eq!(app.animator.mode(), AnimationMode::Settled);
+        assert_eq!(
+            app.animator.current_frame(),
+            AnimationSet::Health.frame_count() - 1
+        );
+    }
+
+    #[test]
+    fn health_command_completion_and_failure_settle_health() {
+        let summary = AppSummary::compute(
+            "completed".into(),
+            "ran".into(),
+            true,
+            RunTotals::default(),
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        let mut done = App::new(AppCommand::Health);
+        done.on_event(ExecEvent::PhaseStarted {
+            name: "repair".into(),
+        });
+        done.on_event(ExecEvent::Finished(summary));
+        assert_eq!(done.animator.set(), AnimationSet::Health);
+        assert_eq!(done.animator.mode(), AnimationMode::Settled);
+        assert_eq!(
+            done.animator.current_frame(),
+            AnimationSet::Health.frame_count() - 1
+        );
+
+        let mut failed = App::new(AppCommand::Health);
+        failed.on_event(ExecEvent::Error("test failure".into()));
+        assert_eq!(failed.animator.set(), AnimationSet::Health);
+        assert_eq!(failed.animator.mode(), AnimationMode::Settled);
+    }
+
+    #[test]
+    fn cleanup_completion_still_settles_sweep() {
+        let mut app = App::new(AppCommand::Clean);
+        app.on_event(ExecEvent::PhaseStarted {
+            name: "cleanup".into(),
+        });
+        app.on_event(ExecEvent::PhaseFinished {
+            name: "cleanup".into(),
+        });
+        let summary = AppSummary::compute(
+            "completed".into(),
+            "not run - cleanup only".into(),
+            false,
+            RunTotals::default(),
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        app.on_event(ExecEvent::Finished(summary));
+        assert_eq!(app.animator.set(), AnimationSet::Sweep);
+        assert_eq!(app.animator.mode(), AnimationMode::Settled);
+    }
+
+    #[test]
+    fn starting_health_run_clears_previous_phase() {
+        let mut app = App::new(AppCommand::All);
+        app.on_event(ExecEvent::PhaseStarted {
+            name: "repair".into(),
+        });
+        assert_eq!(app.animator.set(), AnimationSet::Health);
+
+        app.command = AppCommand::Clean;
+        app.mark_started(2);
+        assert_eq!(app.phase, None);
+        assert_eq!(app.animator.set(), AnimationSet::Sweep);
+        assert_eq!(app.animator.mode(), AnimationMode::Sweeping);
     }
 
     #[test]

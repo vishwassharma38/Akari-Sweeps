@@ -1,25 +1,28 @@
-//! Frame sequencing and timing. Animation sets (sweep/idle, and future
-//! health/about/help) plug in here without touching the TUI.
+//! Frame sequencing and timing. Animation sets (sweep/idle/health, and
+//! future about/help) plug in here without touching the TUI.
 
 use crate::akari::sprites::{SWEEP_INTERVAL_MS, SpriteSetSpec};
 
-/// Which animation set is displayed. Sweep runs during maintenance; Idle
-/// is the book-reading loop shown while Home waits for input.
+/// Which animation set is displayed. Sweep runs during cleanup; Health is
+/// the nurse-inspired loop shown during health/repair work; Idle is the
+/// book-reading loop shown while Home waits for input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnimationSet {
     Sweep,
     Idle,
+    Health,
 }
 
 impl AnimationSet {
-    pub const COUNT: usize = 2;
+    pub const COUNT: usize = 3;
     /// Every set with shipped frames, in load order.
-    pub const ALL: [Self; Self::COUNT] = [Self::Sweep, Self::Idle];
+    pub const ALL: [Self; Self::COUNT] = [Self::Sweep, Self::Idle, Self::Health];
 
     pub fn index(self) -> usize {
         match self {
             Self::Sweep => 0,
             Self::Idle => 1,
+            Self::Health => 2,
         }
     }
 
@@ -28,6 +31,7 @@ impl AnimationSet {
         match self {
             Self::Sweep => SpriteSetSpec::SWEEP,
             Self::Idle => SpriteSetSpec::IDLE,
+            Self::Health => SpriteSetSpec::HEALTH,
         }
     }
 
@@ -41,7 +45,7 @@ impl AnimationSet {
 pub enum AnimationMode {
     /// Home/About/Help: gentle loop so the panel is alive but calm.
     Ambient,
-    /// Cleanup actively running: full-speed sweep loop.
+    /// Maintenance actively running: full-speed loop for the selected set.
     Sweeping,
     /// Work finished: hold the final frame (not "still sweeping").
     Settled,
@@ -152,7 +156,7 @@ impl Animator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::akari::sprites::{IDLE_FRAMES, SWEEP_FRAMES};
+    use crate::akari::sprites::{HEALTH_FRAMES, IDLE_FRAMES, SWEEP_FRAMES};
 
     #[test]
     fn loops_through_eight_frames() {
@@ -247,6 +251,29 @@ mod tests {
     }
 
     #[test]
+    fn health_set_uses_its_own_frame_count_and_frames() {
+        assert_eq!(AnimationSet::Health.frame_count(), HEALTH_FRAMES);
+        assert_eq!(AnimationSet::Health.sprite_set(), SpriteSetSpec::HEALTH);
+        let a = Animator::new(AnimationSet::Health);
+        assert_eq!(a.set(), AnimationSet::Health);
+    }
+
+    #[test]
+    fn health_sweeping_loops_through_all_frames() {
+        let mut a = Animator::new(AnimationSet::Health);
+        a.set_mode(AnimationMode::Sweeping);
+        let mut seen = std::collections::HashSet::new();
+        let mut t = 0u64;
+        for _ in 0..(HEALTH_FRAMES * 2) {
+            t += SWEEP_INTERVAL_MS;
+            assert!(a.tick(t), "health frame should advance");
+            seen.insert(a.current_frame());
+        }
+        assert_eq!(seen.len(), HEALTH_FRAMES);
+        assert_eq!(a.current_frame(), 0, "loop returns to the first frame");
+    }
+
+    #[test]
     fn switching_sets_resets_frame_and_stays_in_range() {
         let mut a = Animator::new(AnimationSet::Sweep);
         a.set_mode(AnimationMode::Sweeping);
@@ -261,9 +288,16 @@ mod tests {
             assert!(a.current_frame() < AnimationSet::Idle.frame_count());
         }
 
-        assert!(a.select_set(AnimationSet::Sweep, 20_000));
+        assert!(a.select_set(AnimationSet::Health, 20_000));
+        assert_eq!(a.current_frame(), 0);
+        for step in 1..=(HEALTH_FRAMES as u64 * 2) {
+            a.tick(20_000 + step * SWEEP_INTERVAL_MS);
+            assert!(a.current_frame() < AnimationSet::Health.frame_count());
+        }
+
+        assert!(a.select_set(AnimationSet::Sweep, 30_000));
         assert_eq!(a.current_frame(), 0);
         assert!(a.current_frame() < AnimationSet::Sweep.frame_count());
-        assert!(!a.select_set(AnimationSet::Sweep, 21_000));
+        assert!(!a.select_set(AnimationSet::Sweep, 31_000));
     }
 }
