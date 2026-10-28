@@ -1,8 +1,8 @@
 # Akari-Sweeps_V00.1
 
 Windows maintenance TUI in Rust — a faithful port of `Akari-Sweeps.bat`
-(the behavioral spec) with Akari's idle reading, sweeping, and health
-animations in a persistent terminal interface. The Rust app is the implementation of
+(the behavioral spec) with Akari's idle reading, sweeping, health, and
+about-screen animations in a persistent terminal interface. The Rust app is the implementation of
 record; the BAT file remains as the auditable baseline, not the runtime
 engine.
 
@@ -36,7 +36,7 @@ src/system/elevation.rs UAC decision, runas relaunch, cancel handling
 src/system/process.rs run_program_capture(), program_exists()
 src/system/windows.rs is_elevated() (fltmc, like BAT), free_space_kb()
 src/akari/sprites.rs animation-set discovery/validation/loading (RGBA PNGs)
-src/akari/animation.rs Animator (idle/sweep/health sets; Ambient/Sweeping/Settled), 6 FPS deadline
+src/akari/animation.rs Animator (idle/sweep/health/about sets; Ambient/Sweeping/Settled), 6 FPS deadline
 src/ui/*             Ratatui layout: header, main/output, animation, entry
 install.ps1 / uninstall.ps1  copy-based command registration
 ```
@@ -117,21 +117,27 @@ Detection uses the BAT's `fltmc` probe — a real privilege check.
 
 ## Sprite assets
 
-Directories: `assets/akari/sweep/`, `assets/akari/idle/`, and
-`assets/akari/health/` (shipped to `<InstallDir>\assets\…`).
+Directories: `assets/akari/sweep/`, `assets/akari/idle/`,
+`assets/akari/health/`, and `assets/akari/about/frames/` (shipped to
+`<InstallDir>\assets\…`).
 
 ```
 akari_sweep_001.png … akari_sweep_008.png   (each 256×320, RGBA)
 idle_001.png … idle_008.png                (each 367×564, RGBA)
 health_001.png … health_008.png            (each 358×575, RGBA)
+about_001.png … about_004.png              (each 346×557, RGBA)
 ```
+
+The About folder also contains `about_005.png`–`about_008.png`, which are
+byte-identical duplicates of frames 001–004; the loader uses the four
+canonical poses.
 
 Validated at startup: each set's frames must decode at its documented
 size, in order. Missing/corrupt frames produce an explicit diagnostic in
 the animation panel — the TUI stays usable. Source PNGs are never modified.
-Home idle mode plays the book-reading frames; cleanup plays sweep frames;
-health/repair work (including the health phase of `akariall`) plays the
-health frames.
+Home idle mode plays the book-reading frames; About plays the
+magnifying-glass frames; cleanup plays sweep frames; health/repair work
+(including the health phase of `akariall`) plays the health frames.
 
 ## Rendering + animation
 
@@ -198,18 +204,18 @@ CHKDSK `0/1/2/3+` mapped per BAT. Locked files are skipped + counted
 
 ## Future animation sets
 
-`assets/akari/{about,help}/` are reserved. Add a frame-set spec, extend
+`assets/akari/help/` is reserved. Add a frame-set spec, extend
 `akari::animation::AnimationSet`, and select it from
 `App::sync_animation`; the TUI panel needs no rewrite.
 
 ## Tests
 
 ```powershell
-cargo test   # 180 tests: dispatch, input/back-nav, placeholder, elevation,
+cargo test   # 195 tests: dispatch, input/back-nav, placeholder, elevation,
              # strict isolation (zero-DISM clean, 6-step health, ordering),
-             # npm/Recycle/DISM-740/filesystem, idle/sweep/health sprites +
-             # animation selection, rendering, exit codes (mock runners + temp
-             # dirs only)
+             # npm/Recycle/DISM-740/filesystem, idle/sweep/health/about
+             # sprites + animation selection, rendering, exit codes
+             # (mock runners + temp dirs only)
 ```
 
 Destructive/real servicing ops never run in tests. TUI resize/exit-code

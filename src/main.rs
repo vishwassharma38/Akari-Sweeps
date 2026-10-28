@@ -326,23 +326,8 @@ fn activate(app: &mut App, tx: &Sender<ExecEvent>, cmd: AppCommand) {
         return;
     }
     if !cmd.starts_maintenance() {
-        let fresh = App::new(cmd);
-        // Preserve loaded sprites and elevation state across navigation.
-        app.sprites = fresh.sprites;
-        app.command = fresh.command;
-        app.screen = fresh.screen;
-        app.execution = fresh.execution;
-        app.summary = None;
-        app.operations.clear();
-        app.phase = None;
-        app.progress = crate::system::ProgressState::default();
-        // Drop stale per-run UI state so back-navigation is clean.
-        app.scroll = 0;
-        app.input.clear();
-        app.input_focused = false;
-        app.run_token = None;
-        app.status_line.clear();
-        app.sync_animation();
+        // Reuse the loaded sprite library; navigation only changes state.
+        app.navigate(cmd);
         if cmd == AppCommand::Home {
             app.push_log(
                 "Returned to main menu. Type back, akariback, or press - to return here; 1-5 still launch operations."

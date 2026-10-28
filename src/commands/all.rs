@@ -324,6 +324,7 @@ mod tests {
     struct ProgressRecorder {
         inner: RecordingRunner,
         progress: Vec<crate::system::ProgressState>,
+        started_phases: Vec<String>,
         finished: usize,
     }
 
@@ -332,6 +333,7 @@ mod tests {
             Self {
                 inner: RecordingRunner::new(),
                 progress: Vec::new(),
+                started_phases: Vec::new(),
                 finished: 0,
             }
         }
@@ -350,6 +352,7 @@ mod tests {
         fn emit(&mut self, ev: ExecEvent) {
             match ev {
                 ExecEvent::Progress(s) => self.progress.push(s),
+                ExecEvent::PhaseStarted { name } => self.started_phases.push(name),
                 ExecEvent::OpFinished(_) => self.finished += 1,
                 _ => {}
             }
@@ -362,6 +365,14 @@ mod tests {
             combined_total_units(),
             crate::commands::clean::cleanup_total_units() + 6
         );
+    }
+
+    #[test]
+    fn combined_run_reports_cleanup_then_repair_phase_starts() {
+        let mut r = ProgressRecorder::new_rec();
+        let summary = run_all_phases(&mut r, false);
+        assert!(summary.repair_entered);
+        assert_eq!(r.started_phases, vec!["cleanup", "repair"]);
     }
 
     #[test]

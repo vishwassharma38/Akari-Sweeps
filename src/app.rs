@@ -27,6 +27,22 @@ pub enum ExecutionState {
     Error,
 }
 
+fn initial_screen(command: AppCommand) -> Screen {
+    match command {
+        AppCommand::About => Screen::About,
+        AppCommand::Help => Screen::Help,
+        AppCommand::Clean | AppCommand::Health | AppCommand::All => Screen::Maintenance,
+        AppCommand::Home => Screen::Home,
+    }
+}
+
+fn initial_execution(command: AppCommand) -> ExecutionState {
+    match command {
+        AppCommand::Clean | AppCommand::Health | AppCommand::All => ExecutionState::Running,
+        AppCommand::Home | AppCommand::About | AppCommand::Help => ExecutionState::Idle,
+    }
+}
+
 /// Loaded frames plus a diagnostic for one animation set.
 #[derive(Debug)]
 pub struct SpriteFrames {
@@ -127,22 +143,11 @@ fn phase_from_name(name: &str) -> Option<Phase> {
 
 impl App {
     pub fn new(command: AppCommand) -> Self {
-        let screen = match command {
-            AppCommand::About => Screen::About,
-            AppCommand::Help => Screen::Help,
-            AppCommand::Clean | AppCommand::Health | AppCommand::All => Screen::Maintenance,
-            AppCommand::Home => Screen::Home,
-        };
-        // Maintenance aliases auto-start; Home waits for a key.
-        let execution = match command {
-            AppCommand::Clean | AppCommand::Health | AppCommand::All => ExecutionState::Running,
-            AppCommand::Home => ExecutionState::Idle,
-            AppCommand::About | AppCommand::Help => ExecutionState::Idle,
-        };
         let mut app = Self {
             command,
-            screen,
-            execution,
+            screen: initial_screen(command),
+            // Maintenance aliases auto-start; Home/informational screens wait.
+            execution: initial_execution(command),
             log: vec![format!(
                 "{PRODUCT_LABEL} — type a command (e.g. akarihelp for help)."
             )],
@@ -204,7 +209,8 @@ impl App {
             }
             ExecutionState::Idle => match self.screen {
                 Screen::Home => (AnimationSet::Idle, AnimationMode::Ambient),
-                _ => (AnimationSet::Sweep, AnimationMode::Ambient),
+                Screen::About => (AnimationSet::About, AnimationMode::Ambient),
+                Screen::Help | Screen::Maintenance => (AnimationSet::Sweep, AnimationMode::Ambient),
             },
         };
         let now_ms = self.elapsed_ms();
@@ -453,6 +459,25 @@ impl App {
         self.sync_animation();
     }
 
+    /// Navigate to Home/About/Help without rebuilding the app or reloading
+    /// sprite assets. Per-run state is cleared; loaded frames are reused.
+    pub fn navigate(&mut self, command: AppCommand) {
+        debug_assert!(!command.starts_maintenance());
+        self.command = command;
+        self.screen = initial_screen(command);
+        self.execution = initial_execution(command);
+        self.summary = None;
+        self.operations.clear();
+        self.phase = None;
+        self.progress = ProgressState::default();
+        self.scroll = 0;
+        self.input.clear();
+        self.input_focused = false;
+        self.run_token = None;
+        self.status_line.clear();
+        self.sync_animation();
+    }
+
     /// Focus (`/` key) or unfocus (Esc) the command-entry field.
     /// Focusing never starts an operation.
     pub fn set_input_focus(&mut self, focused: bool) {
@@ -516,6 +541,7 @@ mod tests {
     fn selected_set_resolves_to_matching_loaded_frames() {
         for (cmd, expected) in [
             (AppCommand::Home, AnimationSet::Idle),
+            (AppCommand::About, AnimationSet::About),
             (AppCommand::Clean, AnimationSet::Sweep),
             (AppCommand::Health, AnimationSet::Health),
         ] {
@@ -580,6 +606,49 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_health_operations_keep_health_without_resetting_frames() {
+        let mut app = App::new(AppCommand::All);
+        app.on_event(ExecEvent::PhaseStarted {
+            name: "cleanup".into(),
+        });
+        app.on_event(ExecEvent::PhaseFinished {
+            name: "cleanup".into(),
+        });
+        app.on_event(ExecEvent::PhaseStarted {
+            name: "repair".into(),
+        });
+
+        // Advance inside the health set so an unnecessary restart is visible.
+        let interval = crate::akari::sprites::SWEEP_INTERVAL_MS;
+        app.animator.tick(interval * 3);
+        let frame = app.animator.current_frame();
+        assert!(frame > 0, "health playback must have advanced");
+
+        for id in ["repair:checkhealth", "repair:restorehealth"] {
+            app.on_event(ExecEvent::OpStarted {
+                id: id.into(),
+                label: id.into(),
+                target: "DISM.exe".into(),
+            });
+            app.on_event(ExecEvent::OpFinished(OpResult::ok(
+                id,
+                "repair",
+                "DISM.exe",
+                "done".into(),
+            )));
+            // Ordinary application updates must not restart the loop.
+            app.sync_animation();
+            assert_eq!(app.animator.set(), AnimationSet::Health);
+            assert_eq!(app.animator.mode(), AnimationMode::Sweeping);
+            assert_eq!(
+                app.animator.current_frame(),
+                frame,
+                "health operation {id} must not restart playback"
+            );
+        }
+    }
+
+    #[test]
     fn health_phase_completion_settles_health_not_sweep() {
         let mut app = App::new(AppCommand::All);
         app.on_event(ExecEvent::PhaseStarted {
@@ -603,6 +672,29 @@ mod tests {
         );
         app.on_event(ExecEvent::Finished(summary));
         assert_eq!(app.execution, ExecutionState::Done);
+        assert_eq!(app.animator.set(), AnimationSet::Health);
+        assert_eq!(app.animator.mode(), AnimationMode::Settled);
+        assert_eq!(
+            app.animator.current_frame(),
+            AnimationSet::Health.frame_count() - 1
+        );
+    }
+
+    #[test]
+    fn all_repair_failure_settles_health() {
+        let mut app = App::new(AppCommand::All);
+        app.on_event(ExecEvent::PhaseStarted {
+            name: "cleanup".into(),
+        });
+        app.on_event(ExecEvent::PhaseFinished {
+            name: "cleanup".into(),
+        });
+        app.on_event(ExecEvent::PhaseStarted {
+            name: "repair".into(),
+        });
+        app.on_event(ExecEvent::Error("test failure".into()));
+
+        assert_eq!(app.execution, ExecutionState::Error);
         assert_eq!(app.animator.set(), AnimationSet::Health);
         assert_eq!(app.animator.mode(), AnimationMode::Settled);
         assert_eq!(
@@ -682,14 +774,54 @@ mod tests {
 
     #[test]
     fn about_help_do_not_run_maintenance() {
-        for cmd in [AppCommand::About, AppCommand::Help] {
-            let app = App::new(cmd);
-            assert_eq!(app.execution, ExecutionState::Idle);
-            assert!(app.summary.is_none());
-            // Preserve their current ambient sweep behavior.
-            assert_eq!(app.animator.set(), AnimationSet::Sweep);
-            assert_eq!(app.animator.mode(), AnimationMode::Ambient);
-        }
+        let about = App::new(AppCommand::About);
+        assert_eq!(about.execution, ExecutionState::Idle);
+        assert!(about.summary.is_none());
+        assert_eq!(about.animator.set(), AnimationSet::About);
+        assert_eq!(about.animator.mode(), AnimationMode::Ambient);
+
+        let help = App::new(AppCommand::Help);
+        assert_eq!(help.execution, ExecutionState::Idle);
+        assert!(help.summary.is_none());
+        // Help keeps its existing ambient sweep behavior.
+        assert_eq!(help.animator.set(), AnimationSet::Sweep);
+        assert_eq!(help.animator.mode(), AnimationMode::Ambient);
+    }
+
+    #[test]
+    fn about_screen_uses_about_animation_and_restores_idle_on_exit() {
+        let mut app = App::new(AppCommand::Home);
+        app.navigate(AppCommand::About);
+        assert_eq!(app.screen, Screen::About);
+        assert_eq!(app.execution, ExecutionState::Idle);
+        assert_eq!(app.animator.set(), AnimationSet::About);
+        assert_eq!(app.animator.mode(), AnimationMode::Ambient);
+        assert_eq!(app.animator.current_frame(), 0);
+
+        let next = app.elapsed_ms() + crate::akari::sprites::SWEEP_INTERVAL_MS * 3;
+        assert!(app.animator.tick(next), "about frame should advance");
+        assert!(app.animator.current_frame() > 0);
+
+        app.navigate(AppCommand::Home);
+        assert_eq!(app.screen, Screen::Home);
+        assert_eq!(app.animator.set(), AnimationSet::Idle);
+        assert_eq!(app.animator.mode(), AnimationMode::Ambient);
+        assert_eq!(app.animator.current_frame(), 0);
+
+        app.navigate(AppCommand::About);
+        assert_eq!(app.animator.set(), AnimationSet::About);
+        assert_eq!(app.animator.mode(), AnimationMode::Ambient);
+        assert_eq!(app.animator.current_frame(), 0);
+    }
+
+    #[test]
+    fn informational_navigation_reuses_loaded_sprite_library() {
+        let mut app = App::new(AppCommand::Home);
+        app.sprites.get_mut(AnimationSet::About).frames.clear();
+        app.sprites.get_mut(AnimationSet::About).error = Some("sentinel".into());
+
+        app.navigate(AppCommand::About);
+        assert_eq!(app.sprite_error(), Some("sentinel"));
     }
 
     #[test]

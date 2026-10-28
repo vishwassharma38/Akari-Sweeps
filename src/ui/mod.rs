@@ -167,6 +167,7 @@ fn render_animation_panel(frame: &mut Frame, app: &App, area: Rect) {
             crate::akari::animation::AnimationSet::Idle => "…reading…",
             crate::akari::animation::AnimationSet::Sweep => "…sweeping…",
             crate::akari::animation::AnimationSet::Health => "…repairing…",
+            crate::akari::animation::AnimationSet::About => "…investigating…",
         };
         let msg = Paragraph::new(vec![
             Line::from(activity),
@@ -201,6 +202,7 @@ fn render_animation_panel(frame: &mut Frame, app: &App, area: Rect) {
             crate::akari::animation::AnimationSet::Idle => "reading",
             crate::akari::animation::AnimationSet::Sweep => "idle",
             crate::akari::animation::AnimationSet::Health => "health",
+            crate::akari::animation::AnimationSet::About => "investigating",
         },
     };
     let mut all = lines;
@@ -408,10 +410,91 @@ mod tests {
     }
 
     #[test]
+    fn about_panel_reports_about_caption_and_source_dimensions() {
+        use crate::akari::animation::AnimationSet;
+        use crate::akari::sprites::SpriteFrame;
+
+        let mut app = crate::app::App::new(AppCommand::About);
+        assert_eq!(app.animator.set(), AnimationSet::About);
+        let assets = app.sprites.get_mut(AnimationSet::About);
+        assets.error = None;
+        assets.frames = vec![SpriteFrame {
+            width: 2,
+            height: 4,
+            rgba: vec![0, 255, 255, 255].repeat(8),
+        }];
+        let text = buffer_text(160, 40, &app);
+        assert!(
+            text.contains("investigating"),
+            "about caption must report about activity"
+        );
+        assert!(text.contains("2×4 source"), "caption must use frame size");
+        assert!(
+            !text.contains("sweeping") && !text.contains("reading"),
+            "about panel must not claim another animation set"
+        );
+    }
+
+    #[test]
+    fn missing_about_frames_show_diagnostic_not_sweep_frames() {
+        use crate::akari::animation::AnimationSet;
+
+        let mut app = crate::app::App::new(AppCommand::About);
+        let assets = app.sprites.get_mut(AnimationSet::About);
+        assets.frames.clear();
+        assets.error = Some("missing sprite frame 1 for about set".to_string());
+        let text = buffer_text(120, 30, &app);
+        assert!(text.contains("investigating"));
+        assert!(text.contains("missing sprite frame 1 for about set"));
+        assert!(!text.contains("sweeping"));
+    }
+
+    #[test]
     fn sweep_panel_still_reports_maintenance_caption() {
         let app = crate::app::App::new(AppCommand::Clean);
         let text = buffer_text(100, 28, &app);
         assert!(text.contains("sweeping"), "running sweep caption preserved");
+    }
+
+    #[test]
+    fn all_phase_transition_replaces_sweep_frame_with_health_frame() {
+        use crate::akari::animation::AnimationSet;
+        use crate::akari::sprites::SpriteFrame;
+
+        let mut app = crate::app::App::new(AppCommand::All);
+        app.sprites.get_mut(AnimationSet::Sweep).error = None;
+        app.sprites.get_mut(AnimationSet::Sweep).frames = vec![SpriteFrame {
+            width: 6,
+            height: 8,
+            rgba: vec![255, 0, 0, 255].repeat(48),
+        }];
+        app.sprites.get_mut(AnimationSet::Health).error = None;
+        app.sprites.get_mut(AnimationSet::Health).frames = vec![SpriteFrame {
+            width: 2,
+            height: 4,
+            rgba: vec![0, 255, 0, 255].repeat(8),
+        }];
+
+        let cleanup = buffer_text(160, 40, &app);
+        assert!(cleanup.contains("6×8 source"), "cleanup frame must show");
+        assert!(cleanup.contains("sweeping"));
+
+        app.on_event(crate::system::ExecEvent::PhaseStarted {
+            name: "cleanup".into(),
+        });
+        let cleanup_phase = buffer_text(160, 40, &app);
+        assert!(cleanup_phase.contains("6×8 source"));
+
+        app.on_event(crate::system::ExecEvent::PhaseStarted {
+            name: "repair".into(),
+        });
+        let repair = buffer_text(160, 40, &app);
+        assert!(repair.contains("2×4 source"), "health frame must show");
+        assert!(repair.contains("repairing"));
+        assert!(
+            !repair.contains("6×8 source") && !repair.contains("sweeping"),
+            "stale sweep frame/caption must not survive the phase switch"
+        );
     }
 
     #[test]

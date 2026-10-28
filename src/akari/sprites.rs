@@ -16,15 +16,20 @@ pub const IDLE_FRAMES: usize = 8;
 pub const HEALTH_WIDTH: u32 = 358;
 pub const HEALTH_HEIGHT: u32 = 575;
 pub const HEALTH_FRAMES: usize = 8;
+pub const ABOUT_WIDTH: u32 = 346;
+pub const ABOUT_HEIGHT: u32 = 557;
+/// Four unique poses. The asset folder also contains exact duplicates as
+/// files 005–008; the loader follows the canonical 001–004 sequence.
+pub const ABOUT_FRAMES: usize = 4;
 /// Target 6 frames per second (≈166.7 ms per frame). All animation sets
 /// share this timing policy through `Animator`.
 pub const SWEEP_INTERVAL_MS: u64 = 167;
 
 /// Filesystem identity and validation constraints for one animation set.
-/// Future sets (about/help) add a constant here.
+/// Future sets (help) add a constant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpriteSetSpec {
-    /// Asset subdirectory under `assets/akari/`.
+    /// Asset directory under `assets/akari/` (may be nested).
     pub dir: &'static str,
     /// File-name prefix before `_NNN.png`.
     pub prefix: &'static str,
@@ -56,6 +61,14 @@ impl SpriteSetSpec {
         frame_count: HEALTH_FRAMES,
         width: HEALTH_WIDTH,
         height: HEALTH_HEIGHT,
+    };
+
+    pub const ABOUT: Self = Self {
+        dir: "about/frames",
+        prefix: "about",
+        frame_count: ABOUT_FRAMES,
+        width: ABOUT_WIDTH,
+        height: ABOUT_HEIGHT,
     };
 
     /// Canonical file name for frame `index` (0-based).
@@ -310,6 +323,18 @@ mod tests {
                 "health_008.png",
             ]
         );
+        let about: Vec<_> = (0..ABOUT_FRAMES)
+            .map(|i| SpriteSetSpec::ABOUT.frame_name(i))
+            .collect();
+        assert_eq!(
+            about,
+            vec![
+                "about_001.png",
+                "about_002.png",
+                "about_003.png",
+                "about_004.png",
+            ]
+        );
     }
 
     #[test]
@@ -318,6 +343,7 @@ mod tests {
             SpriteSetSpec::SWEEP,
             SpriteSetSpec::IDLE,
             SpriteSetSpec::HEALTH,
+            SpriteSetSpec::ABOUT,
         ] {
             let dir = manifest_dir(spec);
             if !dir.join(spec.frame_name(0)).exists() {
@@ -404,6 +430,48 @@ mod tests {
     }
 
     #[test]
+    fn about_frames_are_loaded_in_order() {
+        let spec = SpriteSetSpec::ABOUT;
+        let dir = manifest_dir(spec);
+        if !dir.join(spec.frame_name(0)).exists() {
+            eprintln!("skipping: about assets not in tree");
+            return;
+        }
+        let frames = spec.load_frames(&dir).expect("about frames must decode");
+        assert_eq!(frames.len(), ABOUT_FRAMES);
+        for (i, frame) in frames.iter().enumerate() {
+            let expected = image::open(dir.join(spec.frame_name(i)))
+                .expect("source frame must decode")
+                .to_rgba8();
+            assert_eq!(
+                frame.rgba,
+                expected.into_raw(),
+                "about frame {i} loaded out of order"
+            );
+        }
+    }
+
+    #[test]
+    fn about_dir_is_discovered() {
+        let spec = SpriteSetSpec::ABOUT;
+        if !manifest_dir(spec).join(spec.frame_name(0)).exists() {
+            eprintln!("skipping: about assets not in tree");
+            return;
+        }
+        let dir = spec.resolve_dir().expect("about assets must be discovered");
+        assert!(
+            dir.ends_with(
+                Path::new("assets")
+                    .join("akari")
+                    .join("about")
+                    .join("frames")
+            ),
+            "resolved {}",
+            dir.display()
+        );
+    }
+
+    #[test]
     fn missing_frame_diagnostic() {
         let dir = std::env::temp_dir().join("akari-no-such-sweep-dir");
         let err = SpriteSetSpec::SWEEP.load_frames(&dir).unwrap_err();
@@ -475,6 +543,41 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("expected 358x575"));
         assert!(msg.contains("health animation"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_about_frame_diagnostic() {
+        let dir = temp_dir("missing-about");
+        let err = SpriteSetSpec::ABOUT.load_frames(&dir).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("missing sprite frame 1"));
+        assert!(msg.contains("for about/frames set"));
+        assert!(msg.contains("assets/akari/about/frames/about_001..004.png"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_about_frame_diagnostic() {
+        let dir = temp_dir("corrupt-about");
+        std::fs::write(dir.join(SpriteSetSpec::ABOUT.frame_name(0)), b"not a png").unwrap();
+        let err = SpriteSetSpec::ABOUT.load_frames(&dir).unwrap_err();
+        assert!(matches!(err, SpriteError::Load { .. }));
+        assert!(err.to_string().contains("cannot decode"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bad_about_dimensions_report_about_size() {
+        let dir = temp_dir("bad-about-dim");
+        let img = image::RgbaImage::new(4, 4);
+        img.save(dir.join(SpriteSetSpec::ABOUT.frame_name(0)))
+            .unwrap();
+        let err = SpriteSetSpec::ABOUT.load_frames(&dir).unwrap_err();
+        assert!(matches!(err, SpriteError::BadDimensions { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("expected 346x557"));
+        assert!(msg.contains("about/frames animation"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

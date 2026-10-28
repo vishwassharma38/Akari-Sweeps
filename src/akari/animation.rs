@@ -1,28 +1,31 @@
-//! Frame sequencing and timing. Animation sets (sweep/idle/health, and
-//! future about/help) plug in here without touching the TUI.
+//! Frame sequencing and timing. Animation sets (sweep/idle/health/about)
+//! plug in here without touching the TUI.
 
 use crate::akari::sprites::{SWEEP_INTERVAL_MS, SpriteSetSpec};
 
 /// Which animation set is displayed. Sweep runs during cleanup; Health is
 /// the nurse-inspired loop shown during health/repair work; Idle is the
-/// book-reading loop shown while Home waits for input.
+/// book-reading loop shown while Home waits for input; About is the
+/// magnifying-glass loop shown on the About screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnimationSet {
     Sweep,
     Idle,
     Health,
+    About,
 }
 
 impl AnimationSet {
-    pub const COUNT: usize = 3;
+    pub const COUNT: usize = 4;
     /// Every set with shipped frames, in load order.
-    pub const ALL: [Self; Self::COUNT] = [Self::Sweep, Self::Idle, Self::Health];
+    pub const ALL: [Self; Self::COUNT] = [Self::Sweep, Self::Idle, Self::Health, Self::About];
 
     pub fn index(self) -> usize {
         match self {
             Self::Sweep => 0,
             Self::Idle => 1,
             Self::Health => 2,
+            Self::About => 3,
         }
     }
 
@@ -32,6 +35,7 @@ impl AnimationSet {
             Self::Sweep => SpriteSetSpec::SWEEP,
             Self::Idle => SpriteSetSpec::IDLE,
             Self::Health => SpriteSetSpec::HEALTH,
+            Self::About => SpriteSetSpec::ABOUT,
         }
     }
 
@@ -156,7 +160,7 @@ impl Animator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::akari::sprites::{HEALTH_FRAMES, IDLE_FRAMES, SWEEP_FRAMES};
+    use crate::akari::sprites::{ABOUT_FRAMES, HEALTH_FRAMES, IDLE_FRAMES, SWEEP_FRAMES};
 
     #[test]
     fn loops_through_eight_frames() {
@@ -274,6 +278,31 @@ mod tests {
     }
 
     #[test]
+    fn about_set_uses_its_own_frame_count_and_frames() {
+        assert_eq!(AnimationSet::About.frame_count(), ABOUT_FRAMES);
+        assert_eq!(AnimationSet::About.sprite_set(), SpriteSetSpec::ABOUT);
+        let a = Animator::new(AnimationSet::About);
+        assert_eq!(a.set(), AnimationSet::About);
+    }
+
+    #[test]
+    fn about_ambient_loops_through_all_frames() {
+        let interval = SWEEP_INTERVAL_MS * 3;
+        let mut a = Animator::new(AnimationSet::About);
+        a.set_mode(AnimationMode::Ambient);
+        assert_eq!(a.ms_until_next_frame(0), interval);
+        let mut seen = std::collections::HashSet::new();
+        let mut t = 0u64;
+        for _ in 0..(ABOUT_FRAMES * 2) {
+            t += interval;
+            assert!(a.tick(t), "ambient about frame should advance");
+            seen.insert(a.current_frame());
+        }
+        assert_eq!(seen.len(), ABOUT_FRAMES);
+        assert_eq!(a.current_frame(), 0, "loop returns to the first frame");
+    }
+
+    #[test]
     fn switching_sets_resets_frame_and_stays_in_range() {
         let mut a = Animator::new(AnimationSet::Sweep);
         a.set_mode(AnimationMode::Sweeping);
@@ -295,9 +324,16 @@ mod tests {
             assert!(a.current_frame() < AnimationSet::Health.frame_count());
         }
 
-        assert!(a.select_set(AnimationSet::Sweep, 30_000));
+        assert!(a.select_set(AnimationSet::About, 30_000));
+        assert_eq!(a.current_frame(), 0);
+        for step in 1..=(ABOUT_FRAMES as u64 * 2) {
+            a.tick(30_000 + step * SWEEP_INTERVAL_MS);
+            assert!(a.current_frame() < AnimationSet::About.frame_count());
+        }
+
+        assert!(a.select_set(AnimationSet::Sweep, 40_000));
         assert_eq!(a.current_frame(), 0);
         assert!(a.current_frame() < AnimationSet::Sweep.frame_count());
-        assert!(!a.select_set(AnimationSet::Sweep, 31_000));
+        assert!(!a.select_set(AnimationSet::Sweep, 41_000));
     }
 }
