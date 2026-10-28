@@ -2,6 +2,8 @@
 
 Eight book-reading frames shown while the Home screen waits for input:
 
-- `idle_001.png` … `idle_008.png` (each 367×564, RGBA)
+- `idle_001.png` … `idle_008.png` (each 367×564, RGB, dark background)
 
 The Rust app validates all eight in order and plays them in ambient mode.
+The frames are opaque (no alpha); the loader normalizes them to RGBA for
+the shared renderer.

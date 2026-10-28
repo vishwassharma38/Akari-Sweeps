@@ -1,9 +1,10 @@
 //! Sprite discovery, validation, and pixel loading.
 //!
-//! Each animation set is a sequence of RGBA PNGs in its own
+//! Each animation set is a sequence of PNGs in its own
 //! `assets/akari/<set>/` directory, validated at the set's documented
-//! size. They are never rewritten; the TUI renders a scaled half-block
-//! approximation (documented limitation) with transparency blended.
+//! size and normalized to RGBA. They are never rewritten; the TUI renders a
+//! scaled half-block approximation (documented limitation) with transparent
+//! pixels blended over the terminal background.
 
 use std::path::{Path, PathBuf};
 
@@ -21,12 +22,17 @@ pub const ABOUT_HEIGHT: u32 = 557;
 /// Four unique poses. The asset folder also contains exact duplicates as
 /// files 005–008; the loader follows the canonical 001–004 sequence.
 pub const ABOUT_FRAMES: usize = 4;
+pub const HELP_WIDTH: u32 = 346;
+pub const HELP_HEIGHT: u32 = 557;
+/// Four unique poses. The asset folder also contains exact duplicates as
+/// files 005–008; the loader follows the canonical 001–004 sequence.
+pub const HELP_FRAMES: usize = 4;
 /// Target 6 frames per second (≈166.7 ms per frame). All animation sets
 /// share this timing policy through `Animator`.
 pub const SWEEP_INTERVAL_MS: u64 = 167;
 
 /// Filesystem identity and validation constraints for one animation set.
-/// Future sets (help) add a constant here.
+/// Additional sets add a constant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpriteSetSpec {
     /// Asset directory under `assets/akari/` (may be nested).
@@ -64,11 +70,19 @@ impl SpriteSetSpec {
     };
 
     pub const ABOUT: Self = Self {
-        dir: "about/frames",
+        dir: "about",
         prefix: "about",
         frame_count: ABOUT_FRAMES,
         width: ABOUT_WIDTH,
         height: ABOUT_HEIGHT,
+    };
+
+    pub const HELP: Self = Self {
+        dir: "help",
+        prefix: "help",
+        frame_count: HELP_FRAMES,
+        width: HELP_WIDTH,
+        height: HELP_HEIGHT,
     };
 
     /// Canonical file name for frame `index` (0-based).
@@ -335,6 +349,50 @@ mod tests {
                 "about_004.png",
             ]
         );
+        let help: Vec<_> = (0..HELP_FRAMES)
+            .map(|i| SpriteSetSpec::HELP.frame_name(i))
+            .collect();
+        assert_eq!(
+            help,
+            vec![
+                "help_001.png",
+                "help_002.png",
+                "help_003.png",
+                "help_004.png",
+            ]
+        );
+    }
+
+    #[test]
+    fn every_shipped_set_resolves_and_loads_its_frames() {
+        for spec in [
+            SpriteSetSpec::SWEEP,
+            SpriteSetSpec::IDLE,
+            SpriteSetSpec::HEALTH,
+            SpriteSetSpec::ABOUT,
+            SpriteSetSpec::HELP,
+        ] {
+            let dir = manifest_dir(spec);
+            assert!(
+                dir.join(spec.frame_name(0)).exists(),
+                "missing shipped assets: {}",
+                spec.asset_hint()
+            );
+            let resolved = spec
+                .resolve_dir()
+                .unwrap_or_else(|| panic!("{} assets must be discovered", spec.dir));
+            assert!(
+                resolved.ends_with(Path::new("assets").join("akari").join(spec.dir)),
+                "resolved {} to {}",
+                spec.dir,
+                resolved.display()
+            );
+            let frames = spec.load_frames(&resolved).expect("frames must decode");
+            assert_eq!(frames.len(), spec.frame_count);
+            for frame in &frames {
+                assert_eq!((frame.width, frame.height), (spec.width, spec.height));
+            }
+        }
     }
 
     #[test]
@@ -344,6 +402,7 @@ mod tests {
             SpriteSetSpec::IDLE,
             SpriteSetSpec::HEALTH,
             SpriteSetSpec::ABOUT,
+            SpriteSetSpec::HELP,
         ] {
             let dir = manifest_dir(spec);
             if !dir.join(spec.frame_name(0)).exists() {
@@ -460,12 +519,44 @@ mod tests {
         }
         let dir = spec.resolve_dir().expect("about assets must be discovered");
         assert!(
-            dir.ends_with(
-                Path::new("assets")
-                    .join("akari")
-                    .join("about")
-                    .join("frames")
-            ),
+            dir.ends_with(Path::new("assets").join("akari").join("about")),
+            "resolved {}",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn help_frames_are_loaded_in_order() {
+        let spec = SpriteSetSpec::HELP;
+        let dir = manifest_dir(spec);
+        if !dir.join(spec.frame_name(0)).exists() {
+            eprintln!("skipping: help assets not in tree");
+            return;
+        }
+        let frames = spec.load_frames(&dir).expect("help frames must decode");
+        assert_eq!(frames.len(), HELP_FRAMES);
+        for (i, frame) in frames.iter().enumerate() {
+            let expected = image::open(dir.join(spec.frame_name(i)))
+                .expect("source frame must decode")
+                .to_rgba8();
+            assert_eq!(
+                frame.rgba,
+                expected.into_raw(),
+                "help frame {i} loaded out of order"
+            );
+        }
+    }
+
+    #[test]
+    fn help_dir_is_discovered() {
+        let spec = SpriteSetSpec::HELP;
+        if !manifest_dir(spec).join(spec.frame_name(0)).exists() {
+            eprintln!("skipping: help assets not in tree");
+            return;
+        }
+        let dir = spec.resolve_dir().expect("help assets must be discovered");
+        assert!(
+            dir.ends_with(Path::new("assets").join("akari").join("help")),
             "resolved {}",
             dir.display()
         );
@@ -552,8 +643,8 @@ mod tests {
         let err = SpriteSetSpec::ABOUT.load_frames(&dir).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("missing sprite frame 1"));
-        assert!(msg.contains("for about/frames set"));
-        assert!(msg.contains("assets/akari/about/frames/about_001..004.png"));
+        assert!(msg.contains("for about set"));
+        assert!(msg.contains("assets/akari/about/about_001..004.png"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -577,7 +668,42 @@ mod tests {
         assert!(matches!(err, SpriteError::BadDimensions { .. }));
         let msg = err.to_string();
         assert!(msg.contains("expected 346x557"));
-        assert!(msg.contains("about/frames animation"));
+        assert!(msg.contains("about animation"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_help_frame_diagnostic() {
+        let dir = temp_dir("missing-help");
+        let err = SpriteSetSpec::HELP.load_frames(&dir).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("missing sprite frame 1"));
+        assert!(msg.contains("for help set"));
+        assert!(msg.contains("assets/akari/help/help_001..004.png"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_help_frame_diagnostic() {
+        let dir = temp_dir("corrupt-help");
+        std::fs::write(dir.join(SpriteSetSpec::HELP.frame_name(0)), b"not a png").unwrap();
+        let err = SpriteSetSpec::HELP.load_frames(&dir).unwrap_err();
+        assert!(matches!(err, SpriteError::Load { .. }));
+        assert!(err.to_string().contains("cannot decode"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bad_help_dimensions_report_help_size() {
+        let dir = temp_dir("bad-help-dim");
+        let img = image::RgbaImage::new(4, 4);
+        img.save(dir.join(SpriteSetSpec::HELP.frame_name(0)))
+            .unwrap();
+        let err = SpriteSetSpec::HELP.load_frames(&dir).unwrap_err();
+        assert!(matches!(err, SpriteError::BadDimensions { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("expected 346x557"));
+        assert!(msg.contains("help animation"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

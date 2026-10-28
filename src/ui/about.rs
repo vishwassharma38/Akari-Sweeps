@@ -14,7 +14,9 @@ pub fn lines() -> Vec<Line<'static>> {
         )),
         Line::from(""),
         Line::from("Reproduces the Akari-Sweeps.bat cleanup + system-image repair"),
-        Line::from("workflow in Rust, with Akari's idle, sweep, health, and about animations."),
+        Line::from(
+            "workflow in Rust, with Akari's idle, sweep, health, about, and help animations.",
+        ),
         Line::from(""),
         Line::from("Repository: vishwassharma38/Akari-Sweeps (MIT)."),
         Line::from("Behavioral spec: Akari-Sweeps.bat in the project root."),

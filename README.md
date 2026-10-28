@@ -1,8 +1,8 @@
 # Akari-Sweeps_V00.1
 
 Windows maintenance TUI in Rust — a faithful port of `Akari-Sweeps.bat`
-(the behavioral spec) with Akari's idle reading, sweeping, health, and
-about-screen animations in a persistent terminal interface. The Rust app is the implementation of
+(the behavioral spec) with Akari's idle reading, sweeping, health, about,
+and help-screen animations in a persistent terminal interface. The Rust app is the implementation of
 record; the BAT file remains as the auditable baseline, not the runtime
 engine.
 
@@ -35,8 +35,8 @@ src/system/mod.rs    OpStatus/OpResult/ExecEvent/MaintenanceRunner/AppSummary
 src/system/elevation.rs UAC decision, runas relaunch, cancel handling
 src/system/process.rs run_program_capture(), program_exists()
 src/system/windows.rs is_elevated() (fltmc, like BAT), free_space_kb()
-src/akari/sprites.rs animation-set discovery/validation/loading (RGBA PNGs)
-src/akari/animation.rs Animator (idle/sweep/health/about sets; Ambient/Sweeping/Settled), 6 FPS deadline
+src/akari/sprites.rs animation-set discovery/validation/loading (RGBA output)
+src/akari/animation.rs Animator (idle/sweep/health/about/help sets; Ambient/Sweeping/Settled), 6 FPS deadline
 src/ui/*             Ratatui layout: header, main/output, animation, entry
 install.ps1 / uninstall.ps1  copy-based command registration
 ```
@@ -118,26 +118,30 @@ Detection uses the BAT's `fltmc` probe — a real privilege check.
 ## Sprite assets
 
 Directories: `assets/akari/sweep/`, `assets/akari/idle/`,
-`assets/akari/health/`, and `assets/akari/about/frames/` (shipped to
-`<InstallDir>\assets\…`).
+`assets/akari/health/`, `assets/akari/about/`, and `assets/akari/help/`
+(shipped to `<InstallDir>\assets\…`).
 
 ```
 akari_sweep_001.png … akari_sweep_008.png   (each 256×320, RGBA)
-idle_001.png … idle_008.png                (each 367×564, RGBA)
-health_001.png … health_008.png            (each 358×575, RGBA)
-about_001.png … about_004.png              (each 346×557, RGBA)
+idle_001.png … idle_008.png                (each 367×564, RGB, dark background)
+health_001.png … health_008.png            (each 358×575, RGB, dark background)
+about_001.png … about_004.png              (each 346×557, RGB, dark background)
+help_001.png … help_004.png                (each 346×557, RGB, dark background)
 ```
 
-The About folder also contains `about_005.png`–`about_008.png`, which are
-byte-identical duplicates of frames 001–004; the loader uses the four
-canonical poses.
+The About and Help folders also contain `about_005.png`–`about_008.png`
+and `help_005.png`–`help_008.png`, which are byte-identical duplicates of
+frames 001–004; the loader uses the four canonical poses for each set.
+The non-sweep art is opaque RGB, so its dark background is part of the
+artwork; sweep frames keep their alpha transparency.
 
 Validated at startup: each set's frames must decode at its documented
 size, in order. Missing/corrupt frames produce an explicit diagnostic in
 the animation panel — the TUI stays usable. Source PNGs are never modified.
 Home idle mode plays the book-reading frames; About plays the
-magnifying-glass frames; cleanup plays sweep frames; health/repair work
-(including the health phase of `akariall`) plays the health frames.
+magnifying-glass frames; Help plays its own copy of the magnifying-glass
+frames; cleanup plays sweep frames; health/repair work (including the
+health phase of `akariall`) plays the health frames.
 
 ## Rendering + animation
 
@@ -202,18 +206,19 @@ CHKDSK `0/1/2/3+` mapped per BAT. Locked files are skipped + counted
 - `akariall` runs repair without a second Y/N gate — the explicit alias
   is treated as consent (documented deviation from the BAT's prompt).
 
-## Future animation sets
+## Additional animation sets
 
-`assets/akari/help/` is reserved. Add a frame-set spec, extend
+Help is registered as its own set and selected on the Help screen. Future
+sets follow the same path: add a frame-set spec, extend
 `akari::animation::AnimationSet`, and select it from
 `App::sync_animation`; the TUI panel needs no rewrite.
 
 ## Tests
 
 ```powershell
-cargo test   # 195 tests: dispatch, input/back-nav, placeholder, elevation,
+cargo test   # 209 tests: dispatch, input/back-nav, placeholder, elevation,
              # strict isolation (zero-DISM clean, 6-step health, ordering),
-             # npm/Recycle/DISM-740/filesystem, idle/sweep/health/about
+             # npm/Recycle/DISM-740/filesystem, idle/sweep/health/about/help
              # sprites + animation selection, rendering, exit codes
              # (mock runners + temp dirs only)
 ```

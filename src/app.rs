@@ -210,7 +210,8 @@ impl App {
             ExecutionState::Idle => match self.screen {
                 Screen::Home => (AnimationSet::Idle, AnimationMode::Ambient),
                 Screen::About => (AnimationSet::About, AnimationMode::Ambient),
-                Screen::Help | Screen::Maintenance => (AnimationSet::Sweep, AnimationMode::Ambient),
+                Screen::Help => (AnimationSet::Help, AnimationMode::Ambient),
+                Screen::Maintenance => (AnimationSet::Sweep, AnimationMode::Ambient),
             },
         };
         let now_ms = self.elapsed_ms();
@@ -457,6 +458,9 @@ impl App {
         self.progress = ProgressState::default();
         self.summary = None;
         self.sync_animation();
+        // A rerun of the same operation reuses the same set; without this
+        // restart it would inherit the previous run's settled last frame.
+        self.animator.restart(self.elapsed_ms());
     }
 
     /// Navigate to Home/About/Help without rebuilding the app or reloading
@@ -542,15 +546,18 @@ mod tests {
         for (cmd, expected) in [
             (AppCommand::Home, AnimationSet::Idle),
             (AppCommand::About, AnimationSet::About),
+            (AppCommand::Help, AnimationSet::Help),
             (AppCommand::Clean, AnimationSet::Sweep),
             (AppCommand::Health, AnimationSet::Health),
         ] {
             let app = App::new(cmd);
             assert_eq!(app.animator.set(), expected);
-            if app.frames().is_empty() {
-                eprintln!("skipping: {} assets not in tree", expected.sprite_set().dir);
-                continue;
-            }
+            assert!(
+                !app.frames().is_empty(),
+                "{} assets must be registered and loadable: {:?}",
+                expected.sprite_set().dir,
+                app.sprite_error()
+            );
             let spec = expected.sprite_set();
             assert_eq!(app.frames().len(), spec.frame_count);
             assert_eq!(
@@ -783,8 +790,7 @@ mod tests {
         let help = App::new(AppCommand::Help);
         assert_eq!(help.execution, ExecutionState::Idle);
         assert!(help.summary.is_none());
-        // Help keeps its existing ambient sweep behavior.
-        assert_eq!(help.animator.set(), AnimationSet::Sweep);
+        assert_eq!(help.animator.set(), AnimationSet::Help);
         assert_eq!(help.animator.mode(), AnimationMode::Ambient);
     }
 
@@ -815,13 +821,72 @@ mod tests {
     }
 
     #[test]
+    fn help_screen_uses_help_animation_and_restores_idle_on_exit() {
+        let mut app = App::new(AppCommand::Home);
+        app.navigate(AppCommand::Help);
+        assert_eq!(app.screen, Screen::Help);
+        assert_eq!(app.execution, ExecutionState::Idle);
+        assert_eq!(app.animator.set(), AnimationSet::Help);
+        assert_eq!(app.animator.mode(), AnimationMode::Ambient);
+        assert_eq!(app.animator.current_frame(), 0);
+
+        let next = app.elapsed_ms() + crate::akari::sprites::SWEEP_INTERVAL_MS * 3;
+        assert!(app.animator.tick(next), "help frame should advance");
+        assert!(app.animator.current_frame() > 0);
+
+        app.navigate(AppCommand::Home);
+        assert_eq!(app.animator.set(), AnimationSet::Idle);
+        assert_eq!(app.animator.mode(), AnimationMode::Ambient);
+        assert_eq!(app.animator.current_frame(), 0);
+
+        app.navigate(AppCommand::Help);
+        assert_eq!(app.animator.set(), AnimationSet::Help);
+        assert_eq!(app.animator.mode(), AnimationMode::Ambient);
+        assert_eq!(app.animator.current_frame(), 0);
+    }
+
+    #[test]
+    fn restarting_the_same_operation_starts_at_the_first_frame() {
+        let mut app = App::new(AppCommand::Clean);
+        app.animator
+            .tick(crate::akari::sprites::SWEEP_INTERVAL_MS * 4);
+        assert!(app.animator.current_frame() > 0);
+
+        let summary = AppSummary::compute(
+            "completed".into(),
+            "not run - cleanup only".into(),
+            false,
+            RunTotals::default(),
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        app.on_event(ExecEvent::Finished(summary));
+        assert_eq!(app.animator.mode(), AnimationMode::Settled);
+        assert_eq!(
+            app.animator.current_frame(),
+            AnimationSet::Sweep.frame_count() - 1
+        );
+
+        app.mark_started(2);
+        assert_eq!(app.animator.set(), AnimationSet::Sweep);
+        assert_eq!(app.animator.mode(), AnimationMode::Sweeping);
+        assert_eq!(app.animator.current_frame(), 0);
+    }
+
+    #[test]
     fn informational_navigation_reuses_loaded_sprite_library() {
         let mut app = App::new(AppCommand::Home);
         app.sprites.get_mut(AnimationSet::About).frames.clear();
-        app.sprites.get_mut(AnimationSet::About).error = Some("sentinel".into());
+        app.sprites.get_mut(AnimationSet::About).error = Some("about-sentinel".into());
+        app.sprites.get_mut(AnimationSet::Help).frames.clear();
+        app.sprites.get_mut(AnimationSet::Help).error = Some("help-sentinel".into());
 
         app.navigate(AppCommand::About);
-        assert_eq!(app.sprite_error(), Some("sentinel"));
+        assert_eq!(app.sprite_error(), Some("about-sentinel"));
+        app.navigate(AppCommand::Help);
+        assert_eq!(app.sprite_error(), Some("help-sentinel"));
     }
 
     #[test]

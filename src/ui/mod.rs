@@ -168,6 +168,7 @@ fn render_animation_panel(frame: &mut Frame, app: &App, area: Rect) {
             crate::akari::animation::AnimationSet::Sweep => "…sweeping…",
             crate::akari::animation::AnimationSet::Health => "…repairing…",
             crate::akari::animation::AnimationSet::About => "…investigating…",
+            crate::akari::animation::AnimationSet::Help => "…helping…",
         };
         let msg = Paragraph::new(vec![
             Line::from(activity),
@@ -195,6 +196,7 @@ fn render_animation_panel(frame: &mut Frame, app: &App, area: Rect) {
     let mode = match app.animator.mode() {
         crate::akari::animation::AnimationMode::Sweeping => match app.animator.set() {
             crate::akari::animation::AnimationSet::Health => "repairing…",
+            crate::akari::animation::AnimationSet::Help => "helping…",
             _ => "sweeping…",
         },
         crate::akari::animation::AnimationMode::Settled => "done",
@@ -203,6 +205,7 @@ fn render_animation_panel(frame: &mut Frame, app: &App, area: Rect) {
             crate::akari::animation::AnimationSet::Sweep => "idle",
             crate::akari::animation::AnimationSet::Health => "health",
             crate::akari::animation::AnimationSet::About => "investigating",
+            crate::akari::animation::AnimationSet::Help => "helping",
         },
     };
     let mut all = lines;
@@ -446,6 +449,43 @@ mod tests {
         let text = buffer_text(120, 30, &app);
         assert!(text.contains("investigating"));
         assert!(text.contains("missing sprite frame 1 for about set"));
+        assert!(!text.contains("sweeping"));
+    }
+
+    #[test]
+    fn help_panel_reports_help_caption_and_source_dimensions() {
+        use crate::akari::animation::AnimationSet;
+        use crate::akari::sprites::SpriteFrame;
+
+        let mut app = crate::app::App::new(AppCommand::Help);
+        assert_eq!(app.animator.set(), AnimationSet::Help);
+        let assets = app.sprites.get_mut(AnimationSet::Help);
+        assets.error = None;
+        assets.frames = vec![SpriteFrame {
+            width: 2,
+            height: 4,
+            rgba: vec![255, 0, 255, 255].repeat(8),
+        }];
+        let text = buffer_text(160, 40, &app);
+        assert!(text.contains("helping"), "help caption must report helping");
+        assert!(text.contains("2×4 source"), "caption must use frame size");
+        assert!(
+            !text.contains("investigating") && !text.contains("sweeping"),
+            "help panel must not claim another animation set"
+        );
+    }
+
+    #[test]
+    fn missing_help_frames_show_diagnostic_not_sweep_frames() {
+        use crate::akari::animation::AnimationSet;
+
+        let mut app = crate::app::App::new(AppCommand::Help);
+        let assets = app.sprites.get_mut(AnimationSet::Help);
+        assets.frames.clear();
+        assets.error = Some("missing sprite frame 1 for help set".to_string());
+        let text = buffer_text(120, 30, &app);
+        assert!(text.contains("helping"));
+        assert!(text.contains("missing sprite frame 1 for help set"));
         assert!(!text.contains("sweeping"));
     }
 
