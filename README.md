@@ -1,4 +1,4 @@
-# Akari-Sweeps_V00.1
+# Akari-Sweeps
 
 Windows maintenance TUI in Rust — a faithful port of `Akari-Sweeps.bat`
 (the behavioral spec) with Akari's idle reading, sweeping, health, about,
@@ -38,7 +38,10 @@ src/system/windows.rs is_elevated() (fltmc, like BAT), free_space_kb()
 src/akari/sprites.rs animation-set discovery/validation/loading (RGBA output)
 src/akari/animation.rs Animator (idle/sweep/health/about/help sets; Ambient/Sweeping/Settled), 6 FPS deadline
 src/ui/*             Ratatui layout: header, main/output, animation, entry
+src/update/*         GitHub release discovery, checksum/archive validation,
+                     staging, embedded PowerShell helper, 24-hour cache
 install.ps1 / uninstall.ps1  copy-based command registration
+.github/workflows/release.yml  tag-triggered Windows release pipeline
 ```
 
 OS behavior stays behind `MaintenanceRunner`, so orchestration is unit-
@@ -54,10 +57,22 @@ selectable (keys `1`–`5`):
 | `1` | `akariclean` | Cleanup only, zero DISM/SFC/CHKDSK            | Cleanup only |
 | `2` | `akarihealth`| Health/servicing only ([Repair 1/6]–[6/6])   | Repair only  |
 | `3` | `akariall`   | Cleanup, then health, then combined summary   | Both, in order |
-| `4` | `akariabout` | About (name, V00.1, purpose, repo/license)    | No           |
+| `4` | `akariabout` | About (name, Cargo version, purpose, repo/license) | No       |
 | `5` | `akarihelp`  | Usage, per-command help, exit instructions    | No           |
 
 `akari <name>` also works (`akari clean`, `akari --help`, …).
+
+### Update commands (CLI, outside the TUI)
+
+```powershell
+akari --version        # Akari-Sweeps 0.1.0 (version comes from Cargo.toml)
+akari update --check   # query GitHub, compare versions, download nothing
+akari update           # download, verify, and install the latest release
+```
+
+Only the primary `akari` launcher accepts these commands. Maintenance
+aliases (`akariclean`, `akarihealth`, `akariall`) never make update
+network requests and keep their existing argument behavior.
 
 ### Command-entry field
 
@@ -160,9 +175,9 @@ health phase of `akariall`) plays the health frames.
 
 ```powershell
 cargo fmt --check
-cargo check
-cargo test
-cargo build --release   # -> target\release\akari-sweeps.exe
+cargo check --locked
+cargo test --locked
+cargo build --release --locked   # -> target\release\akari-sweeps.exe
 ```
 
 ## Install (Windows command registration)
@@ -184,6 +199,111 @@ Restart the terminal, then `akarihelp` should open the TUI.
 ```powershell
 .\uninstall.ps1                    # removes exes, assets, and the PATH entry
 ```
+
+## Updates (GitHub Releases)
+
+Akari-Sweeps uses the public GitHub Releases API for
+`vishwassharma38/Akari-Sweeps`. No token, account, separate update server,
+or installed updater executable is required.
+
+### Update behavior
+
+- `akari update --check` prints the installed version, latest published
+  version, status, and release page. It downloads and changes nothing.
+- `akari update` downloads only the exact assets
+  `akari-sweeps-windows-x86_64.zip` and
+  `akari-sweeps-windows-x86_64.zip.sha256`, verifies SHA-256, validates the
+  archive, and stages it outside the installation directory.
+- The package's single `akari-sweeps.exe` replaces **all six** executable
+  aliases. The installed `assets/` tree is completely refreshed, so removed
+  sprites do not linger. Unrelated files (configuration, user data, other
+  directories) are not touched.
+- The installation directory is derived from the running executable, not
+  from a hardcoded default. Custom layouts created with
+  `.\install.ps1 -InstallDir "D:\Tools\Akari"` update in place, and another
+  Akari-Sweeps installation on the same machine is never modified.
+- Windows cannot replace a running executable. The Rust process launches an
+  embedded PowerShell 5.1 helper and exits; the helper waits for all
+  Akari-Sweeps processes in the same installation to exit, backs up the old
+  aliases/assets, replaces them, verifies the result, and rolls back every
+  change if any step fails. It never terminates Akari-Sweeps processes. If
+  files remain locked until the timeout, nothing is replaced and the helper
+  explains which processes to close.
+- Progress and errors are appended to
+  `%LOCALAPPDATA%\Akari-Sweeps\update.log`. If rollback itself fails, the
+  backup directory is retained and its location is reported explicitly.
+
+### Automatic notification
+
+Launching the primary `akari` interface starts a background GitHub check.
+The TUI appears immediately and never waits for the network. At most one
+automatic check runs every 24 hours, tracked in
+`%LOCALAPPDATA%\Akari-Sweeps\update-check.json` (independent of the
+installation directory). When a newer release exists, the Home screen shows
+a yellow update banner with the release page and the Output log gets a
+matching entry.
+
+Automatic checks **only notify**. They never download, install, or replace
+anything; the user must explicitly run `akari update`. Maintenance aliases
+(`akariclean`, `akarihealth`, `akariall`) do not perform automatic checks,
+and `akariabout` / `akarihelp` do not either.
+
+### Security notes
+
+- The SHA-256 sidecar is checked against the exact downloaded ZIP before any
+  extraction. If GitHub also supplies a `sha256:` asset digest, it must
+  agree with both.
+- ZIP entries with absolute paths, `..`, drive/alternate-data-stream
+  separators, symlinks, duplicate names, unexpected executables outside
+  `assets/`, or contents other than the expected executable/assets tree are
+  rejected. Extraction uses an isolated staging directory and explicit size
+  limits.
+- Before changing the installation, the PowerShell helper re-verifies a
+  Rust-generated SHA-256 manifest of every staged file.
+- SHA-256 detects accidental or inconsistent archive changes. A checksum and
+  archive published through the same GitHub account do not provide
+  independent publisher authentication. Authenticode/release signing is a
+  possible future enhancement, not part of this implementation.
+
+## Publishing a release
+
+`.github/workflows/release.yml` runs when a `v*` tag is pushed. It:
+
+1. Checks out the repository and installs stable Rust for
+   `x86_64-pc-windows-msvc`.
+2. Reads the `[package]` version from `Cargo.toml` and fails unless the tag
+   is exactly `v` + that version.
+3. Runs `cargo test --locked`.
+4. Builds the optimized executable.
+5. Packages `akari-sweeps.exe` and the complete `assets/` tree as
+   `akari-sweeps-windows-x86_64.zip`.
+6. Verifies the ZIP contains the expected executable and sprite, then writes
+   `akari-sweeps-windows-x86_64.zip.sha256` as UTF-8 without a BOM.
+7. Publishes both files with GitHub-generated release notes using the
+   built-in `GITHUB_TOKEN` (`contents: write` at job level).
+
+`Cargo.toml` is the only version source. The About screen, `akari --version`,
+and the updater all derive from it.
+
+### Release steps
+
+```powershell
+# 1. Bump the [package] version in Cargo.toml (e.g. 0.1.0 -> 0.1.1).
+# 2. Update Cargo.lock if needed, then commit and push.
+cargo check --locked
+git add Cargo.toml Cargo.lock
+git commit -m "Release v0.1.1"
+git push origin main
+
+# 3. Create and push the matching tag.
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+Pushing the tag starts the workflow; the GitHub Release exists only after
+the workflow completes successfully. There is no release if the tag and
+Cargo version differ, tests fail, or the build/package step fails. Verify the
+result on the repository's **Actions** and **Releases** pages.
 
 ## Errors & exit codes
 
@@ -216,13 +336,20 @@ sets follow the same path: add a frame-set spec, extend
 ## Tests
 
 ```powershell
-cargo test   # 209 tests: dispatch, input/back-nav, placeholder, elevation,
-             # strict isolation (zero-DISM clean, 6-step health, ordering),
-             # npm/Recycle/DISM-740/filesystem, idle/sweep/health/about/help
-             # sprites + animation selection, rendering, exit codes
-             # (mock runners + temp dirs only)
+cargo test --locked
 ```
 
-Destructive/real servicing ops never run in tests. TUI resize/exit-code
-cases are covered by TestBackend layout tests; UAC prompts and live
-maintenance runs remain manual (see verification procedure).
+Coverage includes dispatch, input/back navigation, placeholder behavior,
+elevation decisions, strict cleanup/repair isolation, sprites and animation
+selection, rendering, exit codes, and the updater: semver comparison, release
+metadata/asset selection, checksum and API-digest verification, hostile ZIP
+rejection, cache intervals, dynamic installation discovery, safe helper
+arguments, and Windows-only PowerShell tests that update a temporary fake
+installation, inject a failure to prove rollback, and prove a locked
+executable times out without changing files.
+
+Destructive/real servicing ops never run in tests, and updater tests never
+touch the real installation or the live GitHub API. TUI resize/exit-code
+cases are covered by TestBackend layout tests; UAC prompts, live maintenance
+runs, the real PowerShell replacement of an installed build, and the GitHub
+Actions release itself remain manual/infrastructure verification.

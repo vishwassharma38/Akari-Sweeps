@@ -11,6 +11,7 @@ pub mod windows;
 
 pub use progress::ProgressState;
 
+use crate::update::UpdateNotice;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
@@ -181,6 +182,9 @@ pub enum ExecEvent {
     Progress(ProgressState),
     Finished(AppSummary),
     Error(String),
+    /// Result of the non-blocking automatic release check. Strictly a
+    /// notification: nothing is downloaded or installed from this event.
+    UpdateAvailable(UpdateNotice),
 }
 
 /// Abstraction over side effects so orchestration is unit-testable.

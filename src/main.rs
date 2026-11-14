@@ -6,6 +6,7 @@ mod app;
 mod commands;
 mod system;
 mod ui;
+mod update;
 
 use crate::app::{App, Screen};
 use crate::commands::runner::RealRunner;
@@ -31,6 +32,14 @@ fn real_main() -> i32 {
     let exe_path = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("akari"));
     let exe = exe_path.to_string_lossy().to_string();
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Updater CLI is handled before elevation and before the TUI owns the
+    // terminal. Only the primary `akari` launcher accepts these commands;
+    // maintenance aliases keep their existing argument behavior.
+    if let Some(code) = crate::update::handle_early_cli(&exe, &args) {
+        return code;
+    }
+
     let command = resolve_command(&exe, &args);
 
     // Requirement 2: privilege handling happens BEFORE the TUI owns the
@@ -143,6 +152,10 @@ fn real_main() -> i32 {
     let (tx, rx) = mpsc::channel::<ExecEvent>();
     if command.starts_maintenance() {
         spawn_worker(command, tx.clone(), &mut app);
+    } else if command == AppCommand::Home && crate::update::is_primary_launch(&exe) {
+        // Background notification only; TUI initialization and rendering
+        // never wait for the network. Maintenance aliases never reach here.
+        spawn_background_update_check(tx.clone());
     }
 
     let mut pending_quit = false;
@@ -414,6 +427,15 @@ fn request_quit(app: &mut App, pending: &mut bool) -> bool {
         return false;
     }
     true
+}
+
+fn spawn_background_update_check(tx: Sender<ExecEvent>) {
+    std::thread::spawn(move || {
+        let cache = crate::update::cache::CacheStore::user_default();
+        if let Some(notice) = crate::update::automatic_check(&cache) {
+            let _ = tx.send(ExecEvent::UpdateAvailable(notice));
+        }
+    });
 }
 
 static RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);

@@ -3,17 +3,33 @@
 //! `akari` launches this interface and is therefore not a selectable
 //! item inside it (see `SELECTABLE_COMMANDS`).
 use crate::commands::SELECTABLE_COMMANDS;
+use crate::update::UpdateNotice;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
-pub fn lines() -> Vec<Line<'static>> {
-    let mut out = vec![
-        Line::from(Span::styled(
-            "Welcome — pick a command:",
-            Style::default().fg(Color::Cyan),
-        )),
-        Line::from(""),
-    ];
+pub fn lines(notice: Option<&UpdateNotice>) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    if let Some(notice) = notice {
+        out.push(Line::from(Span::styled(
+            format!(
+                "Update available: Akari-Sweeps {} → {} — run akari update",
+                notice.installed_version, notice.available_version
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+        if !notice.release_url.trim().is_empty() {
+            out.push(Line::from(Span::styled(
+                format!("Release: {}", notice.release_url),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        out.push(Line::from(""));
+    }
+    out.push(Line::from(Span::styled(
+        "Welcome — pick a command:",
+        Style::default().fg(Color::Cyan),
+    )));
+    out.push(Line::from(""));
     for (i, cmd) in SELECTABLE_COMMANDS.iter().enumerate() {
         out.push(Line::from(vec![
             Span::styled(
