@@ -153,7 +153,7 @@ function New-TestPackage {
     } else {
         Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPath -Force
     }
-    $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $hash = Get-Sha256Hash -LiteralPath $zipPath
     $checksumPath = Join-Path $Root ($packageName + '.sha256')
     [IO.File]::WriteAllText(
         $checksumPath,
@@ -265,8 +265,8 @@ Test-Case 'valid package installs six aliases, assets, and PATH entry' {
         foreach ($set in @('sweep', 'idle', 'health', 'about', 'help')) {
             Assert-True (Test-Path -LiteralPath (Join-Path $install ('assets\akari\' + $set + '\frame_001.png')) -PathType Leaf) "$set asset missing"
         }
-        $stored = (Get-FileHash -LiteralPath (Join-Path $install 'akari.exe') -Algorithm SHA256).Hash
-        $expected = (Get-FileHash -LiteralPath (Join-Path $package.Stage 'akari-sweeps.exe') -Algorithm SHA256).Hash
+        $stored = Get-Sha256Hash -LiteralPath (Join-Path $install 'akari.exe')
+        $expected = Get-Sha256Hash -LiteralPath (Join-Path $package.Stage 'akari-sweeps.exe')
         Assert-Equal $stored $expected 'installed executable differs from the release package'
         $parts = @($script:FakeUserPath -split ';')
         Assert-True ($parts -contains $install) 'install directory was not added to PATH'
@@ -643,9 +643,9 @@ Test-Case 'failed asset commit rolls back every executable alias and the previou
 
         $oldHashes = @{}
         foreach ($name in $script:AliasNames) {
-            $oldHashes[$name] = (Get-FileHash -LiteralPath (Join-Path $install $name) -Algorithm SHA256).Hash
+            $oldHashes[$name] = Get-Sha256Hash -LiteralPath (Join-Path $install $name)
         }
-        $oldAssetHash = (Get-FileHash -LiteralPath (Join-Path $install 'assets/akari/sweep/frame_001.png') -Algorithm SHA256).Hash
+        $oldAssetHash = Get-Sha256Hash -LiteralPath (Join-Path $install 'assets/akari/sweep/frame_001.png')
         $script:FailMoveDestination = Join-Path $install 'assets'
         $script:FakeUserPath = 'C:\Windows;C:\Tools'
 
@@ -654,10 +654,10 @@ Test-Case 'failed asset commit rolls back every executable alias and the previou
         } 'injected asset replacement failure must abort installation' | Out-Null
 
         foreach ($name in $script:AliasNames) {
-            $actual = (Get-FileHash -LiteralPath (Join-Path $install $name) -Algorithm SHA256).Hash
+            $actual = Get-Sha256Hash -LiteralPath (Join-Path $install $name)
             Assert-Equal $actual $oldHashes[$name] "$name was not restored after transaction rollback"
         }
-        $actualAssetHash = (Get-FileHash -LiteralPath (Join-Path $install 'assets/akari/sweep/frame_001.png') -Algorithm SHA256).Hash
+        $actualAssetHash = Get-Sha256Hash -LiteralPath (Join-Path $install 'assets/akari/sweep/frame_001.png')
         Assert-Equal $actualAssetHash $oldAssetHash 'previous assets were not restored'
         Assert-Equal (Get-Content -LiteralPath (Join-Path $install 'assets/old-version.txt') -Raw) 'previous assets' 'previous asset tree was not restored'
         Assert-Equal $script:FakeUserPath 'C:\Windows;C:\Tools' 'PATH changed despite failed installation'
@@ -668,6 +668,36 @@ Test-Case 'failed asset commit rolls back every executable alias and the previou
         if (-not [string]::IsNullOrWhiteSpace($script:MockDownloadDir)) {
             Remove-Item -LiteralPath $script:MockDownloadDir -Recurse -Force -ErrorAction SilentlyContinue
         }
+    }
+}
+
+
+Test-Case 'SHA-256 helper matches the known digest without Get-FileHash' {
+    $root = New-TestRoot 'sha256-helper'
+    try {
+        $file = Join-Path $root 'known.txt'
+        [IO.File]::WriteAllText(
+            $file,
+            'abc',
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $actual = Get-Sha256Hash -LiteralPath $file
+        Assert-Equal $actual 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad' 'SHA-256 helper returned an incorrect digest'
+
+        $tokens = $null
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $script:InstallerPath,
+            [ref]$tokens,
+            [ref]$errors
+        )
+        $hashCommands = $ast.FindAll(
+            { param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Get-FileHash' },
+            $true
+        )
+        Assert-Equal $hashCommands.Count 0 'installer must not depend on Get-FileHash'
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
