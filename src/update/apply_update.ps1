@@ -32,6 +32,34 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+# Use .NET directly rather than relying on Get-FileHash being discoverable
+# through PowerShell module auto-loading in the parent/child process environment.
+function Get-Sha256Hash {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$LiteralPath
+    )
+
+    $stream = $null
+    $algorithm = $null
+    try {
+        $stream = [IO.File]::OpenRead($LiteralPath)
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        $digest = $algorithm.ComputeHash($stream)
+        return ([BitConverter]::ToString($digest)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+        if ($null -ne $algorithm) {
+            $algorithm.Dispose()
+        }
+    }
+}
+
+
+
 $script:LogPath = $LogPath
 $script:ScriptPath = $PSCommandPath
 if ([string]::IsNullOrEmpty($script:ScriptPath)) {
@@ -165,8 +193,8 @@ function Assert-TreeMatches {
         if (-not $expected.ContainsKey($key)) {
             throw "Unexpected file '$relative' in '$ActualRoot'."
         }
-        $expectedHash = (Get-FileHash -LiteralPath $expected[$key] -Algorithm SHA256).Hash.ToLowerInvariant()
-        $actualHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        $expectedHash = Get-Sha256Hash -LiteralPath $expected[$key]
+        $actualHash = Get-Sha256Hash -LiteralPath $file.FullName
         if ($expectedHash -ne $actualHash) {
             throw "File '$relative' does not match its backup copy."
         }
@@ -236,7 +264,7 @@ function Read-AndVerifyManifest {
         if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
             throw "The staged file '$relative' is missing."
         }
-        $actual = (Get-FileHash -LiteralPath $fullPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $actual = Get-Sha256Hash -LiteralPath $fullPath
         if ($actual -ne $hash.ToLowerInvariant()) {
             throw "The staged file '$relative' failed SHA-256 checksum verification."
         }
@@ -374,8 +402,8 @@ function Backup-Installation {
             $script:AliasesExisted[$name] = $true
             $destination = Join-Path $aliasBackup $name
             Copy-Item -LiteralPath $source -Destination $destination -Force
-            $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
-            $backupHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+            $sourceHash = Get-Sha256Hash -LiteralPath $source
+            $backupHash = Get-Sha256Hash -LiteralPath $destination
             if ($sourceHash -ne $backupHash) {
                 throw "Backup verification failed for '$name'."
             }
@@ -424,7 +452,7 @@ function Install-NewFiles {
     if ($header.Length -lt 2 -or $header[0] -ne 0x4D -or $header[1] -ne 0x5A) {
         throw "The staged executable is not a valid Windows executable."
     }
-    $canonicalHash = (Get-FileHash -LiteralPath $stagedExe -Algorithm SHA256).Hash.ToLowerInvariant()
+    $canonicalHash = Get-Sha256Hash -LiteralPath $stagedExe
 
     $script:ReplacementStarted = $true
     foreach ($name in $script:AliasNames) {
@@ -432,7 +460,7 @@ function Install-NewFiles {
         $temp = Join-Path $InstallDir ('.' + $name + '.new-' + [Guid]::NewGuid().ToString('N'))
         [void]$script:PendingTemps.Add($temp)
         Copy-Item -LiteralPath $stagedExe -Destination $temp -Force
-        $tempHash = (Get-FileHash -LiteralPath $temp -Algorithm SHA256).Hash.ToLowerInvariant()
+        $tempHash = Get-Sha256Hash -LiteralPath $temp
         if ($tempHash -ne $canonicalHash) {
             throw "The staged copy of '$name' failed verification before replacement."
         }
@@ -465,13 +493,13 @@ function Verify-Installation {
         $Entries
     )
     $stagedExe = Join-Path $StagingDir 'akari-sweeps.exe'
-    $canonicalHash = (Get-FileHash -LiteralPath $stagedExe -Algorithm SHA256).Hash.ToLowerInvariant()
+    $canonicalHash = Get-Sha256Hash -LiteralPath $stagedExe
     foreach ($name in $script:AliasNames) {
         $path = Join-Path $InstallDir $name
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
             throw "Executable '$name' is missing after replacement."
         }
-        $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        $hash = Get-Sha256Hash -LiteralPath $path
         if ($hash -ne $canonicalHash) {
             throw "Executable '$name' does not match the released executable after replacement."
         }
@@ -510,7 +538,7 @@ function Verify-Installation {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
             throw "Installed asset '$($entry.Relative)' is missing."
         }
-        $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        $hash = Get-Sha256Hash -LiteralPath $path
         if ($hash -ne $entry.Hash) {
             throw "Installed asset '$($entry.Relative)' does not match the release package."
         }
@@ -573,8 +601,8 @@ function Restore-Backup {
                     throw "the backup of '$name' is missing"
                 }
                 Copy-Item -LiteralPath $backup -Destination $destination -Force -ErrorAction Stop
-                $backupHash = (Get-FileHash -LiteralPath $backup -Algorithm SHA256).Hash.ToLowerInvariant()
-                $restoredHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+                $backupHash = Get-Sha256Hash -LiteralPath $backup
+                $restoredHash = Get-Sha256Hash -LiteralPath $destination
                 if ($backupHash -ne $restoredHash) {
                     throw "the restored file does not match its backup"
                 }
