@@ -38,6 +38,34 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+
+# Use .NET directly rather than relying on Get-FileHash being discoverable
+# through PowerShell module auto-loading in the parent/child process environment.
+function Get-Sha256Hash {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$LiteralPath
+    )
+
+    $stream = $null
+    $algorithm = $null
+    try {
+        $stream = [IO.File]::OpenRead($LiteralPath)
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        $digest = $algorithm.ComputeHash($stream)
+        return ([BitConverter]::ToString($digest)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+        if ($null -ne $algorithm) {
+            $algorithm.Dispose()
+        }
+    }
+}
+
+
 $ProgressPreference = 'SilentlyContinue'
 
 $script:RepositoryOwner = 'vishwassharma38'
@@ -325,7 +353,7 @@ function Assert-PackageChecksum {
         throw "The release package '$PackagePath' is missing."
     }
     $expected = Read-ChecksumFile $ChecksumPath
-    $actual = (Get-FileHash -LiteralPath $PackagePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $actual = Get-Sha256Hash -LiteralPath $PackagePath
     if ($actual -ne $expected) {
         throw "SHA-256 mismatch: the release checksum says $expected but the downloaded package is $actual."
     }
@@ -670,11 +698,11 @@ function Install-FromVerifiedPackage {
         New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
 
         $canonical = Join-Path $extractDir 'akari-sweeps.exe'
-        $canonicalHash = (Get-FileHash -LiteralPath $canonical -Algorithm SHA256).Hash.ToLowerInvariant()
+        $canonicalHash = Get-Sha256Hash -LiteralPath $canonical
         foreach ($name in $script:AliasNames) {
             $stagedAlias = Join-Path $stageDir $name
             Copy-Item -LiteralPath $canonical -Destination $stagedAlias
-            $stagedHash = (Get-FileHash -LiteralPath $stagedAlias -Algorithm SHA256).Hash.ToLowerInvariant()
+            $stagedHash = Get-Sha256Hash -LiteralPath $stagedAlias
             if ($stagedHash -ne $canonicalHash) {
                 throw "The staged copy of '$name' failed SHA-256 verification."
             }
