@@ -222,6 +222,7 @@ mod windows_tests {
     use super::*;
     use crate::update::download;
     use std::fs::{self, OpenOptions};
+    use std::io::Write;
     use std::os::windows::fs::OpenOptionsExt;
     use std::process::{Command, Output};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -454,6 +455,86 @@ mod windows_tests {
             log.to_ascii_lowercase().contains("checksum"),
             "manifest mismatch must be explained:\n{log}"
         );
+        cleanup(&root);
+    }
+
+    /// Installed-copy integration fixture: starts from a fake `0.1.0`
+    /// installation, stages a checksum-verified `0.1.1` ZIP through the same
+    /// Rust extraction/manifest code path used by `akari update`, then runs
+    /// the embedded helper exactly as the updater does. The fake binaries
+    /// cannot report a version, so `akari --version` after replacement is
+    /// covered by the manual checklist in the README.
+    #[test]
+    fn installed_copy_fixture_replaces_all_aliases_and_assets_transactionally() {
+        let root = temp_root("installed copy fixture");
+        let install = make_install(&root, &crate::update::install::ALIAS_EXES);
+        let workspace = download::UpdateWorkspace::create().unwrap();
+        let zip_path = workspace.root.join("release.zip");
+        let file = fs::File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("akari-sweeps.exe", options).unwrap();
+        writer.write_all(NEW_BINARY).unwrap();
+        writer.add_directory("assets/", options).unwrap();
+        writer
+            .start_file("assets/akari/idle/idle_001.png", options)
+            .unwrap();
+        writer.write_all(b"new-idle-png").unwrap();
+        writer
+            .start_file("assets/akari/sweep/akari_sweep_001.png", options)
+            .unwrap();
+        writer.write_all(b"new-sweep-png").unwrap();
+        writer.finish().unwrap();
+
+        let digest = download::sha256_file(&zip_path).unwrap();
+        let sidecar = format!("{digest}  {}\n", crate::update::github::WINDOWS_PACKAGE);
+        download::verify_checksum_file(&zip_path, &sidecar, None).unwrap();
+
+        let stage = workspace.root.join("stage");
+        download::extract_package(&zip_path, &stage).unwrap();
+        let manifest = workspace.root.join("install-manifest.sha256");
+        download::write_manifest(&stage, &manifest).unwrap();
+        let script = write_script(&workspace.root).unwrap();
+        let launch = HelperLaunch {
+            script_path: script,
+            install_dir: install.clone(),
+            staging_dir: stage,
+            manifest_path: manifest,
+            backup_dir: workspace.root.join("backup"),
+            log_path: root.join("logs").join("update.log"),
+            wait_seconds: 15,
+        };
+
+        let mut command = Command::new(POWERSHELL_PROGRAM);
+        command.args(launch.arguments());
+        let output = command.output().unwrap();
+        assert_exit(&output, 0);
+
+        assert_all_aliases(&install, NEW_BINARY);
+        assert!(install.join("assets/akari/idle/idle_001.png").is_file());
+        assert!(
+            install
+                .join("assets/akari/sweep/akari_sweep_001.png")
+                .is_file()
+        );
+        assert!(
+            !install.join("assets/akari/idle/old.png").exists(),
+            "the previous assets tree must be replaced, not merged"
+        );
+        assert_eq!(
+            fs::read(install.join("settings.json")).unwrap(),
+            b"{\"theme\":\"akari\"}"
+        );
+        assert_eq!(
+            fs::read(install.join("user data").join("keep.txt")).unwrap(),
+            b"keep-me"
+        );
+        assert!(
+            !workspace.root.exists(),
+            "the transaction workspace must be removed after success"
+        );
+        let log = fs::read_to_string(&launch.log_path).unwrap();
+        assert!(log.contains("Update completed successfully"), "{log}");
         cleanup(&root);
     }
 

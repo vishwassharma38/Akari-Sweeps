@@ -11,7 +11,7 @@
 //! - [`download`] — checksum verification and hardened ZIP extraction.
 //! - [`install`] — installation-layout discovery and staging preparation.
 //! - [`powershell`] — embedded helper and safe argument construction.
-//! - [`cache`] — the 24-hour automatic-check timestamp.
+//! - [`cache`] — automatic-check success windows and short failure retries.
 
 pub mod cache;
 pub mod download;
@@ -27,14 +27,17 @@ pub type Result<T> = std::result::Result<T, UpdateError>;
 
 /// Every updater failure is converted into a readable message; no updater
 /// code path relies on panics or exposes raw internal state to the user.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum UpdateError {
     /// DNS, TLS, connection, timeout, and interrupted-transfer failures.
     Network(String),
     /// A successful HTTP exchange that did not contain a usable release.
     Api(String),
+    /// No published (non-prerelease) release exists yet (HTTP 404).
+    NoRelease,
     /// GitHub rejected the request because the public rate limit was hit.
-    RateLimited,
+    /// `retry_after_secs` is the numeric `Retry-After` value when supplied.
+    RateLimited { retry_after_secs: Option<u64> },
     /// Missing or malformed release metadata/asset information.
     InvalidRelease(String),
     /// A tag that is not valid semantic versioning.
@@ -59,8 +62,11 @@ impl UpdateError {
     /// A short, actionable hint printed after the technical message.
     pub fn user_hint(&self) -> &'static str {
         match self {
-            UpdateError::RateLimited => {
+            UpdateError::RateLimited { .. } => {
                 "GitHub's API rate limit was reached. Wait a few minutes and try again."
+            }
+            UpdateError::NoRelease => {
+                "No release has been published yet. Try again later, or check the repository's Releases page."
             }
             UpdateError::Network(_) => "Check your internet connection and try again.",
             UpdateError::UnsupportedPlatform => {
@@ -82,7 +88,8 @@ impl fmt::Display for UpdateError {
         match self {
             UpdateError::Network(message) => write!(f, "network error: {message}"),
             UpdateError::Api(message) => write!(f, "GitHub API error: {message}"),
-            UpdateError::RateLimited => write!(f, "GitHub's API rate limit was reached"),
+            UpdateError::NoRelease => write!(f, "no published release is available yet"),
+            UpdateError::RateLimited { .. } => write!(f, "GitHub's API rate limit was reached"),
             UpdateError::InvalidRelease(message) => write!(f, "invalid release: {message}"),
             UpdateError::InvalidVersion(message) => {
                 write!(f, "invalid release version: {message}")
@@ -386,12 +393,28 @@ fn install_available(report: &CheckReport) -> Result<()> {
     result
 }
 
-/// Automatic check used only by the primary launcher. The cache timestamp is
-/// recorded before the network request so a failed attempt also respects the
-/// 24-hour interval. Failures are deliberately silent: they must never block
-/// or interrupt normal startup.
+/// Automatic check used only by the primary launcher. A successful release
+/// API response (including "no newer release") is cached for 24 hours; every
+/// failure is retried after [`cache::RETRY_INTERVAL_SECS`] so a newly
+/// published release or a transient outage is not hidden for a full day.
+/// Failures are deliberately silent: they must never block or interrupt
+/// normal startup.
 pub fn automatic_check(cache: &cache::CacheStore) -> Option<UpdateNotice> {
     automatic_check_with(cache, cache::now_unix_secs(), github::fetch_latest_release)
+}
+
+/// Short retry interval for a failed automatic check. Rate-limit responses
+/// with a numeric `Retry-After` are honored within bounded limits.
+fn automatic_retry_secs(error: &UpdateError) -> u64 {
+    match error {
+        UpdateError::RateLimited {
+            retry_after_secs: Some(seconds),
+        } => (*seconds).clamp(
+            cache::MIN_RATE_LIMIT_RETRY_SECS,
+            cache::MAX_RATE_LIMIT_RETRY_SECS,
+        ),
+        _ => cache::RETRY_INTERVAL_SECS,
+    }
 }
 
 /// Testable automatic-check policy. `fetch` is only called when the cache
@@ -407,14 +430,30 @@ where
     if !cache_store.should_check(now_unix_secs) {
         return None;
     }
-    cache_store.record_check_best_effort(now_unix_secs);
-    notice_for_release(&fetch().ok()?)
+
+    let release = match fetch() {
+        Ok(release) => release,
+        Err(error) => {
+            cache_store.record_failure_best_effort(now_unix_secs, automatic_retry_secs(&error));
+            return None;
+        }
+    };
+
+    // A response whose version cannot be parsed is not a usable successful
+    // check; retry it soon instead of suppressing updates for 24 hours.
+    let latest = match release.version() {
+        Ok(latest) => latest,
+        Err(_) => {
+            cache_store.record_failure_best_effort(now_unix_secs, cache::RETRY_INTERVAL_SECS);
+            return None;
+        }
+    };
+    cache_store.record_success_best_effort(now_unix_secs);
+    notice_for_version(&release, &latest)
 }
 
-/// Compare one release with the installed version and build the notification.
-pub fn notice_for_release(release: &github::Release) -> Option<UpdateNotice> {
-    let latest = release.version().ok()?;
-    if !version::is_newer(&version::installed_version(), &latest) {
+fn notice_for_version(release: &github::Release, latest: &Version) -> Option<UpdateNotice> {
+    if !version::is_newer(&version::installed_version(), latest) {
         return None;
     }
     Some(UpdateNotice {
@@ -590,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_check_is_silent_for_current_or_older_releases() {
+    fn successful_checks_with_no_newer_release_still_record_24_hours() {
         for tag in [
             format!("v{}", env!("CARGO_PKG_VERSION")),
             "v0.0.0".to_string(),
@@ -603,6 +642,12 @@ mod tests {
             });
             assert!(notice.is_none(), "{tag}");
             assert_eq!(calls.get(), 1, "{tag}");
+            assert_eq!(
+                cache.last_check_unix_secs(),
+                Some(1_000_000),
+                "a successful response is cached even without a newer release"
+            );
+            assert!(!cache.should_check(1_000_000 + cache::CHECK_INTERVAL_SECS - 1));
             let _ = fs::remove_dir_all(cache.path().parent().unwrap());
         }
     }
@@ -610,7 +655,7 @@ mod tests {
     #[test]
     fn automatic_check_respects_the_24_hour_cache_without_calling_github() {
         let cache = temp_cache("suppressed");
-        cache.record_check(1_000_000).unwrap();
+        cache.record_success(1_000_000).unwrap();
         let calls = Cell::new(0);
         let notice = automatic_check_with(&cache, 1_000_000 + 60, || {
             calls.set(calls.get() + 1);
@@ -622,19 +667,100 @@ mod tests {
     }
 
     #[test]
-    fn failed_automatic_checks_do_not_panic_and_are_rate_limited() {
-        let cache = temp_cache("failure");
-        let notice = automatic_check_with(&cache, 1_000_000, || {
-            Err(UpdateError::Network("offline".to_string()))
-        });
+    fn failed_automatic_checks_use_the_short_retry_and_never_look_successful() {
+        let failures = [
+            UpdateError::Network("offline".to_string()),
+            UpdateError::NoRelease,
+            UpdateError::Api("GitHub Releases returned HTTP 500".to_string()),
+            UpdateError::Api("malformed response".to_string()),
+        ];
+        for error in failures {
+            let cache = temp_cache("failure");
+            let notice = automatic_check_with(&cache, 1_000_000, || Err(error.clone()));
+            assert!(notice.is_none());
+            assert_eq!(
+                cache.last_check_unix_secs(),
+                None,
+                "a failed request must not establish the 24-hour success cache"
+            );
+            assert_eq!(
+                cache.next_check_unix_secs(),
+                Some(1_000_000 + cache::RETRY_INTERVAL_SECS)
+            );
+            assert!(!cache.should_check(1_000_000 + cache::RETRY_INTERVAL_SECS - 1));
+            assert!(cache.should_check(1_000_000 + cache::RETRY_INTERVAL_SECS));
+            let _ = fs::remove_dir_all(cache.path().parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn rate_limit_retry_after_is_bounded() {
+        let cases = [
+            (Some(5), cache::MIN_RATE_LIMIT_RETRY_SECS),
+            (Some(7_200), 7_200),
+            (Some(999_999), cache::MAX_RATE_LIMIT_RETRY_SECS),
+            (None, cache::RETRY_INTERVAL_SECS),
+        ];
+        for (retry_after_secs, expected) in cases {
+            let cache = temp_cache("rate-limit");
+            automatic_check_with(&cache, 1_000_000, || {
+                Err(UpdateError::RateLimited { retry_after_secs })
+            });
+            assert_eq!(
+                cache.next_check_unix_secs(),
+                Some(1_000_000 + expected),
+                "{retry_after_secs:?}"
+            );
+            let _ = fs::remove_dir_all(cache.path().parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn invalid_release_metadata_uses_the_short_retry() {
+        let cache = temp_cache("invalid-tag");
+        let mut bad_release = release("v999.0.0");
+        bad_release.tag_name = "not-a-version".to_string();
+        let notice = automatic_check_with(&cache, 1_000_000, || Ok(bad_release));
         assert!(notice.is_none());
+        assert_eq!(cache.last_check_unix_secs(), None);
         assert_eq!(
-            cache.last_check_unix_secs(),
-            Some(1_000_000),
-            "failed attempts must still respect the interval"
+            cache.next_check_unix_secs(),
+            Some(1_000_000 + cache::RETRY_INTERVAL_SECS)
         );
-        assert!(!cache.should_check(1_000_000 + 60));
         let _ = fs::remove_dir_all(cache.path().parent().unwrap());
+    }
+
+    #[test]
+    fn release_published_after_a_404_is_discovered_after_the_short_retry() {
+        let cache = temp_cache("release-later");
+        let start = 1_000_000;
+        let first = automatic_check_with(&cache, start, || Err(UpdateError::NoRelease));
+        assert!(first.is_none());
+        assert!(!cache.should_check(start + 60));
+
+        let retry_at = start + cache::RETRY_INTERVAL_SECS;
+        assert!(cache.should_check(retry_at));
+        let notice = automatic_check_with(&cache, retry_at, || Ok(release("v999.0.0")));
+        assert_eq!(notice.unwrap().available_version, "999.0.0");
+        assert_eq!(cache.next_check_unix_secs(), None);
+        assert_eq!(cache.last_check_unix_secs(), Some(retry_at));
+        assert!(!cache.should_check(retry_at + 60));
+        let _ = fs::remove_dir_all(cache.path().parent().unwrap());
+    }
+
+    #[test]
+    fn automatic_cache_write_failure_never_interrupts_startup_or_notification() {
+        let root = temp_cache("blocked").path().parent().unwrap().to_path_buf();
+        fs::create_dir_all(&root).unwrap();
+        let blocker = root.join("not-a-directory");
+        fs::write(&blocker, b"file").unwrap();
+        let cache = cache::CacheStore::new(blocker.join("update-check.json"));
+
+        let notice = automatic_check_with(&cache, 1_000_000, || Ok(release("v999.0.0")));
+        assert_eq!(notice.unwrap().available_version, "999.0.0");
+        assert_eq!(cache.last_check_unix_secs(), None);
+        assert_eq!(fs::read(&blocker).unwrap(), b"file");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -649,9 +775,11 @@ mod tests {
     }
 
     #[test]
-    fn manual_check_path_does_not_consult_the_cache() {
+    fn manual_check_remains_available_after_a_failed_automatic_check() {
         let cache = temp_cache("manual-bypass");
-        cache.record_check(1_000_000).unwrap();
+        automatic_check_with(&cache, 1_000_000, || {
+            Err(UpdateError::Network("offline".to_string()))
+        });
         assert!(!cache.should_check(1_000_001));
         // Manual discovery calls this function directly; it takes no cache.
         let report = check_latest_with(|| Ok(release("v999.0.0"))).unwrap();
@@ -683,10 +811,12 @@ mod tests {
     #[test]
     fn update_errors_have_actionable_hints() {
         assert!(
-            UpdateError::RateLimited
-                .user_hint()
-                .to_ascii_lowercase()
-                .contains("rate limit")
+            UpdateError::RateLimited {
+                retry_after_secs: None,
+            }
+            .user_hint()
+            .to_ascii_lowercase()
+            .contains("rate limit")
         );
         assert!(
             UpdateError::Network("dns".to_string())

@@ -22,6 +22,15 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Maximum compressed release archive size accepted from GitHub. The
+/// legitimate Akari-Sweeps package is a few megabytes; 100 MiB leaves ample
+/// room for future sprite sets while bounding memory/disk exposure.
+pub const MAX_COMPRESSED_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
+
+/// GitHub currently performs a single redirect to its signed CDN host. A
+/// small fixed cap prevents redirect loops and chained-resource abuse.
+const MAX_REDIRECTS: usize = 5;
+
 /// Temporary workspace for one update transaction. Callers explicitly
 /// remove it on failure. It is intentionally not a `Drop` guard: after a
 /// successful launch the PowerShell helper owns the directory and the
@@ -100,48 +109,148 @@ pub fn download_release(
 }
 
 pub fn download_file(url: &str, destination: &Path) -> Result<()> {
-    github::validate_download_url(
-        url,
-        destination
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("asset"),
-    )?;
+    let asset_name = destination
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("asset");
+    github::validate_download_url(url, asset_name)?;
+
     let client = reqwest::blocking::Client::builder()
         .user_agent(github::USER_AGENT)
         .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
         .timeout(DOWNLOAD_TIMEOUT)
+        // Redirects are followed manually so every destination can be
+        // validated before a request is sent.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| UpdateError::Network(format!("could not create the HTTP client ({e})")))?;
-    let mut response = client.get(url).send().map_err(|e| {
-        UpdateError::Network(format!(
-            "could not download {} ({e})",
-            destination
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("update asset")
-        ))
+
+    let response = follow_redirects(&client, url, asset_name, github::validate_redirect_url)?;
+    receive_limited(
+        response,
+        destination,
+        MAX_COMPRESSED_DOWNLOAD_BYTES,
+        asset_name,
+    )
+}
+
+/// Follow redirects with an explicit hop limit and a validator called before
+/// each destination is requested.
+fn follow_redirects<F>(
+    client: &reqwest::blocking::Client,
+    initial: &str,
+    asset_name: &str,
+    validate_redirect: F,
+) -> Result<reqwest::blocking::Response>
+where
+    F: Fn(&str, &str) -> Result<()>,
+{
+    let mut current = reqwest::Url::parse(initial).map_err(|_| {
+        UpdateError::InvalidRelease(format!("asset '{asset_name}' has an invalid download URL"))
     })?;
-    if !response.status().is_success() {
-        return Err(UpdateError::Network(format!(
-            "download returned HTTP {}",
-            response.status().as_u16()
-        )));
+
+    for hop in 0..=MAX_REDIRECTS {
+        let response = client
+            .get(current.clone())
+            .header(reqwest::header::ACCEPT, "application/octet-stream")
+            .send()
+            .map_err(|e| UpdateError::Network(format!("could not download {asset_name} ({e})")))?;
+
+        if !response.status().is_redirection() {
+            if !response.status().is_success() {
+                return Err(UpdateError::Network(format!(
+                    "download of {asset_name} returned HTTP {}",
+                    response.status().as_u16()
+                )));
+            }
+            return Ok(response);
+        }
+
+        if hop == MAX_REDIRECTS {
+            return Err(UpdateError::Network(format!(
+                "download of {asset_name} exceeded the redirect limit ({MAX_REDIRECTS})"
+            )));
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| {
+                UpdateError::Network(format!(
+                    "download of {asset_name} returned a redirect without a Location header"
+                ))
+            })?;
+        let next = current.join(location).map_err(|_| {
+            UpdateError::Network(format!(
+                "download of {asset_name} returned an invalid redirect location"
+            ))
+        })?;
+        validate_redirect(next.as_str(), asset_name)?;
+        current = next;
     }
+
+    Err(UpdateError::Network(format!(
+        "download of {asset_name} exceeded the redirect limit"
+    )))
+}
+
+/// Write a response body while enforcing a hard byte ceiling. Both the
+/// declared `Content-Length` and the actual streamed byte count are checked;
+/// neither can bypass the limit. Incomplete files are removed on failure.
+fn receive_limited(
+    mut response: reqwest::blocking::Response,
+    destination: &Path,
+    max_bytes: u64,
+    asset_name: &str,
+) -> Result<()> {
+    if let Some(declared) = declared_content_length(&response) {
+        if declared > max_bytes {
+            return Err(UpdateError::Network(format!(
+                "download of {asset_name} declares {declared} bytes, which exceeds the \
+                 {max_bytes}-byte limit"
+            )));
+        }
+    }
+
     let mut file = File::create(destination)
         .map_err(|e| UpdateError::Io(format!("could not create {}: {e}", destination.display())))?;
-    let result = io::copy(&mut response, &mut file)
-        .and_then(|_| file.flush())
-        .and_then(|_| file.sync_all());
-    if let Err(e) = result {
-        drop(file);
-        let _ = fs::remove_file(destination);
-        return Err(UpdateError::Network(format!(
-            "download was interrupted while writing {}: {e}",
-            destination.display()
-        )));
+    let result = (|| {
+        let mut limited = (&mut response).take(max_bytes.saturating_add(1));
+        let written = io::copy(&mut limited, &mut file)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok::<u64, io::Error>(written)
+    })();
+
+    match result {
+        Ok(written) if written > max_bytes => {
+            drop(file);
+            let _ = fs::remove_file(destination);
+            Err(UpdateError::Network(format!(
+                "download of {asset_name} exceeded the {max_bytes}-byte limit"
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(e) => {
+            drop(file);
+            let _ = fs::remove_file(destination);
+            Err(UpdateError::Network(format!(
+                "download was interrupted while writing {}: {e}",
+                destination.display()
+            )))
+        }
     }
-    Ok(())
+}
+
+fn declared_content_length(response: &reqwest::blocking::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
 }
 
 /// Parse the first non-empty checksum line. Standard `sha256sum` format
@@ -957,5 +1066,171 @@ mod tests {
         a.cleanup();
         assert!(!a.root.exists());
         b.cleanup();
+    }
+
+    // Small local HTTP server helpers. They make download-limit and redirect
+    // tests deterministic without touching GitHub or the user's network.
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn http_response(status: &str, headers: &[String], body: &[u8]) -> Vec<u8> {
+        let mut response = format!("HTTP/1.1 {status}\r\nConnection: close\r\n");
+        for header in headers {
+            response.push_str(header);
+            response.push_str("\r\n");
+        }
+        response.push_str("\r\n");
+        let mut bytes = response.into_bytes();
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    fn chunked_body(data: &[u8]) -> Vec<u8> {
+        let mut body = format!("{:x}\r\n", data.len()).into_bytes();
+        body.extend_from_slice(data);
+        body.extend_from_slice(b"\r\n0\r\n\r\n");
+        body
+    }
+
+    fn serve_once(raw: Vec<u8>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream.write_all(&raw).unwrap();
+            stream.flush().unwrap();
+        });
+        (format!("http://{address}/asset"), handle)
+    }
+
+    fn test_client() -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn declared_content_length_over_limit_is_rejected_before_writing() {
+        let body = vec![b'x'; 100];
+        let raw = http_response("200 OK", &["Content-Length: 100".to_string()], &body);
+        let (url, server) = serve_once(raw);
+        let response = test_client().get(&url).send().unwrap();
+        let dest = temp_dir("declared-over").join("asset.zip");
+        let err = receive_limited(response, &dest, 10, "asset.zip").unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        assert!(!dest.exists(), "rejected download must not leave a file");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn missing_content_length_under_limit_succeeds() {
+        let body = b"0123456789";
+        let raw = http_response("200 OK", &[], body);
+        let (url, server) = serve_once(raw);
+        let response = test_client().get(&url).send().unwrap();
+        let dest = temp_dir("missing-length-ok").join("asset.zip");
+        receive_limited(response, &dest, 10, "asset.zip").unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), body);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn missing_content_length_over_limit_is_stopped_while_streaming() {
+        let body = vec![b'x'; 100];
+        let raw = http_response(
+            "200 OK",
+            &["Transfer-Encoding: chunked".to_string()],
+            &chunked_body(&body),
+        );
+        let (url, server) = serve_once(raw);
+        let response = test_client().get(&url).send().unwrap();
+        let dest = temp_dir("missing-length-over").join("asset.zip");
+        let err = receive_limited(response, &dest, 10, "asset.zip").unwrap_err();
+        assert!(err.to_string().contains("exceed"), "{err}");
+        assert!(!dest.exists(), "incomplete download must be removed");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn inaccurate_content_length_cannot_bypass_the_stream_limit() {
+        // A misleading small Content-Length is ignored in favor of the
+        // actual streamed bytes when Transfer-Encoding is chunked.
+        let body = vec![b'x'; 100];
+        let raw = http_response(
+            "200 OK",
+            &[
+                "Content-Length: 10".to_string(),
+                "Transfer-Encoding: chunked".to_string(),
+            ],
+            &chunked_body(&body),
+        );
+        let (url, server) = serve_once(raw);
+        let response = test_client().get(&url).send().unwrap();
+        let dest = temp_dir("inaccurate-length").join("asset.zip");
+        let err = receive_limited(response, &dest, 10, "asset.zip").unwrap_err();
+        assert!(err.to_string().contains("exceed"), "{err}");
+        assert!(!dest.exists());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn excessive_redirect_chain_is_rejected() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let redirect = http_response(
+            "302 Found",
+            &[
+                "Location: /next".to_string(),
+                "Content-Length: 0".to_string(),
+            ],
+            b"",
+        );
+        let server = thread::spawn(move || {
+            for _ in 0..=MAX_REDIRECTS {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(&redirect);
+                let _ = stream.flush();
+            }
+        });
+        let url = format!("http://{address}/start");
+        let err = follow_redirects(&test_client(), &url, "asset.zip", |_, _| Ok(())).unwrap_err();
+        assert!(err.to_string().contains("redirect limit"), "{err}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn rejected_asset_url_never_reaches_extraction_or_installation() {
+        let workspace = UpdateWorkspace::create().unwrap();
+        let assets = SelectedAssets {
+            zip: github::ReleaseAsset {
+                name: github::WINDOWS_PACKAGE.to_string(),
+                browser_download_url: format!(
+                    "https://github.com/other-owner/Akari-Sweeps/releases/download/v9.9.9/{}",
+                    github::WINDOWS_PACKAGE
+                ),
+                digest: None,
+            },
+            checksum: github::ReleaseAsset {
+                name: github::CHECKSUM_ASSET.to_string(),
+                browser_download_url: format!(
+                    "https://github.com/{}/releases/download/v9.9.9/{}",
+                    github::REPOSITORY,
+                    github::CHECKSUM_ASSET
+                ),
+                digest: None,
+            },
+            zip_digest: None,
+        };
+        let err = download_release(&assets, &workspace).unwrap_err();
+        assert!(matches!(err, UpdateError::InvalidRelease(_)), "{err}");
+        let entries = fs::read_dir(&workspace.root).unwrap().count();
+        assert_eq!(entries, 0, "no download or staging file may be created");
+        assert!(!workspace.root.join("stage").exists());
+        workspace.cleanup();
     }
 }
