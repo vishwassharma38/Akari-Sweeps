@@ -59,6 +59,20 @@ function Get-RemoteFile {
     Copy-Item -LiteralPath $source -Destination $Destination -Force
 }
 
+$script:FailMoveDestination = $null
+function Move-InstallerItem {
+    param(
+        [string]$Source,
+        [string]$Destination
+    )
+    if (-not [string]::IsNullOrWhiteSpace($script:FailMoveDestination) -and
+        [string]::Equals($Destination, $script:FailMoveDestination, [StringComparison]::OrdinalIgnoreCase) -and
+        $Source.Contains('.akari-install-stage-')) {
+        throw 'Injected move failure for transaction rollback test.'
+    }
+    Move-Item -LiteralPath $Source -Destination $Destination -Force
+}
+
 function Assert-True {
     param(
         [bool]$Condition,
@@ -176,6 +190,40 @@ function Reset-TestState {
     $script:MockDownloadDir = $null
     $script:MockTag = 'v9.9.9'
     $script:MockDownloadedUris = @()
+}
+
+function New-TestZipArchive {
+    param(
+        [string]$Path,
+        [object[]]$Entries
+    )
+    Add-Type -AssemblyName System.IO.Compression
+    $file = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $archive = $null
+    try {
+        $archive = [IO.Compression.ZipArchive]::new(
+            $file,
+            [IO.Compression.ZipArchiveMode]::Create,
+            $false
+        )
+        foreach ($item in $Entries) {
+            $entry = $archive.CreateEntry([string]$item.Name)
+            $stream = $entry.Open()
+            try {
+                $bytes = [Text.Encoding]::UTF8.GetBytes([string]$item.Content)
+                if ($bytes.Length -gt 0) {
+                    $stream.Write($bytes, 0, $bytes.Length)
+                }
+            } finally {
+                $stream.Dispose()
+            }
+        }
+    } finally {
+        if ($null -ne $archive) {
+            $archive.Dispose()
+        }
+        $file.Dispose()
+    }
 }
 
 function Test-Case {
@@ -467,6 +515,158 @@ Test-Case 'installer does not invoke Cargo or Rust' {
         $name = $command.GetCommandName()
         if ($null -ne $name) {
             Assert-True ($name -notin @('cargo', 'rustc', 'rustup')) "installer unexpectedly invokes $name"
+        }
+    }
+}
+
+Test-Case 'release asset URLs are pinned to the expected repository, tag, and asset' {
+    $valid = 'https://github.com/vishwassharma38/Akari-Sweeps/releases/download/v1.2.3/akari-sweeps-windows-x86_64.zip'
+    [void](Assert-ReleaseAssetUrl -Url $valid -AssetName 'akari-sweeps-windows-x86_64.zip' -Tag 'v1.2.3')
+    Assert-Throws {
+        Assert-ReleaseAssetUrl -Url 'https://github.com/attacker/Akari-Sweeps/releases/download/v1.2.3/akari-sweeps-windows-x86_64.zip' -AssetName 'akari-sweeps-windows-x86_64.zip' -Tag 'v1.2.3'
+    } 'foreign repository URL must be rejected' | Out-Null
+    Assert-Throws {
+        Assert-ReleaseAssetUrl -Url 'https://github.com/vishwassharma38/Akari-Sweeps/releases/download/v9.9.9/akari-sweeps-windows-x86_64.zip' -AssetName 'akari-sweeps-windows-x86_64.zip' -Tag 'v1.2.3'
+    } 'mismatched release tag must be rejected' | Out-Null
+    Assert-Throws {
+        Assert-ReleaseAssetUrl -Url 'http://github.com/vishwassharma38/Akari-Sweeps/releases/download/v1.2.3/akari-sweeps-windows-x86_64.zip' -AssetName 'akari-sweeps-windows-x86_64.zip' -Tag 'v1.2.3'
+    } 'HTTP downgrade must be rejected' | Out-Null
+}
+
+Test-Case 'asset redirects are restricted to GitHub and the approved release CDN hosts' {
+    [void](Assert-AllowedRedirectUrl -Url 'https://release-assets.githubusercontent.com/asset?token=example' -AssetName $script:PackageName -Tag 'v1.2.3')
+    [void](Assert-AllowedRedirectUrl -Url 'https://objects.githubusercontent.com/asset?token=example' -AssetName $script:PackageName -Tag 'v1.2.3')
+    Assert-Throws {
+        Assert-AllowedRedirectUrl -Url 'http://release-assets.githubusercontent.com/asset' -AssetName $script:PackageName -Tag 'v1.2.3'
+    } 'HTTP CDN redirect must be rejected' | Out-Null
+    Assert-Throws {
+        Assert-AllowedRedirectUrl -Url 'https://attacker.example/asset' -AssetName $script:PackageName -Tag 'v1.2.3'
+    } 'foreign redirect host must be rejected' | Out-Null
+    Assert-Throws {
+        Assert-AllowedRedirectUrl -Url 'https://github.com/other-owner/Akari-Sweeps/releases/download/v1.2.3/akari-sweeps-windows-x86_64.zip' -AssetName $script:PackageName -Tag 'v1.2.3'
+    } 'redirect to a different repository must be rejected' | Out-Null
+}
+
+Test-Case 'limited stream writer rejects oversized downloads and removes partial files' {
+    $root = New-TestRoot 'limited-stream'
+    $stream = $null
+    try {
+        $destination = Join-Path $root 'oversized.bin'
+        $stream = [IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes('01234567890'))
+        Assert-Throws {
+            Write-LimitedStreamToFile -InputStream $stream -Destination $destination -MaxBytes 10 | Out-Null
+        } 'oversized stream must be rejected' | Out-Null
+        Assert-True (-not (Test-Path -LiteralPath $destination)) 'partial oversized download was not removed'
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'safe ZIP extraction rejects traversal paths before writing outside the staging directory' {
+    $root = New-TestRoot 'zip-traversal'
+    try {
+        $zip = Join-Path $root 'unsafe.zip'
+        $stage = Join-Path $root 'stage'
+        New-TestZipArchive -Path $zip -Entries @(
+            @{ Name = '../escape.txt'; Content = 'outside' },
+            @{ Name = 'akari-sweeps.exe'; Content = 'MZfake' }
+        )
+        Assert-Throws {
+            Expand-SafePackage -PackagePath $zip -DestinationDirectory $stage
+        } 'traversal entry must be rejected' | Out-Null
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $root 'escape.txt'))) 'ZIP traversal wrote outside the staging directory'
+        Assert-True (-not (Test-Path -LiteralPath $stage)) 'failed extraction left partial staging files'
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'safe ZIP extraction rejects executable and script payloads inside assets' {
+    $root = New-TestRoot 'zip-script'
+    try {
+        $zip = Join-Path $root 'unsafe.zip'
+        $stage = Join-Path $root 'stage'
+        New-TestZipArchive -Path $zip -Entries @(
+            @{ Name = 'akari-sweeps.exe'; Content = 'MZfake' },
+            @{ Name = 'assets/akari/sweep/frame.png'; Content = 'png' },
+            @{ Name = 'assets/akari/sweep/payload.ps1'; Content = 'Write-Host unsafe' }
+        )
+        Assert-Throws {
+            Expand-SafePackage -PackagePath $zip -DestinationDirectory $stage
+        } 'script payload inside assets must be rejected' | Out-Null
+        Assert-True (-not (Test-Path -LiteralPath $stage)) 'rejected ZIP left partial staging files'
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'safe ZIP extraction enforces the archive entry-count ceiling' {
+    $root = New-TestRoot 'zip-count-limit'
+    $originalLimit = $script:MaxArchiveEntries
+    try {
+        $zip = Join-Path $root 'too-many.zip'
+        $stage = Join-Path $root 'stage'
+        New-TestZipArchive -Path $zip -Entries @(
+            @{ Name = 'first.txt'; Content = 'one' },
+            @{ Name = 'second.txt'; Content = 'two' }
+        )
+        $script:MaxArchiveEntries = 1
+        Assert-Throws {
+            Expand-SafePackage -PackagePath $zip -DestinationDirectory $stage
+        } 'entry-count ceiling must be enforced' | Out-Null
+        Assert-True (-not (Test-Path -LiteralPath $stage)) 'entry-count rejection left staging files'
+    } finally {
+        $script:MaxArchiveEntries = $originalLimit
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'failed asset commit rolls back every executable alias and the previous assets tree' {
+    $root = New-TestRoot 'transaction-rollback'
+    try {
+        Reset-TestState
+        $package = New-TestPackage -Root $root
+        Set-MockDownload -PackagePath $package.Package -ChecksumPath $package.Checksum | Out-Null
+        $install = Join-Path $root 'install'
+        New-Item -ItemType Directory -Path $install -Force | Out-Null
+
+        foreach ($name in $script:AliasNames) {
+            [IO.File]::WriteAllBytes((Join-Path $install $name), [byte[]](0x4D, 0x5A, 0x11, 0x22, 0x33))
+        }
+        foreach ($set in $script:RequiredSpriteSets) {
+            $setDir = Join-Path $install ('assets/akari/' + $set)
+            New-Item -ItemType Directory -Path $setDir -Force | Out-Null
+            [IO.File]::WriteAllBytes((Join-Path $setDir 'frame_001.png'), [byte[]](9, 8, 7, 6))
+        }
+        [IO.File]::WriteAllText((Join-Path $install 'assets/old-version.txt'), 'previous assets')
+
+        $oldHashes = @{}
+        foreach ($name in $script:AliasNames) {
+            $oldHashes[$name] = (Get-FileHash -LiteralPath (Join-Path $install $name) -Algorithm SHA256).Hash
+        }
+        $oldAssetHash = (Get-FileHash -LiteralPath (Join-Path $install 'assets/akari/sweep/frame_001.png') -Algorithm SHA256).Hash
+        $script:FailMoveDestination = Join-Path $install 'assets'
+        $script:FakeUserPath = 'C:\Windows;C:\Tools'
+
+        Assert-Throws {
+            Install-AkariSweeps -InstallDirectory $install
+        } 'injected asset replacement failure must abort installation' | Out-Null
+
+        foreach ($name in $script:AliasNames) {
+            $actual = (Get-FileHash -LiteralPath (Join-Path $install $name) -Algorithm SHA256).Hash
+            Assert-Equal $actual $oldHashes[$name] "$name was not restored after transaction rollback"
+        }
+        $actualAssetHash = (Get-FileHash -LiteralPath (Join-Path $install 'assets/akari/sweep/frame_001.png') -Algorithm SHA256).Hash
+        Assert-Equal $actualAssetHash $oldAssetHash 'previous assets were not restored'
+        Assert-Equal (Get-Content -LiteralPath (Join-Path $install 'assets/old-version.txt') -Raw) 'previous assets' 'previous asset tree was not restored'
+        Assert-Equal $script:FakeUserPath 'C:\Windows;C:\Tools' 'PATH changed despite failed installation'
+        Assert-True (-not (Get-ChildItem -LiteralPath $install -Force -Directory | Where-Object { $_.Name -like '.akari-install-backup-*' -or $_.Name -like '.akari-install-stage-*' })) 'successful rollback left transaction directories behind'
+    } finally {
+        $script:FailMoveDestination = $null
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace($script:MockDownloadDir)) {
+            Remove-Item -LiteralPath $script:MockDownloadDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 }
