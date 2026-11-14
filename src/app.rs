@@ -4,11 +4,14 @@ use crate::akari::animation::{AnimationMode, AnimationSet, Animator};
 use crate::akari::sprites::SpriteFrame;
 use crate::commands::{AppCommand, Phase};
 use crate::system::{AppSummary, ExecEvent, OpResult, OpStatus, ProgressState};
+use crate::update::UpdateNotice;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
-pub const PRODUCT_LABEL: &str = "Akari-Sweeps_V00.1";
-pub const PRODUCT_VERSION: &str = "V00.1";
+/// Display branding derived from Cargo's package version, the single source
+/// of truth shared by the About screen, `akari --version`, and the updater.
+pub const PRODUCT_LABEL: &str = concat!("Akari-Sweeps_V", env!("CARGO_PKG_VERSION"));
+pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const LOG_CAP: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +124,10 @@ pub struct App {
     pub input_focused: bool,
     /// Administrator-elevation state captured at startup.
     pub elevated: bool,
+    /// Latest automatic update notification, if any. Purely informational:
+    /// it is never downloaded or installed until the user runs
+    /// `akari update` explicitly.
+    pub update_notice: Option<UpdateNotice>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +173,7 @@ impl App {
             input: String::new(),
             input_focused: false,
             elevated: crate::system::windows::is_elevated(),
+            update_notice: None,
         };
         app.sync_animation();
         app
@@ -311,6 +319,17 @@ impl App {
                 self.push_log(format!("ERROR: {e}"));
                 self.status_line = e;
                 self.sync_animation();
+                false
+            }
+            ExecEvent::UpdateAvailable(notice) => {
+                self.push_log(format!(
+                    "Update available: {} → {}. Run: akari update",
+                    notice.installed_version, notice.available_version
+                ));
+                if !notice.release_url.trim().is_empty() {
+                    self.push_log(format!("Release: {}", notice.release_url));
+                }
+                self.update_notice = Some(notice);
                 false
             }
         }
@@ -974,6 +993,41 @@ mod tests {
         assert_eq!(app.animator.set(), AnimationSet::Idle);
         assert_eq!(app.animator.mode(), AnimationMode::Ambient);
         assert!(app.animator.current_frame() < AnimationSet::Idle.frame_count());
+    }
+
+    #[test]
+    fn update_event_only_notifies_and_never_starts_work() {
+        let mut app = App::new(AppCommand::Home);
+        let screen = app.screen;
+        let notice = UpdateNotice {
+            installed_version: "0.1.0".to_string(),
+            available_version: "0.1.1".to_string(),
+            release_url: "https://example.com/release".to_string(),
+        };
+        assert!(!app.on_event(ExecEvent::UpdateAvailable(notice.clone())));
+        assert_eq!(app.screen, screen);
+        assert!(!app.worker_running);
+        assert_eq!(app.execution, ExecutionState::Idle);
+        assert_eq!(app.update_notice, Some(notice));
+        assert!(
+            app.log
+                .iter()
+                .any(|line| line.contains("Update available: 0.1.0 → 0.1.1"))
+        );
+        assert!(
+            app.log
+                .iter()
+                .any(|line| line.contains("https://example.com/release"))
+        );
+    }
+
+    #[test]
+    fn product_version_constants_come_from_cargo() {
+        assert_eq!(PRODUCT_VERSION, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            PRODUCT_LABEL,
+            concat!("Akari-Sweeps_V", env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]

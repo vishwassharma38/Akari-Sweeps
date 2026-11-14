@@ -82,7 +82,7 @@ fn screen_subtitle(app: &App) -> String {
 fn render_main(frame: &mut Frame, app: &App, area: Rect) {
     match app.screen {
         Screen::Home => {
-            let p = Paragraph::new(home::lines())
+            let p = Paragraph::new(home::lines(app.update_notice.as_ref()))
                 .block(Block::default().borders(Borders::ALL).title(" Commands "))
                 .wrap(Wrap { trim: false });
             frame.render_widget(p, area);
@@ -343,8 +343,12 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
-    fn product_label_constant() {
-        assert_eq!(PRODUCT_LABEL, "Akari-Sweeps_V00.1");
+    fn product_label_constant_is_derived_from_cargo_version() {
+        assert_eq!(
+            PRODUCT_LABEL,
+            concat!("Akari-Sweeps_V", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(crate::app::PRODUCT_VERSION, env!("CARGO_PKG_VERSION"));
     }
 
     fn buffer_text(width: u16, height: u16, app: &App) -> String {
@@ -377,6 +381,25 @@ mod tests {
         // `akari` as a bare selectable entry must not appear; the numbered
         // rows carry only the five public names.
         assert!(!text.contains("6  "), "must not offer six items");
+    }
+
+    #[test]
+    fn home_shows_update_notification_without_replacing_commands() {
+        let mut app = crate::app::App::new(AppCommand::Home);
+        app.update_notice = Some(crate::update::UpdateNotice {
+            installed_version: "0.1.0".to_string(),
+            available_version: "0.1.1".to_string(),
+            release_url: "https://github.com/vishwassharma38/Akari-Sweeps/releases/tag/v0.1.1"
+                .to_string(),
+        });
+        let text = buffer_text(120, 34, &app);
+        assert!(text.contains("Update available:"));
+        assert!(text.contains("0.1.0"));
+        assert!(text.contains("0.1.1"));
+        assert!(text.contains("run akari update"));
+        assert!(text.contains("releases/tag/v0.1.1"));
+        assert!(text.contains("akariclean"), "commands must remain visible");
+        assert_eq!(app.screen, crate::app::Screen::Home);
     }
 
     #[test]
@@ -840,7 +863,7 @@ mod tests {
                 "startup log must not say press ?"
             );
         }
-        for line in crate::ui::home::lines() {
+        for line in crate::ui::home::lines(None) {
             let s = format!("{line:?}");
             assert!(!s.contains("? help"), "home must not show ? help: {s}");
         }
