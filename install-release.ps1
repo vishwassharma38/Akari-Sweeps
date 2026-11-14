@@ -48,7 +48,6 @@ $script:ReleaseDownloadBase = 'https://github.com/' + $script:Repository + '/rel
 $script:PackageName = 'akari-sweeps-windows-x86_64.zip'
 $script:ChecksumName = 'akari-sweeps-windows-x86_64.zip.sha256'
 $script:UserAgent = 'Akari-Sweeps-Standalone-Installer'
-
 $script:MaxCompressedDownloadBytes = 100 * 1024 * 1024
 $script:MaxChecksumDownloadBytes = 64 * 1024
 $script:MaxArchiveEntryBytes = 512 * 1024 * 1024
@@ -411,14 +410,20 @@ function Get-ValidatedArchiveEntryPath {
             throw "The ZIP directory '$EntryName' is not part of the application package."
         }
         if ($key -eq 'assets') {
-            return [pscustomobject]@{ Key = $key; RelativePath = 'assets'; IsCanonical = $false; IsDirectory = $true }
+            return [pscustomobject]@{
+                Key = $key; RelativePath = 'assets'; IsCanonical = $false; IsDirectory = $true
+            }
         }
         $relative = Join-Path 'assets' (($parts | Select-Object -Skip 1) -join [IO.Path]::DirectorySeparatorChar)
-        return [pscustomobject]@{ Key = $key; RelativePath = $relative; IsCanonical = $false; IsDirectory = $true }
+        return [pscustomobject]@{
+            Key = $key; RelativePath = $relative; IsCanonical = $false; IsDirectory = $true
+        }
     }
 
     if ($key -eq 'akari-sweeps.exe') {
-        return [pscustomobject]@{ Key = $key; RelativePath = 'akari-sweeps.exe'; IsCanonical = $true; IsDirectory = $false }
+        return [pscustomobject]@{
+            Key = $key; RelativePath = 'akari-sweeps.exe'; IsCanonical = $true; IsDirectory = $false
+        }
     }
     if ($key -eq 'assets') {
         throw "The ZIP entry '$EntryName' must be a directory."
@@ -427,7 +432,123 @@ function Get-ValidatedArchiveEntryPath {
         throw "The ZIP file '$EntryName' is not part of the application package."
     }
     $fileName = $parts[$parts.Count - 1].ToLowerInvariant()
-    if ($fileName -match '\.(exe|dll|bat|cmd|com|scr|ps1|msi|vbs|vbe|js|jse|wsf|wsh|cpl|pif|hta|lnk)    return [Environment]::GetEnvironmentVariable('Path', 'User')
+    if ($fileName -match '\.(exe|dll|bat|cmd|com|scr|ps1|msi|vbs|vbe|js|jse|wsf|wsh|cpl|pif|hta|lnk)$') {
+        throw "The ZIP file '$EntryName' is an unexpected executable or script inside assets."
+    }
+    $relative = Join-Path 'assets' (($parts | Select-Object -Skip 1) -join [IO.Path]::DirectorySeparatorChar)
+    return [pscustomobject]@{
+        Key = $key; RelativePath = $relative; IsCanonical = $false; IsDirectory = $false
+    }
+}
+
+function Copy-ZipEntryWithLimits {
+    param(
+        [IO.Compression.ZipArchiveEntry]$Entry,
+        [string]$Destination,
+        [ref]$TotalBytes
+    )
+    $inputStream = $null
+    $outputStream = $null
+    $entryBytes = [long]0
+    try {
+        $inputStream = $Entry.Open()
+        $outputStream = [IO.File]::Open(
+            $Destination,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::None
+        )
+        $buffer = New-Object byte[] 65536
+        while (($read = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $entryBytes += $read
+            $TotalBytes.Value += $read
+            if ($entryBytes -gt $script:MaxArchiveEntryBytes) {
+                throw "The ZIP entry '$($Entry.FullName)' exceeds the per-entry extraction limit."
+            }
+            if ($TotalBytes.Value -gt $script:MaxArchiveTotalBytes) {
+                throw 'The ZIP archive expands beyond the total extraction size limit.'
+            }
+            $outputStream.Write($buffer, 0, $read)
+        }
+        $outputStream.Flush()
+    } finally {
+        if ($null -ne $outputStream) { $outputStream.Dispose() }
+        if ($null -ne $inputStream) { $inputStream.Dispose() }
+    }
+}
+
+function Expand-SafePackage {
+    param(
+        [string]$PackagePath,
+        [string]$DestinationDirectory
+    )
+    $archive = $null
+    $success = $false
+    try {
+        Add-Type -AssemblyName System.IO.Compression
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        New-Item -ItemType Directory -Path $DestinationDirectory -Force | Out-Null
+        $archive = [IO.Compression.ZipFile]::OpenRead($PackagePath)
+        if ($archive.Entries.Count -gt $script:MaxArchiveEntries) {
+            throw "The ZIP archive contains more than $($script:MaxArchiveEntries) entries."
+        }
+
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $totalDeclaredBytes = [long]0
+        $totalWrittenBytes = [long]0
+        foreach ($entry in $archive.Entries) {
+            $isDirectory = [string]::IsNullOrEmpty($entry.Name) -or
+                $entry.FullName.EndsWith('/') -or $entry.FullName.EndsWith('\')
+            $unixMode = ($entry.ExternalAttributes -shr 16) -band 0xF000
+            if ($unixMode -eq 0xA000) {
+                throw "The ZIP entry '$($entry.FullName)' is a symbolic link, which is not allowed."
+            }
+
+            $validated = Get-ValidatedArchiveEntryPath -EntryName $entry.FullName -IsDirectory $isDirectory
+            if (-not $seen.Add($validated.Key)) {
+                throw "The ZIP archive contains a duplicate entry '$($entry.FullName)'."
+            }
+
+            $destination = Join-Path $DestinationDirectory $validated.RelativePath
+            if ($isDirectory) {
+                New-Item -ItemType Directory -Path $destination -Force | Out-Null
+                continue
+            }
+            if ($entry.Length -gt $script:MaxArchiveEntryBytes) {
+                throw "The ZIP entry '$($entry.FullName)' exceeds the per-entry extraction limit."
+            }
+            $totalDeclaredBytes += [long]$entry.Length
+            if ($totalDeclaredBytes -gt $script:MaxArchiveTotalBytes) {
+                throw 'The ZIP archive declares more than the total extraction size limit.'
+            }
+            if ($validated.IsCanonical -and $entry.Length -lt 2) {
+                throw "The packaged executable '$($script:PackageName)' is empty."
+            }
+
+            $parent = Split-Path -Parent $destination
+            if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+                New-Item -ItemType Directory -Path $parent -Force | Out-Null
+            }
+            [void](Copy-ZipEntryWithLimits -Entry $entry -Destination $destination -TotalBytes ([ref]$totalWrittenBytes))
+        }
+
+        Assert-PackageLayout -ExtractDir $DestinationDirectory
+        $success = $true
+    } catch {
+        if (Test-Path -LiteralPath $DestinationDirectory) {
+            Remove-Item -LiteralPath $DestinationDirectory -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        throw
+    } finally {
+        if ($null -ne $archive) { $archive.Dispose() }
+        if (-not $success -and (Test-Path -LiteralPath $DestinationDirectory)) {
+            Remove-Item -LiteralPath $DestinationDirectory -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Get-InstallerUserPath {
+    return [Environment]::GetEnvironmentVariable('Path', 'User')
 }
 
 function Set-InstallerUserPath {
@@ -669,340 +790,6 @@ function Install-AkariSweeps {
     $encodedTag = [Uri]::EscapeDataString($tag)
     $packageUrl = $script:ReleaseDownloadBase + '/' + $encodedTag + '/' + $script:PackageName
     $checksumUrl = $script:ReleaseDownloadBase + '/' + $encodedTag + '/' + $script:ChecksumName
-
-    $downloadDir = Join-Path ([IO.Path]::GetTempPath()) ('akari-sweeps-install-' + [Guid]::NewGuid().ToString('N'))
-    try {
-        New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
-        $packagePath = Join-Path $downloadDir $script:PackageName
-        $checksumPath = Join-Path $downloadDir $script:ChecksumName
-
-        Write-Step "Downloading Akari-Sweeps $tag..."
-        Get-RemoteFile -Uri $packageUrl -Destination $packagePath
-        Get-RemoteFile -Uri $checksumUrl -Destination $checksumPath
-
-        Write-Step 'Verifying the release package (SHA-256)...'
-        $result = Install-FromVerifiedPackage -PackagePath $packagePath -ChecksumPath $checksumPath -InstallDirectory $InstallDirectory
-    } finally {
-        if (Test-Path -LiteralPath $downloadDir) {
-            Remove-Item -LiteralPath $downloadDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-
-    Write-Success ''
-    Write-Success "Akari-Sweeps $tag installed to $($result.InstallDirectory)"
-    Write-Host 'Installed commands: akari, akariclean, akarihealth, akariall, akariabout, akarihelp'
-    if ($result.PathAdded) {
-        Write-Host "Added to the current user's PATH: $($result.InstallDirectory)" -ForegroundColor Green
-        Write-Host 'Restart your terminal (or sign out and back in) before using the commands.'
-    } else {
-        Write-Host "The current user's PATH already contains $($result.InstallDirectory)."
-    }
-    Write-Host 'Verify with: akari --version'
-    Write-Host 'Uninstall with uninstall.ps1 from the repository (see README).'
-}
-
-# Dot-sourcing is used by tests to load the functions without installing.
-if ($MyInvocation.InvocationName -ne '.') {
-    try {
-        Install-AkariSweeps -InstallDirectory $InstallDir -RequestedVersion $Version
-        exit 0
-    } catch {
-        Write-Host ''
-        Write-Host "Akari-Sweeps installation failed: $($_.Exception.Message)" -ForegroundColor Red
-        exit 1
-    }
-}
-) {
-        throw "The ZIP file '$EntryName' is an unexpected executable or script inside assets."
-    }
-    $relative = Join-Path 'assets' (($parts | Select-Object -Skip 1) -join [IO.Path]::DirectorySeparatorChar)
-    return [pscustomobject]@{ Key = $key; RelativePath = $relative; IsCanonical = $false; IsDirectory = $false }
-}
-
-function Copy-ZipEntryWithLimits {
-    param(
-        [IO.Compression.ZipArchiveEntry]$Entry,
-        [string]$Destination,
-        [ref]$TotalBytes
-    )
-    $inputStream = $null
-    $outputStream = $null
-    $entryBytes = [long]0
-    try {
-        $inputStream = $Entry.Open()
-        $outputStream = [IO.File]::Open(
-            $Destination,
-            [IO.FileMode]::CreateNew,
-            [IO.FileAccess]::Write,
-            [IO.FileShare]::None
-        )
-        $buffer = New-Object byte[] 65536
-        while (($read = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
-            $entryBytes += $read
-            $TotalBytes.Value += $read
-            if ($entryBytes -gt $script:MaxArchiveEntryBytes) {
-                throw "The ZIP entry '$($Entry.FullName)' exceeds the per-entry extraction limit."
-            }
-            if ($TotalBytes.Value -gt $script:MaxArchiveTotalBytes) {
-                throw 'The ZIP archive expands beyond the total extraction size limit.'
-            }
-            $outputStream.Write($buffer, 0, $read)
-        }
-        $outputStream.Flush()
-    } finally {
-        if ($null -ne $outputStream) {
-            $outputStream.Dispose()
-        }
-        if ($null -ne $inputStream) {
-            $inputStream.Dispose()
-        }
-    }
-}
-
-function Expand-SafePackage {
-    param(
-        [string]$PackagePath,
-        [string]$DestinationDirectory
-    )
-    $archive = $null
-    $success = $false
-    try {
-        Add-Type -AssemblyName System.IO.Compression
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        New-Item -ItemType Directory -Path $DestinationDirectory -Force | Out-Null
-        $archive = [IO.Compression.ZipFile]::OpenRead($PackagePath)
-        if ($archive.Entries.Count -gt $script:MaxArchiveEntries) {
-            throw "The ZIP archive contains more than $($script:MaxArchiveEntries) entries."
-        }
-
-        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-        $totalDeclaredBytes = [long]0
-        $totalWrittenBytes = [long]0
-        foreach ($entry in $archive.Entries) {
-            $isDirectory = [string]::IsNullOrEmpty($entry.Name) -or
-                $entry.FullName.EndsWith('/') -or $entry.FullName.EndsWith('\')
-            $unixMode = ($entry.ExternalAttributes -shr 16) -band 0xF000
-            if ($unixMode -eq 0xA000) {
-                throw "The ZIP entry '$($entry.FullName)' is a symbolic link, which is not allowed."
-            }
-
-            $validated = Get-ValidatedArchiveEntryPath -EntryName $entry.FullName -IsDirectory $isDirectory
-            if (-not $seen.Add($validated.Key)) {
-                throw "The ZIP archive contains a duplicate entry '$($entry.FullName)'."
-            }
-
-            $destination = Join-Path $DestinationDirectory $validated.RelativePath
-            if ($isDirectory) {
-                New-Item -ItemType Directory -Path $destination -Force | Out-Null
-                continue
-            }
-            if ($entry.Length -gt $script:MaxArchiveEntryBytes) {
-                throw "The ZIP entry '$($entry.FullName)' exceeds the per-entry extraction limit."
-            }
-            $totalDeclaredBytes += [long]$entry.Length
-            if ($totalDeclaredBytes -gt $script:MaxArchiveTotalBytes) {
-                throw 'The ZIP archive declares more than the total extraction size limit.'
-            }
-            if ($validated.IsCanonical -and $entry.Length -lt 2) {
-                throw "The packaged '$($script:PackageName)' executable is empty."
-            }
-
-            $parent = Split-Path -Parent $destination
-            if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
-                New-Item -ItemType Directory -Path $parent -Force | Out-Null
-            }
-            [void](Copy-ZipEntryWithLimits -Entry $entry -Destination $destination -TotalBytes ([ref]$totalWrittenBytes))
-        }
-
-        Assert-PackageLayout -ExtractDir $DestinationDirectory
-        $success = $true
-    } catch {
-        if (Test-Path -LiteralPath $DestinationDirectory) {
-            Remove-Item -LiteralPath $DestinationDirectory -Recurse -Force -ErrorAction SilentlyContinue
-        }
-        throw
-    } finally {
-        if ($null -ne $archive) {
-            $archive.Dispose()
-        }
-        if (-not $success -and (Test-Path -LiteralPath $DestinationDirectory)) {
-            Remove-Item -LiteralPath $DestinationDirectory -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
-
-function Get-InstallerUserPath {
-    return [Environment]::GetEnvironmentVariable('Path', 'User')
-}
-
-function Set-InstallerUserPath {
-    param([string]$PathValue)
-    [Environment]::SetEnvironmentVariable('Path', $PathValue, 'User')
-}
-
-function Add-InstallDirToUserPath {
-    param([string]$PathToAdd)
-    $normalized = $PathToAdd.TrimEnd([char[]]@('\', '/'))
-    $current = Get-InstallerUserPath
-    $parts = @()
-    if (-not [string]::IsNullOrWhiteSpace($current)) {
-        $parts = @($current -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    }
-    foreach ($part in $parts) {
-        $candidate = $part.Trim().TrimEnd([char[]]@('\', '/'))
-        if ([string]::Equals($candidate, $normalized, [StringComparison]::OrdinalIgnoreCase)) {
-            return $false
-        }
-    }
-    if ($parts.Count -eq 0) {
-        Set-InstallerUserPath $normalized
-    } else {
-        Set-InstallerUserPath (($parts -join ';') + ';' + $normalized)
-    }
-    return $true
-}
-
-function Assert-InstallDirectoryIsSafe {
-    param([string]$Path)
-    $full = [IO.Path]::GetFullPath($Path).TrimEnd([char[]]@('\', '/'))
-    if ($full -match '^[A-Za-z]:$') {
-        throw "Refusing to install into a drive root: '$full'."
-    }
-    $windows = [IO.Path]::GetFullPath($env:WINDIR).TrimEnd([char[]]@('\', '/'))
-    if ([string]::Equals($full, $windows, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "Refusing to install into the Windows directory: '$full'."
-    }
-    return $full
-}
-
-function Assert-NoRunningAliases {
-    param([string]$InstallDirectory)
-    $blocked = @()
-    foreach ($name in $script:AliasNames) {
-        $path = Join-Path $InstallDirectory $name
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-            continue
-        }
-        $stream = $null
-        try {
-            $stream = [IO.File]::Open(
-                $path,
-                [IO.FileMode]::Open,
-                [IO.FileAccess]::ReadWrite,
-                [IO.FileShare]::None
-            )
-        } catch {
-            $blocked += $name
-        } finally {
-            if ($null -ne $stream) {
-                $stream.Dispose()
-            }
-        }
-    }
-    if ($blocked.Count -gt 0) {
-        throw ("Close Akari-Sweeps before installing. These installed files are in use: " +
-            ($blocked -join ', ') + '.')
-    }
-}
-
-function Install-FromVerifiedPackage {
-    param(
-        [string]$PackagePath,
-        [string]$ChecksumPath,
-        [string]$InstallDirectory
-    )
-    Assert-PackageChecksum -PackagePath $PackagePath -ChecksumPath $ChecksumPath
-    $target = Assert-InstallDirectoryIsSafe $InstallDirectory
-
-    $extractDir = Join-Path ([IO.Path]::GetTempPath()) ('akari-sweeps-extract-' + [Guid]::NewGuid().ToString('N'))
-    $pendingTemp = New-Object System.Collections.Generic.List[string]
-    try {
-        New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
-        Expand-Archive -LiteralPath $PackagePath -DestinationPath $extractDir -Force
-        Assert-PackageLayout $extractDir
-
-        New-Item -ItemType Directory -Path $target -Force | Out-Null
-        Assert-NoRunningAliases $target
-
-        $canonical = Join-Path $extractDir 'akari-sweeps.exe'
-        $canonicalHash = (Get-FileHash -LiteralPath $canonical -Algorithm SHA256).Hash.ToLowerInvariant()
-        foreach ($name in $script:AliasNames) {
-            $destination = Join-Path $target $name
-            $temp = Join-Path $target ('.' + $name + '.new-' + [Guid]::NewGuid().ToString('N'))
-            [void]$pendingTemp.Add($temp)
-            Copy-Item -LiteralPath $canonical -Destination $temp -Force
-            $tempHash = (Get-FileHash -LiteralPath $temp -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($tempHash -ne $canonicalHash) {
-                throw "The prepared copy of '$name' failed SHA-256 verification."
-            }
-            Move-Item -LiteralPath $temp -Destination $destination -Force
-            [void]$pendingTemp.Remove($temp)
-        }
-
-        $stagedAssets = Join-Path $extractDir 'assets'
-        $installAssets = Join-Path $target 'assets'
-        $newAssets = Join-Path $target ('.assets.new-' + [Guid]::NewGuid().ToString('N'))
-        [void]$pendingTemp.Add($newAssets)
-        Copy-Item -LiteralPath $stagedAssets -Destination $newAssets -Recurse -Force
-
-        if (Test-Path -LiteralPath $installAssets) {
-            $oldAssets = Join-Path $target ('.assets.old-' + [Guid]::NewGuid().ToString('N'))
-            [void]$pendingTemp.Add($oldAssets)
-            Move-Item -LiteralPath $installAssets -Destination $oldAssets
-            try {
-                Move-Item -LiteralPath $newAssets -Destination $installAssets
-            } catch {
-                Move-Item -LiteralPath $oldAssets -Destination $installAssets
-                throw
-            }
-            [void]$pendingTemp.Remove($newAssets)
-            Remove-Item -LiteralPath $oldAssets -Recurse -Force
-            [void]$pendingTemp.Remove($oldAssets)
-        } else {
-            Move-Item -LiteralPath $newAssets -Destination $installAssets
-            [void]$pendingTemp.Remove($newAssets)
-        }
-
-        $pathAdded = Add-InstallDirToUserPath $target
-        return [pscustomobject]@{
-            InstallDirectory = $target
-            PathAdded = $pathAdded
-        }
-    } finally {
-        foreach ($temp in @($pendingTemp)) {
-            if (Test-Path -LiteralPath $temp) {
-                Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
-            }
-        }
-        if (Test-Path -LiteralPath $extractDir) {
-            Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
-
-function Install-AkariSweeps {
-    param(
-        [string]$InstallDirectory = (Join-Path $env:LOCALAPPDATA 'Akari-Sweeps'),
-        [string]$RequestedVersion = $null
-    )
-    $architecture = $env:PROCESSOR_ARCHITEW6432
-    if ([string]::IsNullOrWhiteSpace($architecture)) {
-        $architecture = $env:PROCESSOR_ARCHITECTURE
-    }
-    if (-not [string]::IsNullOrWhiteSpace($architecture) -and $architecture -ne 'AMD64') {
-        throw "The Akari-Sweeps release package supports Windows x86_64 only (detected '$architecture')."
-    }
-
-    $tag = $null
-    if ([string]::IsNullOrWhiteSpace($RequestedVersion)) {
-        Write-Step 'Finding the latest Akari-Sweeps release...'
-        $tag = Get-LatestReleaseTag
-    } else {
-        $tag = Get-NormalizedTag $RequestedVersion
-    }
-
-    $packageUrl = $script:ReleaseDownloadBase + '/' + $tag + '/' + $script:PackageName
-    $checksumUrl = $script:ReleaseDownloadBase + '/' + $tag + '/' + $script:ChecksumName
 
     $downloadDir = Join-Path ([IO.Path]::GetTempPath()) ('akari-sweeps-install-' + [Guid]::NewGuid().ToString('N'))
     try {
