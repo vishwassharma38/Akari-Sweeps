@@ -402,11 +402,12 @@ and `akariabout` / `akarihelp` do not either.
    `akari-sweeps-windows-x86_64.zip`.
 7. Verifies the ZIP contains the expected executable and sprite, then writes
    `akari-sweeps-windows-x86_64.zip.sha256` as UTF-8 without a BOM.
-8. Builds and validates akari-sweeps-itchio-setup.zip, a single-file
-   itch.io upload containing the Windows package, its checksum sidecar,
-   install-release.ps1, and INSTALL.txt.
+8. Builds and validates akari-sweeps-itchio-setup.zip, a self-contained
+   setup bundle containing the Windows package, its checksum sidecar,
+   install-release.ps1, and INSTALL.txt. The bundle is attached to GitHub
+   Releases and downloaded through a permanent latest-release link on itch.io.
 9. Publishes the Windows ZIP, checksum sidecar, standalone installer, and
-   itch.io setup bundle with GitHub-generated release notes using the built-in
+   setup bundle with GitHub-generated release notes using the built-in
    GITHUB_TOKEN (contents: write at job level).
 
 `Cargo.toml` is the only version source. The About screen, `akari --version`,
