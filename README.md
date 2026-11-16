@@ -213,15 +213,26 @@ akari --version
 akarihelp
 ~~~
 
-### Install from the itch.io setup bundle
+### Install from the itch.io page
 
-The release workflow also creates **akari-sweeps-itchio-setup.zip**. Upload
-that single file to the itch.io project page as the Windows download. It
-contains the installer, the Windows application ZIP, its SHA-256 sidecar,
-and an INSTALL.txt guide.
+The release workflow attaches akari-sweeps-itchio-setup.zip to every
+published stable GitHub Release. Put this permanent link in the itch.io page
+description and, optionally, the project's External links metadata:
 
-After downloading the bundle from itch.io, extract all files into one
-folder, open PowerShell in that folder, and run:
+https://github.com/vishwassharma38/Akari-Sweeps/releases/latest/download/akari-sweeps-itchio-setup.zip
+
+GitHub resolves /releases/latest/download/<asset-name> to the matching
+asset on the latest stable release. Because the filename stays the same on
+every release, this page link does not need to be edited or re-uploaded when
+a new version is published.
+
+The same page should include the one-command PowerShell installation above.
+Both links are stable: the bundle link downloads the latest setup bundle,
+while the command downloads the latest installer, which then fetches and
+verifies the matching application package.
+
+For the locally downloaded bundle, extract all files into one folder, open
+PowerShell there, and run:
 
 ~~~powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-release.ps1 -PackagePath .\akari-sweeps-windows-x86_64.zip
@@ -439,12 +450,14 @@ build/package step fails. Verify the result on the repository's **Actions**
 and **Releases** pages, including that the Windows ZIP, .sha256 sidecar,
 install-release.ps1, and akari-sweeps-itchio-setup.zip are attached.
 
-After the workflow succeeds, download akari-sweeps-itchio-setup.zip from
-the GitHub Release and upload it to the itch.io project's Windows download
-slot. On each new release, replace the previous itch.io setup bundle with
-the newly generated one. Keep the PowerShell quick-install command in
-ITCHIO_PAGE_COPY.md unchanged; its GitHub releases/latest/download URL follows
-the latest stable release automatically.
+On the itch.io project page, keep the permanent setup-bundle URL
+https://github.com/vishwassharma38/Akari-Sweeps/releases/latest/download/akari-sweeps-itchio-setup.zip
+and the one-command PowerShell installer from ITCHIO_PAGE_COPY.md.
+Do not upload a static copy of the bundle to itch.io if automatic latest
+downloads are required: an uploaded file is a snapshot and would need to be
+replaced manually or synchronized through a Butler deployment workflow.
+The stable GitHub URL resolves to the matching asset from each latest stable
+release without editing the itch.io page.
 
 ## Errors & exit codes
 
