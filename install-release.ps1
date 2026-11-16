@@ -6,11 +6,12 @@
   Installs the already-compiled Akari-Sweeps release package. Rust, Cargo,
   and a source checkout are not required.
 
-  The installer obtains the official GitHub release (latest by default, or an
-  explicit -Version), downloads the Windows x86_64 ZIP and its published
-  SHA-256 sidecar, verifies the archive, extracts it into an isolated staging
-  directory, installs all six command aliases plus the complete assets tree,
-  and adds the install directory to the current user's PATH.
+  The installer can either obtain the official GitHub release (latest by
+  default, or an explicit -Version), or install from a locally downloaded
+  release ZIP and SHA-256 sidecar. In both modes it verifies the archive,
+  extracts it into an isolated staging directory, installs all six command
+  aliases plus the complete assets tree, and adds the install directory to
+  the current user's PATH.
 
   The installation directory defaults to %LOCALAPPDATA%\Akari-Sweeps and does
   not require administrator privileges. Unrelated files in an existing install
@@ -22,18 +23,33 @@
 
 .PARAMETER Version
   Optional release version, for example 0.1.0 or v0.1.0. When omitted, the
-  latest non-prerelease GitHub release is used.
+  latest non-prerelease GitHub release is used. Cannot be combined with
+  -PackagePath.
+
+.PARAMETER PackagePath
+  Optional path to a locally downloaded Windows x86_64 release ZIP. When
+  supplied, no network download is performed. The checksum sidecar defaults
+  to the package path plus '.sha256'.
+
+.PARAMETER ChecksumPath
+  Optional path to the SHA-256 sidecar for -PackagePath. If omitted, the
+  installer uses '<PackagePath>.sha256'.
 
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File .\install-release.ps1
 
 .EXAMPLE
   .\install-release.ps1 -Version 0.1.1 -InstallDir "D:\Tools\Akari"
+
+.EXAMPLE
+  .\install-release.ps1 -PackagePath .\akari-sweeps-windows-x86_64.zip
 #>
 [CmdletBinding()]
 param(
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Akari-Sweeps'),
-    [string]$Version
+    [string]$Version,
+    [string]$PackagePath,
+    [string]$ChecksumPath
 )
 
 Set-StrictMode -Version 2.0
@@ -797,8 +813,11 @@ function Install-FromVerifiedPackage {
 function Install-AkariSweeps {
     param(
         [string]$InstallDirectory = (Join-Path $env:LOCALAPPDATA 'Akari-Sweeps'),
-        [string]$RequestedVersion = $null
+        [string]$RequestedVersion = $null,
+        [string]$LocalPackagePath = $null,
+        [string]$LocalChecksumPath = $null
     )
+
     $architecture = $env:PROCESSOR_ARCHITEW6432
     if ([string]::IsNullOrWhiteSpace($architecture)) {
         $architecture = $env:PROCESSOR_ARCHITECTURE
@@ -807,38 +826,77 @@ function Install-AkariSweeps {
         throw "The Akari-Sweeps release package supports Windows x86_64 only (detected '$architecture')."
     }
 
-    $tag = $null
-    if ([string]::IsNullOrWhiteSpace($RequestedVersion)) {
-        Write-Step 'Finding the latest Akari-Sweeps release...'
-        $tag = Get-LatestReleaseTag
-    } else {
-        $tag = Get-NormalizedTag $RequestedVersion
+    if ([string]::IsNullOrWhiteSpace($LocalPackagePath) -and
+        -not [string]::IsNullOrWhiteSpace($LocalChecksumPath)) {
+        throw '-ChecksumPath can only be used together with -PackagePath.'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($LocalPackagePath) -and
+        -not [string]::IsNullOrWhiteSpace($RequestedVersion)) {
+        throw 'Use either -Version or -PackagePath, not both.'
     }
 
-    $encodedTag = [Uri]::EscapeDataString($tag)
-    $packageUrl = $script:ReleaseDownloadBase + '/' + $encodedTag + '/' + $script:PackageName
-    $checksumUrl = $script:ReleaseDownloadBase + '/' + $encodedTag + '/' + $script:ChecksumName
+    $result = $null
+    $tag = $null
 
-    $downloadDir = Join-Path ([IO.Path]::GetTempPath()) ('akari-sweeps-install-' + [Guid]::NewGuid().ToString('N'))
-    try {
-        New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
-        $packagePath = Join-Path $downloadDir $script:PackageName
-        $checksumPath = Join-Path $downloadDir $script:ChecksumName
+    if (-not [string]::IsNullOrWhiteSpace($LocalPackagePath)) {
+        $packagePath = [IO.Path]::GetFullPath($LocalPackagePath)
+        if (-not (Test-Path -LiteralPath $packagePath -PathType Leaf)) {
+            throw "The local release package was not found: '$packagePath'."
+        }
 
-        Write-Step "Downloading Akari-Sweeps $tag..."
-        Get-RemoteFile -Uri $packageUrl -Destination $packagePath
-        Get-RemoteFile -Uri $checksumUrl -Destination $checksumPath
+        if ([string]::IsNullOrWhiteSpace($LocalChecksumPath)) {
+            $checksumPath = $packagePath + '.sha256'
+        } else {
+            $checksumPath = [IO.Path]::GetFullPath($LocalChecksumPath)
+        }
+        if (-not (Test-Path -LiteralPath $checksumPath -PathType Leaf)) {
+            throw "The local release checksum file was not found: '$checksumPath'."
+        }
 
-        Write-Step 'Verifying the release package (SHA-256)...'
+        Write-Step 'Installing from the local Akari-Sweeps package...'
         $result = Install-FromVerifiedPackage -PackagePath $packagePath -ChecksumPath $checksumPath -InstallDirectory $InstallDirectory
-    } finally {
-        if (Test-Path -LiteralPath $downloadDir) {
-            Remove-Item -LiteralPath $downloadDir -Recurse -Force -ErrorAction SilentlyContinue
+        $tag = 'local package'
+    } else {
+        if (-not [string]::IsNullOrWhiteSpace($LocalChecksumPath)) {
+            throw '-ChecksumPath can only be used together with -PackagePath.'
+        }
+
+        if ([string]::IsNullOrWhiteSpace($RequestedVersion)) {
+            Write-Step 'Finding the latest Akari-Sweeps release...'
+            $tag = Get-LatestReleaseTag
+        } else {
+            $tag = Get-NormalizedTag $RequestedVersion
+        }
+
+        $encodedTag = [Uri]::EscapeDataString($tag)
+        $packageUrl = $script:ReleaseDownloadBase + '/' + $encodedTag + '/' + $script:PackageName
+        $checksumUrl = $script:ReleaseDownloadBase + '/' + $encodedTag + '/' + $script:ChecksumName
+
+        $downloadDir = Join-Path ([IO.Path]::GetTempPath()) ('akari-sweeps-install-' + [Guid]::NewGuid().ToString('N'))
+        try {
+            New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
+            $packagePath = Join-Path $downloadDir $script:PackageName
+            $checksumPath = Join-Path $downloadDir $script:ChecksumName
+
+            Write-Step "Downloading Akari-Sweeps $tag..."
+            Get-RemoteFile -Uri $packageUrl -Destination $packagePath
+            Get-RemoteFile -Uri $checksumUrl -Destination $checksumPath
+
+            Write-Step 'Verifying the release package (SHA-256)...'
+            $result = Install-FromVerifiedPackage -PackagePath $packagePath -ChecksumPath $checksumPath -InstallDirectory $InstallDirectory
+        } finally {
+            if (Test-Path -LiteralPath $downloadDir) {
+                Remove-Item -LiteralPath $downloadDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 
     Write-Success ''
-    Write-Success "Akari-Sweeps $tag installed to $($result.InstallDirectory)"
+    if ($tag -eq 'local package') {
+        Write-Success "Akari-Sweeps installed from the local package to $($result.InstallDirectory)"
+    } else {
+        Write-Success "Akari-Sweeps $tag installed to $($result.InstallDirectory)"
+    }
     Write-Host 'Installed commands: akari, akariclean, akarihealth, akariall, akariabout, akarihelp'
     if ($result.PathAdded) {
         Write-Host "Added to the current user's PATH: $($result.InstallDirectory)" -ForegroundColor Green
