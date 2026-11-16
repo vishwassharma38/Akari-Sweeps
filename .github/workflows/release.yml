@@ -198,7 +198,7 @@ jobs:
   publish-itchio:
     name: Publish the release bundle to itch.io
     needs: release
-    if: \${{ vars.ITCHIO_TARGET != '' }}
+    if: ${{ vars.ITCHIO_TARGET != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -208,7 +208,7 @@ jobs:
 
       - name: Download the just-published GitHub Release bundle
         env:
-          GH_TOKEN: \${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -230,7 +230,7 @@ jobs:
             "install-release.ps1"
             "INSTALL.txt"
           )
-          for file in "\${required_files[@]}"; do
+          for file in "${required_files[@]}"; do
             test -f "dist/itchio/$file" || {
               echo "::error::The itch.io bundle is missing $file"
               exit 1
@@ -238,7 +238,7 @@ jobs:
           done
 
           actual_count=$(find dist/itchio -mindepth 1 -maxdepth 1 -type f | wc -l)
-          if [ "$actual_count" -ne "\${#required_files[@]}" ]; then
+          if [ "$actual_count" -ne "${#required_files[@]}" ]; then
             echo "::error::The itch.io bundle contains unexpected files"
             find dist/itchio -mindepth 1 -maxdepth 1 -type f -print
             exit 1
@@ -246,12 +246,12 @@ jobs:
 
       - name: Publish to the stable Windows channel
         env:
-          BUTLER_API_KEY: \${{ secrets.BUTLER_API_KEY }}
-          ITCHIO_TARGET: \${{ vars.ITCHIO_TARGET }}
-          RELEASE_VERSION: \${{ github.ref_name }}
+          BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
+          ITCHIO_TARGET: ${{ vars.ITCHIO_TARGET }}
+          RELEASE_VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          if [ -z "\${BUTLER_API_KEY:-}" ]; then
+          if [ -z "${BUTLER_API_KEY:-}" ]; then
             echo "::error::Add the BUTLER_API_KEY repository secret before enabling ITCHIO_TARGET."
             exit 1
           fi
@@ -259,6 +259,6 @@ jobs:
             echo "::error::ITCHIO_TARGET must use the format itch-username/project-slug:windows."
             exit 1
           fi
-          version="\${RELEASE_VERSION#v}"
+          version="${RELEASE_VERSION#v}"
           echo "Publishing Akari-Sweeps $version to $ITCHIO_TARGET"
           butler push "dist/itchio" "$ITCHIO_TARGET" --userversion "$version"
