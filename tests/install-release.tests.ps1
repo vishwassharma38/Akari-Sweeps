@@ -298,6 +298,100 @@ Test-Case 'explicit version selects the matching release tag' {
     }
 }
 
+Test-Case 'local itch.io package installs six aliases and assets without network access' {
+    $root = New-TestRoot 'local-package'
+    try {
+        Reset-TestState
+        $package = New-TestPackage -Root $root
+        $install = Join-Path $root 'local install'
+        Install-AkariSweeps -InstallDirectory $install -LocalPackagePath $package.Package
+
+        foreach ($name in @('akari.exe', 'akariclean.exe', 'akarihealth.exe', 'akariall.exe', 'akariabout.exe', 'akarihelp.exe')) {
+            Assert-True (Test-Path -LiteralPath (Join-Path $install $name) -PathType Leaf) "$name was not installed from the local package"
+        }
+        foreach ($set in @('sweep', 'idle', 'health', 'about', 'help')) {
+            Assert-True (Test-Path -LiteralPath (Join-Path $install ('assets\akari\' + $set + '\frame_001.png')) -PathType Leaf) "$set assets were not installed from the local package"
+        }
+        Assert-True (($script:FakeUserPath -split ';') -contains $install) 'local package install did not add the install directory to PATH'
+        Assert-Equal $script:MockDownloadedUris.Count 0 'local package installation unexpectedly contacted GitHub'
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'local package uses an explicit checksum sidecar when supplied' {
+    $root = New-TestRoot 'local-custom-checksum'
+    try {
+        Reset-TestState
+        $package = New-TestPackage -Root $root
+        $customChecksum = Join-Path $root 'custom.sha256'
+        Copy-Item -LiteralPath $package.Checksum -Destination $customChecksum
+        $install = Join-Path $root 'install'
+        Install-AkariSweeps -InstallDirectory $install -LocalPackagePath $package.Package -LocalChecksumPath $customChecksum
+        Assert-True (Test-Path -LiteralPath (Join-Path $install 'akari.exe') -PathType Leaf) 'local package with explicit checksum was not installed'
+        Assert-Equal $script:MockDownloadedUris.Count 0 'local package with explicit checksum unexpectedly contacted GitHub'
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'local package checksum mismatch is rejected before installation' {
+    $root = New-TestRoot 'local-bad-checksum'
+    try {
+        Reset-TestState
+        $package = New-TestPackage -Root $root
+        [IO.File]::WriteAllText($package.Checksum, (('0' * 64) + '  akari-sweeps-windows-x86_64.zip'))
+        $install = Join-Path $root 'install'
+        Assert-Throws {
+            Install-AkariSweeps -InstallDirectory $install -LocalPackagePath $package.Package
+        } 'local checksum mismatch must fail' | Out-Null
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $install 'akari.exe'))) 'files were installed after a local checksum failure'
+        Assert-Equal $script:MockDownloadedUris.Count 0 'local checksum failure unexpectedly contacted GitHub'
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'local package requires its checksum sidecar' {
+    $root = New-TestRoot 'local-missing-checksum'
+    try {
+        Reset-TestState
+        $package = New-TestPackage -Root $root
+        Remove-Item -LiteralPath $package.Checksum -Force
+        Assert-Throws {
+            Install-AkariSweeps -InstallDirectory (Join-Path $root 'install') -LocalPackagePath $package.Package
+        } 'missing local checksum must fail' | Out-Null
+        Assert-Equal $script:MockDownloadedUris.Count 0 'missing local checksum unexpectedly contacted GitHub'
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'local package path must exist and invalid argument combinations are rejected' {
+    Reset-TestState
+    Assert-Throws {
+        Install-AkariSweeps -InstallDirectory (Join-Path ([IO.Path]::GetTempPath()) 'missing-akari-package') -LocalPackagePath (Join-Path ([IO.Path]::GetTempPath()) 'missing-akari-package.zip')
+    } 'missing local package must fail' | Out-Null
+    Assert-Throws {
+        Install-AkariSweeps -InstallDirectory (Join-Path ([IO.Path]::GetTempPath()) 'unused-akari-package') -LocalChecksumPath 'unused.sha256'
+    } 'checksum without package must fail' | Out-Null
+    Assert-Equal $script:MockDownloadedUris.Count 0 'invalid local arguments unexpectedly contacted GitHub'
+}
+
+Test-Case 'local package and explicit GitHub version cannot be combined' {
+    $root = New-TestRoot 'local-version-conflict'
+    try {
+        Reset-TestState
+        $package = New-TestPackage -Root $root
+        Assert-Throws {
+            Install-AkariSweeps -InstallDirectory (Join-Path $root 'install') -RequestedVersion '1.2.3' -LocalPackagePath $package.Package
+        } 'local package and explicit version must be mutually exclusive' | Out-Null
+        Assert-Equal $script:MockDownloadedUris.Count 0 'conflicting local arguments unexpectedly contacted GitHub'
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Test-Case 'invalid checksum is rejected before installation' {
     $root = New-TestRoot 'bad-checksum'
     try {
