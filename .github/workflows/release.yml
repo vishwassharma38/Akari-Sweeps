@@ -130,6 +130,48 @@ jobs:
           )
           Copy-Item -LiteralPath 'install-release.ps1' `
             -Destination (Join-Path $dist 'install-release.ps1') -Force
+
+          # Build one itch.io upload containing the local installer, the exact
+          # release package, and its checksum sidecar. Users only download this
+          # bundle from itch.io, then install without a second network fetch.
+          $itchStage = Join-Path $env:RUNNER_TEMP 'akari-sweeps-itchio'
+          if (Test-Path -LiteralPath $itchStage) {
+            Remove-Item -LiteralPath $itchStage -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $itchStage -Force | Out-Null
+          Copy-Item -LiteralPath $zipPath -Destination $itchStage
+          Copy-Item -LiteralPath $checksumPath -Destination $itchStage
+          Copy-Item -LiteralPath (Join-Path $dist 'install-release.ps1') -Destination $itchStage
+          Copy-Item -LiteralPath 'ITCHIO-INSTALL.txt' -Destination (Join-Path $itchStage 'INSTALL.txt')
+
+          $itchBundleName = 'akari-sweeps-itchio-setup.zip'
+          $itchBundlePath = Join-Path $dist $itchBundleName
+          if (Test-Path -LiteralPath $itchBundlePath) {
+            Remove-Item -LiteralPath $itchBundlePath -Force
+          }
+          Compress-Archive -Path (Join-Path $itchStage '*') -DestinationPath $itchBundlePath -CompressionLevel Optimal
+
+          $itchArchive = [IO.Compression.ZipFile]::OpenRead($itchBundlePath)
+          try {
+            $itchNames = @($itchArchive.Entries | ForEach-Object { $_.FullName.Replace('\\', '/') })
+          } finally {
+            $itchArchive.Dispose()
+          }
+          $requiredItchFiles = @(
+            'akari-sweeps-windows-x86_64.zip',
+            'akari-sweeps-windows-x86_64.zip.sha256',
+            'install-release.ps1',
+            'INSTALL.txt'
+          )
+          foreach ($requiredFile in $requiredItchFiles) {
+            if ($itchNames -notcontains $requiredFile) {
+              throw "The itch.io setup bundle is missing '$requiredFile'."
+            }
+          }
+          if ($itchNames.Count -ne $requiredItchFiles.Count) {
+            throw "The itch.io setup bundle contains unexpected files: $($itchNames -join ', ')"
+          }
+
           Write-Host "Created $zipPath"
           Write-Host "Created $(Join-Path $dist 'install-release.ps1')"
           Get-Content -LiteralPath $checksumPath
@@ -144,7 +186,8 @@ jobs:
           $zip = 'dist/akari-sweeps-windows-x86_64.zip'
           $checksum = 'dist/akari-sweeps-windows-x86_64.zip.sha256'
           $installer = 'dist/install-release.ps1'
-          gh release create $env:GITHUB_REF_NAME $zip $checksum $installer `
+          $itchBundle = 'dist/akari-sweeps-itchio-setup.zip'
+          gh release create $env:GITHUB_REF_NAME $zip $checksum $installer $itchBundle `
             --verify-tag `
             --title "Akari-Sweeps $env:CARGO_VERSION" `
             --generate-notes
