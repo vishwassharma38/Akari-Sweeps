@@ -911,7 +911,7 @@ function Install-AkariSweeps {
 # Dot-sourcing is used by tests to load the functions without installing.
 if ($MyInvocation.InvocationName -ne '.') {
     try {
-        Install-AkariSweeps -InstallDirectory $InstallDir -RequestedVersion $Version
+        Install-AkariSweeps -InstallDirectory $InstallDir -RequestedVersion $Version -LocalPackagePath $PackagePath -LocalChecksumPath $ChecksumPath
         exit 0
     } catch {
         Write-Host ''
