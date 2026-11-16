@@ -4,6 +4,42 @@
 
 Akari-Sweeps brings Windows cleanup and system-health tools into a persistent terminal UI, with live operation output, clear results, and Akari animations.
 
+## Download the latest Windows setup
+
+**[Download Akari-Sweeps for Windows (latest stable release)](https://github.com/vishwassharma38/Akari-Sweeps/releases/latest/download/akari-sweeps-itchio-setup.zip)**
+
+This link always resolves to the setup bundle attached to the latest stable GitHub Release. You do not need to change this link when a new version is published.
+
+The bundle includes the installer, application package, SHA-256 checksum, and installation guide. Download it, extract the ZIP, then run the local installation command below.
+
+## One-command installation
+
+**Requirements:** Windows 10 or Windows 11, 64-bit (x86_64).
+
+Prefer not to download and extract a bundle manually? Open PowerShell and paste:
+
+~~~powershell
+& { $ErrorActionPreference='Stop'; $p=Join-Path $env:TEMP ('akari-sweeps-'+[guid]::NewGuid().ToString('N')+'.ps1'); try { Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/vishwassharma38/Akari-Sweeps/releases/latest/download/install-release.ps1' -OutFile $p; & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $p; if ($LASTEXITCODE -ne 0) { throw "Akari-Sweeps installer failed with exit code $LASTEXITCODE." } } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } }
+~~~
+
+This downloads the official installer from the latest stable GitHub Release. The installer downloads the matching application package, verifies its published SHA-256 checksum, validates the archive, installs all six command aliases and their animation assets, and adds the installation folder to your **current user's PATH**.
+
+Installation does not require Rust, Cargo, or administrator privileges. Restart your terminal after installation.
+
+## Install from the downloaded setup bundle
+
+1. Download the latest setup bundle using the link above.
+2. Extract all files into one folder.
+3. Open PowerShell in that folder and run:
+
+~~~powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-release.ps1 -PackagePath .\akari-sweeps-windows-x86_64.zip
+~~~
+
+The installer automatically reads the adjacent SHA-256 sidecar. It verifies the local package before installation and does not need to download the application again.
+
+The default installation folder is %LOCALAPPDATA%\Akari-Sweeps.
+
 ## Features
 
 - **Animated terminal interface:** A responsive Ratatui TUI with idle, sweeping, health, About, and Help animations.
@@ -11,39 +47,7 @@ Akari-Sweeps brings Windows cleanup and system-health tools into a persistent te
 - **Cleanup and health are separated:** Run cleanup independently, health/repair independently, or both in sequence.
 - **Measured results:** Operations report real process results and exit codes rather than treating a launched command as a success.
 - **Built-in update support:** Check for and install published updates using akari update.
-- **No developer toolchain required:** The release installer uses the prebuilt Windows application. Rust and Cargo are not needed.
-
-## Quick install from PowerShell
-
-**Requirements:** Windows 10 or Windows 11, 64-bit (x86_64).
-
-Open PowerShell and paste this single command:
-
-~~~powershell
-& { $ErrorActionPreference='Stop'; $p=Join-Path $env:TEMP ('akari-sweeps-'+[guid]::NewGuid().ToString('N')+'.ps1'); try { Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/vishwassharma38/Akari-Sweeps/releases/latest/download/install-release.ps1' -OutFile $p; & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $p; if ($LASTEXITCODE -ne 0) { throw "Akari-Sweeps installer failed with exit code $LASTEXITCODE." } } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } }
-~~~
-
-This downloads the official installer from the latest stable GitHub Release. The installer then downloads the matching Windows package, verifies its published SHA-256 checksum, validates the archive, installs the application, and adds its folder to your **current user's PATH**. The installation itself does not require administrator privileges.
-
-The default installation folder is:
-
-~~~text
-%LOCALAPPDATA%\Akari-Sweeps
-~~~
-
-Restart PowerShell or open a new terminal after installation.
-
-## Download and install directly from itch.io
-
-Prefer downloading a file from itch.io? Download **Akari-Sweeps Windows Setup Bundle** from the Download section and extract it.
-
-Open PowerShell in the extracted folder and run:
-
-~~~powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-release.ps1 -PackagePath .\akari-sweeps-windows-x86_64.zip
-~~~
-
-Keep the installer, ZIP package, and .sha256 file together. This local installation route does not need to download the application again or contact GitHub. It verifies the package against the included checksum before installing.
+- **No developer toolchain required:** The release installer uses the prebuilt Windows application.
 
 ## Available commands
 
@@ -55,8 +59,6 @@ Keep the installer, ZIP package, and .sha256 file together. This local installat
 | akariall | Run cleanup, then health/repair operations, in sequence |
 | akariabout | Show application information |
 | akarihelp | Show usage and command help |
-
-You can also enter the main interface and choose an action there.
 
 ## Updates
 
@@ -85,5 +87,5 @@ The application only notifies about updates automatically. It does not silently 
 ## Source code and support
 
 - **Source code:** https://github.com/vishwassharma38/Akari-Sweeps
-- **Releases:** https://github.com/vishwassharma38/Akari-Sweeps/releases
+- **Latest release notes:** https://github.com/vishwassharma38/Akari-Sweeps/releases/latest
 - **Report an issue:** https://github.com/vishwassharma38/Akari-Sweeps/issues
