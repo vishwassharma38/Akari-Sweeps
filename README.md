@@ -184,39 +184,70 @@ cargo build --release --locked   # -> target\release\akari-sweeps.exe
 
 ## Install (regular users, no Rust required)
 
-Use the standalone installer from the repository's **Releases** page. It
-downloads the already-compiled Windows x86_64 package, verifies its published
-SHA-256 sidecar, installs all six command aliases plus the complete
-`assets\` tree, and adds the install directory to the **current user's**
-PATH. Rust, Cargo, and a source checkout are not required.
+Supported platform: **Windows 10/11 on x86_64**. Rust, Cargo, and a source
+checkout are not required. The installer installs the prebuilt application
+and adds its folder to the **current user's** PATH; administrator privileges
+are not required for installation.
 
-Supported platform: **Windows 10/11 on x86_64**. If the Releases page has no
-published release yet, use the developer installation below instead.
+### One-command install (PowerShell)
 
-```powershell
-# Download install-release.ps1 from the latest release, then:
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install-release.ps1
+After the first stable GitHub Release has been published, open PowerShell and
+paste this one-line command:
 
-# Optional explicit version and/or installation directory:
-.\install-release.ps1 -Version 0.1.1 -InstallDir "D:\Tools\Akari"
-```
+~~~powershell
+& { $ErrorActionPreference='Stop'; $p=Join-Path $env:TEMP ('akari-sweeps-'+[guid]::NewGuid().ToString('N')+'.ps1'); try { Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/vishwassharma38/Akari-Sweeps/releases/latest/download/install-release.ps1' -OutFile $p; & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $p; if ($LASTEXITCODE -ne 0) { throw "Akari-Sweeps installer failed with exit code $LASTEXITCODE." } } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } }
+~~~
 
-- Default install directory: `%LOCALAPPDATA%\Akari-Sweeps` (no administrator
-  rights required).
-- `-Version` accepts `0.1.1` or `v0.1.1`; omit it to install the latest
-  non-prerelease release.
-- Existing unrelated files in the install directory are preserved. The six
-  application aliases and the application-owned `assets\` directory are
-  replaced; re-running the installer is safe.
-- PATH is updated idempotently: unrelated entries are preserved, duplicate
-  entries are not created, and the machine PATH is never modified. Restart
-  the terminal after the first install.
-- Verify the installed version in a new terminal:
+This downloads the installer from the latest stable GitHub Release, runs it
+in a separate Windows PowerShell process, and removes the temporary script
+afterward. The installer downloads the matching application ZIP and SHA-256
+sidecar, verifies the checksum, validates the archive, installs all six
+command aliases and the complete assets tree, then updates the current
+user's PATH. The terminal you pasted into stays open.
 
-```powershell
-akari --version      # Akari-Sweeps <version>
-akarihelp            # opens the TUI
-```
+The default install directory is %LOCALAPPDATA%\Akari-Sweeps. Restart the
+terminal after the first installation, then verify:
+
+~~~powershell
+akari --version
+akarihelp
+~~~
+
+### Install from the itch.io setup bundle
+
+The release workflow also creates **akari-sweeps-itchio-setup.zip**. Upload
+that single file to the itch.io project page as the Windows download. It
+contains the installer, the Windows application ZIP, its SHA-256 sidecar,
+and an INSTALL.txt guide.
+
+After downloading the bundle from itch.io, extract all files into one
+folder, open PowerShell in that folder, and run:
+
+~~~powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-release.ps1 -PackagePath .\akari-sweeps-windows-x86_64.zip
+~~~
+
+The installer automatically uses the adjacent
+akari-sweeps-windows-x86_64.zip.sha256 sidecar. It verifies and installs
+the local package without contacting GitHub or downloading the application
+again. Keep the installer, ZIP, and checksum sidecar together.
+
+### Direct installer options
+
+- Download the installer separately:
+  https://github.com/vishwassharma38/Akari-Sweeps/releases/latest/download/install-release.ps1
+- -Version accepts 0.1.1 or v0.1.1; omit it to install the latest
+  non-prerelease GitHub release.
+- -PackagePath installs from a local release ZIP and performs no network
+  download. Its checksum defaults to the package path plus .sha256.
+- -ChecksumPath optionally selects a different SHA-256 sidecar.
+- -InstallDir selects a custom installation directory.
+
+Existing unrelated files in the install directory are preserved. The six
+application aliases and the application-owned assets directory are
+replaced; re-running the installer is safe. PATH updates are idempotent:
+unrelated entries are preserved, duplicates are not created, and the
+machine-wide PATH is never modified.
 
 ### Uninstall / undo
 
@@ -360,9 +391,12 @@ and `akariabout` / `akarihelp` do not either.
    `akari-sweeps-windows-x86_64.zip`.
 7. Verifies the ZIP contains the expected executable and sprite, then writes
    `akari-sweeps-windows-x86_64.zip.sha256` as UTF-8 without a BOM.
-8. Publishes the ZIP, checksum sidecar, and `install-release.ps1` with
-   GitHub-generated release notes using the built-in `GITHUB_TOKEN`
-   (`contents: write` at job level).
+8. Builds and validates akari-sweeps-itchio-setup.zip, a single-file
+   itch.io upload containing the Windows package, its checksum sidecar,
+   install-release.ps1, and INSTALL.txt.
+9. Publishes the Windows ZIP, checksum sidecar, standalone installer, and
+   itch.io setup bundle with GitHub-generated release notes using the built-in
+   GITHUB_TOKEN (contents: write at job level).
 
 `Cargo.toml` is the only version source. The About screen, `akari --version`,
 and the updater all derive from it.
@@ -402,8 +436,15 @@ Pushing the tag starts the workflow; the GitHub Release exists only after
 the workflow completes successfully. There is no release if the tag and
 Cargo version differ, the lockfile is stale, tests fail, or the
 build/package step fails. Verify the result on the repository's **Actions**
-and **Releases** pages, including that the ZIP, `.sha256` sidecar, and
-`install-release.ps1` are attached.
+and **Releases** pages, including that the Windows ZIP, .sha256 sidecar,
+install-release.ps1, and akari-sweeps-itchio-setup.zip are attached.
+
+After the workflow succeeds, download akari-sweeps-itchio-setup.zip from
+the GitHub Release and upload it to the itch.io project's Windows download
+slot. On each new release, replace the previous itch.io setup bundle with
+the newly generated one. Keep the PowerShell quick-install command in
+ITCHIO_PAGE_COPY.md unchanged; its GitHub releases/latest/download URL follows
+the latest stable release automatically.
 
 ## Errors & exit codes
 
@@ -452,11 +493,13 @@ updates a temporary installation, injected rollback, and a locked executable
 timing out without changing files.
 
 The standalone installer tests run offline on Windows PowerShell 5.1 with
-isolated temporary directories and a fake per-user PATH. They cover valid
-install, invalid checksum, missing package/downloads, missing executable or
+isolated temporary directories and a fake per-user PATH. They cover remote
+and local package installation, explicit and inferred checksum paths,
+checksum mismatch, missing package/downloads/checksum, missing executable or
 assets, extraction failure, an existing install directory, repeated installs,
 PATH preservation and duplicate prevention, unsafe directories, invalid
-versions, cleanup after failure, and the absence of any Cargo/Rust invocation.
+versions and argument combinations, cleanup after failure, and the absence
+of any Cargo/Rust invocation.
 The real user's PATH and any real Akari-Sweeps installation are never touched.
 
 Destructive/real servicing ops never run in tests, and updater tests never
@@ -471,10 +514,13 @@ release itself remain manual/infrastructure verification.
 Perform this only after the first baseline release is published and use a
 disposable Windows test installation, never a real user installation.
 
-1. Publish `v0.1.0`; confirm the release contains the ZIP, `.sha256`, and
-   `install-release.ps1`, and that GitHub Actions succeeded.
-2. Install `0.1.0` with the standalone installer. In a new terminal confirm
-   `akari --version`, all six command names, sprites, and PATH.
+1. Publish v0.1.0; confirm the release contains the Windows ZIP,
+   .sha256 sidecar, install-release.ps1, and akari-sweeps-itchio-setup.zip,
+   and that GitHub Actions succeeded.
+2. Test both installation routes on a disposable Windows x86_64 machine:
+   run the one-command PowerShell install, then separately extract the itch.io
+   setup bundle and install with -PackagePath. In a new terminal confirm
+   akari --version, all six command names, sprites, and PATH.
 3. Prepare and publish `v0.1.1` with the corrected Cargo.lock workflow above.
 4. From the disposable `0.1.0` installation run `akari update --check` and
    then `akari update`. The command exits after launching the separate helper;
