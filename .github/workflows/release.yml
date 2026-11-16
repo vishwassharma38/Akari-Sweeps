@@ -193,3 +193,48 @@ jobs:
             --verify-tag `
             --title "Akari-Sweeps $env:CARGO_VERSION" `
             --generate-notes
+
+      # Optional native itch.io publication. Configure the repository variable
+      # ITCHIO_TARGET (owner/project:windows) and the BUTLER_API_KEY secret once.
+      # If they are not configured yet, the GitHub Release still publishes and
+      # the permanent latest-release link on the itch.io page remains usable.
+      - name: Set up itch.io butler
+        if: ${{ vars.ITCHIO_TARGET != '' }}
+        uses: remarkablegames/setup-butler@v3
+
+      - name: Publish setup bundle to itch.io
+        if: ${{ vars.ITCHIO_TARGET != '' }}
+        shell: pwsh
+        env:
+          BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
+          ITCHIO_TARGET: ${{ vars.ITCHIO_TARGET }}
+          CARGO_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:BUTLER_API_KEY)) {
+            throw 'ITCHIO_TARGET is configured but the BUTLER_API_KEY repository secret is missing.'
+          }
+          if ($env:ITCHIO_TARGET -notmatch '^[^/]+/[^:]+:windows
+) {
+            throw "ITCHIO_TARGET must use the form itch-username/project-slug:windows (got '$env:ITCHIO_TARGET')."
+          }
+
+          $itchStage = Join-Path $env:RUNNER_TEMP 'akari-sweeps-itchio'
+          if (-not (Test-Path -LiteralPath $itchStage -PathType Container)) {
+            throw "The validated itch.io setup bundle staging directory is missing: '$itchStage'."
+          }
+          $requiredFiles = @(
+            'akari-sweeps-windows-x86_64.zip',
+            'akari-sweeps-windows-x86_64.zip.sha256',
+            'install-release.ps1',
+            'INSTALL.txt'
+          )
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path -LiteralPath (Join-Path $itchStage $file) -PathType Leaf)) {
+              throw "The itch.io setup bundle is missing '$file'."
+            }
+          }
+
+          Write-Host "Publishing Akari-Sweeps $env:CARGO_VERSION to $env:ITCHIO_TARGET"
+          butler push $itchStage $env:ITCHIO_TARGET --userversion $env:CARGO_VERSION
+
