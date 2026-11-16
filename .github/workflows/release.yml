@@ -153,7 +153,7 @@ jobs:
 
           $itchArchive = [IO.Compression.ZipFile]::OpenRead($itchBundlePath)
           try {
-            $itchNames = @($itchArchive.Entries | ForEach-Object { $_.FullName.Replace('\\', '/') })
+            $itchNames = @($itchArchive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
           } finally {
             $itchArchive.Dispose()
           }
@@ -174,6 +174,7 @@ jobs:
 
           Write-Host "Created $zipPath"
           Write-Host "Created $(Join-Path $dist 'install-release.ps1')"
+          Write-Host "Created $itchBundlePath"
           Get-Content -LiteralPath $checksumPath
 
       - name: Publish GitHub Release
