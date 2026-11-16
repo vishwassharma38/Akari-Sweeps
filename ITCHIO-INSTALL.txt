@@ -1,0 +1,55 @@
+AKARI-SWEEPS - WINDOWS SETUP BUNDLE
+
+Supported systems
+- Windows 10 or Windows 11, 64-bit (x86_64).
+- No Rust, Cargo, or administrator privileges are required for installation.
+- Maintenance operations may request Windows UAC elevation when needed.
+
+INSTALL FROM THIS DOWNLOAD (NO SECOND DOWNLOAD REQUIRED)
+
+1. Extract every file in this bundle into a folder. Keep these files together:
+   - install-release.ps1
+   - akari-sweeps-windows-x86_64.zip
+   - akari-sweeps-windows-x86_64.zip.sha256
+
+2. Open PowerShell in the extracted folder.
+
+3. Run:
+
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-release.ps1 -PackagePath .\akari-sweeps-windows-x86_64.zip
+
+The installer verifies the ZIP against its SHA-256 sidecar, validates the archive contents, installs the six command aliases and all Akari animation assets, and adds the installation folder to your current user's PATH.
+
+The default install folder is:
+%LOCALAPPDATA%\Akari-Sweeps
+
+Restart your terminal after installation, then verify:
+
+   akari --version
+
+   akarihelp
+
+ONLINE ONE-COMMAND INSTALL
+
+When using the Akari-Sweeps itch.io page, you can also open PowerShell and paste the one-command installer shown on that page. That route downloads the official installer from the latest GitHub Release and then downloads and verifies the matching release package.
+
+UPDATES
+
+After installation, run:
+
+   akari update
+
+This checks for and installs the latest published stable release. You can check without installing by running:
+
+   akari update --check
+
+INSTALLATION NOTES
+
+- Installation only updates the six Akari-Sweeps executables, the application-owned assets folder, and the current user's PATH entry.
+- Unrelated files in the installation folder are preserved.
+- The installer does not change the machine-wide PATH.
+- Close Akari-Sweeps before reinstalling or updating.
+- The package is intended for Windows x86_64 only.
+
+For source code, detailed behavior, troubleshooting, and uninstall instructions:
+https://github.com/vishwassharma38/Akari-Sweeps
