@@ -216,20 +216,25 @@ akarihelp
 ### Install from the itch.io page
 
 The release workflow attaches akari-sweeps-itchio-setup.zip to every
-published stable GitHub Release. Put this permanent link in the itch.io page
-description and, optionally, the project's External links metadata:
+published stable GitHub Release. It can also publish that same validated
+bundle to your itch.io project's persistent Windows download channel using
+Butler. Configure the one-time GitHub Actions secret and repository variable
+described in ITCHIO_SETUP.md; after that, each stable release updates the
+same itch.io download slot automatically.
 
+Keep these permanent fallback links in the itch.io page description:
+
+Setup bundle:
 https://github.com/vishwassharma38/Akari-Sweeps/releases/latest/download/akari-sweeps-itchio-setup.zip
 
-GitHub resolves /releases/latest/download/<asset-name> to the matching
-asset on the latest stable release. Because the filename stays the same on
-every release, this page link does not need to be edited or re-uploaded when
-a new version is published.
+One-command installer:
+https://github.com/vishwassharma38/Akari-Sweeps/releases/latest/download/install-release.ps1
 
-The same page should include the one-command PowerShell installation above.
-Both links are stable: the bundle link downloads the latest setup bundle,
-while the command downloads the latest installer, which then fetches and
-verifies the matching application package.
+GitHub resolves /releases/latest/download/<asset-name> to the matching
+asset on the latest stable release. Because the asset filenames stay the
+same, these links do not need to be edited for later versions. The one-command
+PowerShell installation above downloads the current installer, which then
+fetches and verifies the matching application package.
 
 For the locally downloaded bundle, extract all files into one folder, open
 PowerShell there, and run:
@@ -409,6 +414,10 @@ and `akariabout` / `akarihelp` do not either.
 9. Publishes the Windows ZIP, checksum sidecar, standalone installer, and
    setup bundle with GitHub-generated release notes using the built-in
    GITHUB_TOKEN (contents: write at job level).
+10. After the GitHub Release is published, the optional publish-itchio job
+    downloads and validates the exact setup bundle, then pushes it to the
+    configured itch.io Windows channel with Butler. The job runs when the
+    ITCHIO_TARGET repository variable is configured.
 
 `Cargo.toml` is the only version source. The About screen, `akari --version`,
 and the updater all derive from it.
@@ -451,14 +460,22 @@ build/package step fails. Verify the result on the repository's **Actions**
 and **Releases** pages, including that the Windows ZIP, .sha256 sidecar,
 install-release.ps1, and akari-sweeps-itchio-setup.zip are attached.
 
-On the itch.io project page, keep the permanent setup-bundle URL
-https://github.com/vishwassharma38/Akari-Sweeps/releases/latest/download/akari-sweeps-itchio-setup.zip
-and the one-command PowerShell installer from ITCHIO_PAGE_COPY.md.
-Do not upload a static copy of the bundle to itch.io if automatic latest
-downloads are required: an uploaded file is a snapshot and would need to be
-replaced manually or synchronized through a Butler deployment workflow.
-The stable GitHub URL resolves to the matching asset from each latest stable
-release without editing the itch.io page.
+Configure the one-time itch.io connection by following ITCHIO_SETUP.md:
+- Add the itch.io Butler API key as the GitHub Actions repository secret
+  BUTLER_API_KEY.
+- Add the project target as the GitHub Actions repository variable
+  ITCHIO_TARGET, using the format itch-username/project-slug:windows.
+
+After that one-time setup, every new stable GitHub Release publishes the
+same setup bundle to the same itch.io Windows channel. You do not need to
+change the itch.io page URL, re-upload a file, or edit the secret/variable
+for each release. Keep the stable GitHub latest-asset links in the page
+description as a fallback.
+
+The publish-itchio job is skipped when ITCHIO_TARGET is not configured.
+If the target is configured but BUTLER_API_KEY is missing or invalid, the
+publishing job fails and reports the missing/invalid credential rather than
+silently claiming that itch.io was updated.
 
 ## Errors & exit codes
 

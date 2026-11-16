@@ -62,3 +62,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Standalone installer tests failed with exit code $LASTEXITCODE."
           }
+
+  workflow-lint:
+    name: Lint GitHub Actions workflows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run actionlint
+        uses: raven-actions/actionlint@v2
