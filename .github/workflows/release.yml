@@ -194,47 +194,71 @@ jobs:
             --title "Akari-Sweeps $env:CARGO_VERSION" `
             --generate-notes
 
-      # Optional native itch.io publication. Configure the repository variable
-      # ITCHIO_TARGET (owner/project:windows) and the BUTLER_API_KEY secret once.
-      # If they are not configured yet, the GitHub Release still publishes and
-      # the permanent latest-release link on the itch.io page remains usable.
+
+  publish-itchio:
+    name: Publish the release bundle to itch.io
+    needs: release
+    if: \${{ vars.ITCHIO_TARGET != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
       - name: Set up itch.io butler
-        if: ${{ vars.ITCHIO_TARGET != '' }}
         uses: remarkablegames/setup-butler@v3
 
-      - name: Publish setup bundle to itch.io
-        if: ${{ vars.ITCHIO_TARGET != '' }}
-        shell: pwsh
+      - name: Download the just-published GitHub Release bundle
         env:
-          BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
-          ITCHIO_TARGET: ${{ vars.ITCHIO_TARGET }}
-          CARGO_VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: \${{ github.token }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          if ([string]::IsNullOrWhiteSpace($env:BUTLER_API_KEY)) {
-            throw 'ITCHIO_TARGET is configured but the BUTLER_API_KEY repository secret is missing.'
-          }
-          if ($env:ITCHIO_TARGET -notmatch '^[^/]+/[^:]+:windows
-) {
-            throw "ITCHIO_TARGET must use the form itch-username/project-slug:windows (got '$env:ITCHIO_TARGET')."
-          }
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "akari-sweeps-itchio-setup.zip" \
+            --dir dist
 
-          $itchStage = Join-Path $env:RUNNER_TEMP 'akari-sweeps-itchio'
-          if (-not (Test-Path -LiteralPath $itchStage -PathType Container)) {
-            throw "The validated itch.io setup bundle staging directory is missing: '$itchStage'."
-          }
-          $requiredFiles = @(
-            'akari-sweeps-windows-x86_64.zip',
-            'akari-sweeps-windows-x86_64.zip.sha256',
-            'install-release.ps1',
-            'INSTALL.txt'
+      - name: Validate and extract the itch.io setup bundle
+        run: |
+          set -euo pipefail
+          mkdir -p dist/itchio
+          unzip -t dist/akari-sweeps-itchio-setup.zip
+          unzip -q dist/akari-sweeps-itchio-setup.zip -d dist/itchio
+
+          required_files=(
+            "akari-sweeps-windows-x86_64.zip"
+            "akari-sweeps-windows-x86_64.zip.sha256"
+            "install-release.ps1"
+            "INSTALL.txt"
           )
-          foreach ($file in $requiredFiles) {
-            if (-not (Test-Path -LiteralPath (Join-Path $itchStage $file) -PathType Leaf)) {
-              throw "The itch.io setup bundle is missing '$file'."
+          for file in "\${required_files[@]}"; do
+            test -f "dist/itchio/$file" || {
+              echo "::error::The itch.io bundle is missing $file"
+              exit 1
             }
-          }
+          done
 
-          Write-Host "Publishing Akari-Sweeps $env:CARGO_VERSION to $env:ITCHIO_TARGET"
-          butler push $itchStage $env:ITCHIO_TARGET --userversion $env:CARGO_VERSION
+          actual_count=$(find dist/itchio -mindepth 1 -maxdepth 1 -type f | wc -l)
+          if [ "$actual_count" -ne "\${#required_files[@]}" ]; then
+            echo "::error::The itch.io bundle contains unexpected files"
+            find dist/itchio -mindepth 1 -maxdepth 1 -type f -print
+            exit 1
+          fi
 
+      - name: Publish to the stable Windows channel
+        env:
+          BUTLER_API_KEY: \${{ secrets.BUTLER_API_KEY }}
+          ITCHIO_TARGET: \${{ vars.ITCHIO_TARGET }}
+          RELEASE_VERSION: \${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "\${BUTLER_API_KEY:-}" ]; then
+            echo "::error::Add the BUTLER_API_KEY repository secret before enabling ITCHIO_TARGET."
+            exit 1
+          fi
+          if [[ "$ITCHIO_TARGET" != */*:windows ]]; then
+            echo "::error::ITCHIO_TARGET must use the format itch-username/project-slug:windows."
+            exit 1
+          fi
+          version="\${RELEASE_VERSION#v}"
+          echo "Publishing Akari-Sweeps $version to $ITCHIO_TARGET"
+          butler push "dist/itchio" "$ITCHIO_TARGET" --userversion "$version"
