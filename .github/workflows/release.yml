@@ -131,9 +131,10 @@ jobs:
           Copy-Item -LiteralPath 'install-release.ps1' `
             -Destination (Join-Path $dist 'install-release.ps1') -Force
 
-          # Build one itch.io upload containing the local installer, the exact
-          # release package, and its checksum sidecar. Users only download this
-          # bundle from itch.io, then install without a second network fetch.
+          # Build a self-contained setup bundle and attach it to every
+          # GitHub Release. The itch.io page links to the stable
+          # /releases/latest/download/ URL, so it always serves the newest
+          # stable bundle without re-uploading or editing the itch.io page.
           $itchStage = Join-Path $env:RUNNER_TEMP 'akari-sweeps-itchio'
           if (Test-Path -LiteralPath $itchStage) {
             Remove-Item -LiteralPath $itchStage -Recurse -Force
