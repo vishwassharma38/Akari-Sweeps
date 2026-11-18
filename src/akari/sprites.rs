@@ -1,29 +1,21 @@
-//! Sprite discovery, validation, and pixel loading.
+//! Sprite discovery, normalization, and pixel loading.
 //!
 //! Each animation set is a sequence of PNGs in its own
-//! `assets/akari/<set>/` directory, validated at the set's documented
-//! size and normalized to RGBA. They are never rewritten; the TUI renders a
-//! scaled half-block approximation (documented limitation) with transparent
-//! pixels blended over the terminal background.
+//! `assets/akari/<set>/` directory. Replacement frames may use any
+//! dimensions: the loader decodes every expected frame, derives one shared
+//! canvas from the largest width and height in the set, and centers each
+//! source image on a transparent canvas of that size. Frames are never
+//! rewritten; the TUI renders a scaled half-block approximation (documented
+//! limitation) with transparent pixels blended over the terminal background.
 
 use std::path::{Path, PathBuf};
 
-pub const SWEEP_WIDTH: u32 = 256;
-pub const SWEEP_HEIGHT: u32 = 320;
 pub const SWEEP_FRAMES: usize = 8;
-pub const IDLE_WIDTH: u32 = 367;
-pub const IDLE_HEIGHT: u32 = 564;
 pub const IDLE_FRAMES: usize = 8;
-pub const HEALTH_WIDTH: u32 = 358;
-pub const HEALTH_HEIGHT: u32 = 575;
 pub const HEALTH_FRAMES: usize = 8;
-pub const ABOUT_WIDTH: u32 = 346;
-pub const ABOUT_HEIGHT: u32 = 557;
 /// Four unique poses. The asset folder also contains exact duplicates as
 /// files 005–008; the loader follows the canonical 001–004 sequence.
 pub const ABOUT_FRAMES: usize = 4;
-pub const HELP_WIDTH: u32 = 346;
-pub const HELP_HEIGHT: u32 = 557;
 /// Four unique poses. The asset folder also contains exact duplicates as
 /// files 005–008; the loader follows the canonical 001–004 sequence.
 pub const HELP_FRAMES: usize = 4;
@@ -31,7 +23,13 @@ pub const HELP_FRAMES: usize = 4;
 /// share this timing policy through `Animator`.
 pub const SWEEP_INTERVAL_MS: u64 = 167;
 
-/// Filesystem identity and validation constraints for one animation set.
+/// Safety budget for the normalized RGBA data of one animation set (all
+/// frames). This is deliberately far above any sensible terminal sprite and
+/// is a resource guard, not an expected image size: replacement art may use
+/// any dimensions or aspect ratio within it.
+pub const MAX_ANIMATION_BYTES: usize = 256 * 1024 * 1024;
+
+/// Filesystem identity and loading constraints for one animation set.
 /// Additional sets add a constant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpriteSetSpec {
@@ -40,8 +38,6 @@ pub struct SpriteSetSpec {
     /// File-name prefix before `_NNN.png`.
     pub prefix: &'static str,
     pub frame_count: usize,
-    pub width: u32,
-    pub height: u32,
 }
 
 impl SpriteSetSpec {
@@ -49,40 +45,30 @@ impl SpriteSetSpec {
         dir: "sweep",
         prefix: "akari_sweep",
         frame_count: SWEEP_FRAMES,
-        width: SWEEP_WIDTH,
-        height: SWEEP_HEIGHT,
     };
 
     pub const IDLE: Self = Self {
         dir: "idle",
         prefix: "idle",
         frame_count: IDLE_FRAMES,
-        width: IDLE_WIDTH,
-        height: IDLE_HEIGHT,
     };
 
     pub const HEALTH: Self = Self {
         dir: "health",
         prefix: "health",
         frame_count: HEALTH_FRAMES,
-        width: HEALTH_WIDTH,
-        height: HEALTH_HEIGHT,
     };
 
     pub const ABOUT: Self = Self {
         dir: "about",
         prefix: "about",
         frame_count: ABOUT_FRAMES,
-        width: ABOUT_WIDTH,
-        height: ABOUT_HEIGHT,
     };
 
     pub const HELP: Self = Self {
         dir: "help",
         prefix: "help",
         frame_count: HELP_FRAMES,
-        width: HELP_WIDTH,
-        height: HELP_HEIGHT,
     };
 
     /// Canonical file name for frame `index` (0-based).
@@ -131,9 +117,14 @@ impl SpriteSetSpec {
             .find(|d| d.join(self.frame_name(0)).exists())
     }
 
-    /// Load and validate every frame in order.
+    /// Load every expected frame in order and normalize the set onto one
+    /// shared canvas sized to the largest source width/height. Every source
+    /// image is centered, unmodified, on transparent padding.
     pub fn load_frames(self, dir: &Path) -> Result<Vec<SpriteFrame>, SpriteError> {
-        let mut frames = Vec::with_capacity(self.frame_count);
+        // Pass 1: resolve paths and read header dimensions without keeping
+        // full pixel buffers. This lets the shared canvas be sized before
+        // any unbounded RGBA allocation happens.
+        let mut sources = Vec::with_capacity(self.frame_count);
         for i in 0..self.frame_count {
             let path = dir.join(self.frame_name(i));
             if !path.exists() {
@@ -143,24 +134,75 @@ impl SpriteSetSpec {
                     path,
                 });
             }
-            let img = image::open(&path).map_err(|e| SpriteError::Load {
-                path: path.clone(),
-                reason: e.to_string(),
-            })?;
-            let rgba = img.to_rgba8();
-            let (w, h) = (rgba.width(), rgba.height());
-            if w != self.width || h != self.height {
-                return Err(SpriteError::BadDimensions {
-                    spec: self,
-                    path,
-                    w,
-                    h,
+            let mut reader = image::ImageReader::open(&path).map_err(|e| load_error(&path, e))?;
+            reader.limits(decode_limits());
+            let (width, height) = reader.into_dimensions().map_err(|e| load_error(&path, e))?;
+            sources.push((path, width, height));
+        }
+
+        let canvas_width = sources
+            .iter()
+            .map(|(_, width, _)| *width)
+            .max()
+            .unwrap_or(0);
+        let canvas_height = sources
+            .iter()
+            .map(|(_, _, height)| *height)
+            .max()
+            .unwrap_or(0);
+        let canvas_len = checked_canvas_len(self, canvas_width, canvas_height)?;
+
+        // Pass 2: decode one frame at a time and copy it into its centered
+        // canvas position. Pixels (including alpha) are copied verbatim.
+        let mut frames = Vec::with_capacity(self.frame_count);
+        for (path, source_width, source_height) in sources {
+            let mut reader = image::ImageReader::open(&path).map_err(|e| load_error(&path, e))?;
+            reader.limits(decode_limits());
+            let rgba = reader
+                .decode()
+                .map_err(|e| load_error(&path, e))?
+                .to_rgba8();
+            if rgba.width() != source_width || rgba.height() != source_height {
+                return Err(SpriteError::Load {
+                    path: path.clone(),
+                    reason: format!(
+                        "decoded dimensions {}x{} do not match the PNG header {source_width}x{source_height}",
+                        rgba.width(),
+                        rgba.height()
+                    ),
                 });
             }
+
+            let offset_x = (canvas_width - source_width) / 2;
+            let offset_y = (canvas_height - source_height) / 2;
+            let mut canvas = Vec::new();
+            canvas
+                .try_reserve_exact(canvas_len)
+                .map_err(|_| SpriteError::CanvasTooLarge {
+                    spec: self,
+                    width: canvas_width,
+                    height: canvas_height,
+                    limit: MAX_ANIMATION_BYTES,
+                })?;
+            canvas.resize(canvas_len, 0);
+
+            let source_row_bytes = source_width as usize * 4;
+            let canvas_row_bytes = canvas_width as usize * 4;
+            let raw = rgba.as_raw();
+            for row in 0..source_height as usize {
+                let src_start = row * source_row_bytes;
+                let dst_start =
+                    (offset_y as usize + row) * canvas_row_bytes + offset_x as usize * 4;
+                canvas[dst_start..dst_start + source_row_bytes]
+                    .copy_from_slice(&raw[src_start..src_start + source_row_bytes]);
+            }
+
             frames.push(SpriteFrame {
-                width: w,
-                height: h,
-                rgba: rgba.into_raw(),
+                source_width,
+                source_height,
+                canvas_width,
+                canvas_height,
+                rgba: canvas,
             });
         }
         Ok(frames)
@@ -180,6 +222,45 @@ impl SpriteSetSpec {
     }
 }
 
+/// Decoder limits: no fixed width/height requirement, but a single decode
+/// may not allocate more than one animation's safety budget.
+fn decode_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_ANIMATION_BYTES as u64);
+    limits
+}
+
+/// Validate the shared canvas size and return its RGBA byte length.
+///
+/// Checked arithmetic prevents overflow for hostile dimensions; the budget
+/// keeps memory use bounded without reintroducing a fixed asset size.
+fn checked_canvas_len(spec: SpriteSetSpec, width: u32, height: u32) -> Result<usize, SpriteError> {
+    let total_bytes = (width as u128)
+        .checked_mul(height as u128)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|bytes| bytes.checked_mul(spec.frame_count as u128))
+        .unwrap_or(u128::MAX);
+    let per_canvas = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4));
+    match per_canvas {
+        Some(bytes) if total_bytes <= MAX_ANIMATION_BYTES as u128 => Ok(bytes),
+        _ => Err(SpriteError::CanvasTooLarge {
+            spec,
+            width,
+            height,
+            limit: MAX_ANIMATION_BYTES,
+        }),
+    }
+}
+
+fn load_error(path: &Path, error: impl std::fmt::Display) -> SpriteError {
+    SpriteError::Load {
+        path: path.to_path_buf(),
+        reason: error.to_string(),
+    }
+}
+
 #[derive(Debug)]
 pub enum SpriteError {
     Missing {
@@ -191,11 +272,11 @@ pub enum SpriteError {
         path: PathBuf,
         reason: String,
     },
-    BadDimensions {
+    CanvasTooLarge {
         spec: SpriteSetSpec,
-        path: PathBuf,
-        w: u32,
-        h: u32,
+        width: u32,
+        height: u32,
+        limit: usize,
     },
 }
 
@@ -213,24 +294,49 @@ impl std::fmt::Display for SpriteError {
             SpriteError::Load { path, reason } => {
                 write!(f, "cannot decode {}: {reason}", path.display())
             }
-            SpriteError::BadDimensions { spec, path, w, h } => write!(
+            SpriteError::CanvasTooLarge {
+                spec,
+                width,
+                height,
+                limit,
+            } => write!(
                 f,
-                "{} is {w}x{h}, expected {}x{} for the {} animation — re-export at the documented size",
-                path.display(),
-                spec.width,
-                spec.height,
-                spec.dir
+                "cannot normalize the {} animation: shared {width}x{height} canvas for {} frames \
+                 exceeds the {} MiB safety budget — provide smaller PNGs",
+                spec.dir,
+                spec.frame_count,
+                limit / (1024 * 1024)
             ),
         }
     }
 }
 
-/// One decoded RGBA frame (row-major, 4 bytes/px).
+/// One decoded frame normalized onto its animation set's shared RGBA canvas
+/// (row-major, 4 bytes/px). `source_*` preserves the original PNG dimensions
+/// for accurate reporting; `canvas_*` is identical for every frame in a set.
 #[derive(Debug, Clone)]
 pub struct SpriteFrame {
-    pub width: u32,
-    pub height: u32,
+    /// Original PNG width in pixels.
+    pub source_width: u32,
+    /// Original PNG height in pixels.
+    pub source_height: u32,
+    /// Shared canvas width (largest source width in the set).
+    pub canvas_width: u32,
+    /// Shared canvas height (largest source height in the set).
+    pub canvas_height: u32,
+    /// Normalized canvas pixels: `canvas_width × canvas_height`, RGBA.
     pub rgba: Vec<u8>,
+}
+
+impl SpriteFrame {
+    /// Top-left pixel of the original image inside the shared canvas.
+    #[allow(dead_code)]
+    pub fn source_offset(&self) -> (u32, u32) {
+        (
+            self.canvas_width.saturating_sub(self.source_width) / 2,
+            self.canvas_height.saturating_sub(self.source_height) / 2,
+        )
+    }
 }
 
 /// Canonical sweep file name for frame `index` (0-based).
@@ -251,7 +357,7 @@ pub fn resolve_sweep_dir() -> Option<PathBuf> {
     SpriteSetSpec::SWEEP.resolve_dir()
 }
 
-/// Load and validate all eight sweep frames in order.
+/// Load and normalize all eight sweep frames in order.
 #[allow(dead_code)]
 pub fn load_sweep_frames(dir: &Path) -> Result<Vec<SpriteFrame>, SpriteError> {
     SpriteSetSpec::SWEEP.load_frames(dir)
@@ -285,6 +391,49 @@ mod tests {
             .join("assets")
             .join("akari")
             .join(spec.dir)
+    }
+
+    fn save_solid(dir: &Path, spec: SpriteSetSpec, index: usize, w: u32, h: u32, rgba: [u8; 4]) {
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba(rgba));
+        img.save(dir.join(spec.frame_name(index))).unwrap();
+    }
+
+    fn source_image(spec: SpriteSetSpec, dir: &Path, index: usize) -> image::RgbaImage {
+        image::open(dir.join(spec.frame_name(index)))
+            .expect("source frame must decode")
+            .to_rgba8()
+    }
+
+    fn canvas_pixel(frame: &SpriteFrame, x: u32, y: u32) -> [u8; 4] {
+        let idx = ((y as usize * frame.canvas_width as usize) + x as usize) * 4;
+        [
+            frame.rgba[idx],
+            frame.rgba[idx + 1],
+            frame.rgba[idx + 2],
+            frame.rgba[idx + 3],
+        ]
+    }
+
+    /// The source pixels must appear verbatim at the frame's centered
+    /// offset in the shared canvas.
+    fn assert_source_preserved(frame: &SpriteFrame, source: &image::RgbaImage) {
+        assert_eq!(
+            (frame.source_width, frame.source_height),
+            (source.width(), source.height())
+        );
+        let (offset_x, offset_y) = frame.source_offset();
+        let source_row_bytes = source.width() as usize * 4;
+        let canvas_row_bytes = frame.canvas_width as usize * 4;
+        let raw = source.as_raw();
+        for row in 0..source.height() as usize {
+            let src_start = row * source_row_bytes;
+            let dst_start = (offset_y as usize + row) * canvas_row_bytes + offset_x as usize * 4;
+            assert_eq!(
+                &frame.rgba[dst_start..dst_start + source_row_bytes],
+                &raw[src_start..src_start + source_row_bytes],
+                "source row {row} must be preserved in the canvas"
+            );
+        }
     }
 
     #[test]
@@ -389,14 +538,23 @@ mod tests {
             );
             let frames = spec.load_frames(&resolved).expect("frames must decode");
             assert_eq!(frames.len(), spec.frame_count);
-            for frame in &frames {
-                assert_eq!((frame.width, frame.height), (spec.width, spec.height));
+
+            let max_width = frames.iter().map(|f| f.source_width).max().unwrap();
+            let max_height = frames.iter().map(|f| f.source_height).max().unwrap();
+            for (i, frame) in frames.iter().enumerate() {
+                assert_eq!(
+                    (frame.canvas_width, frame.canvas_height),
+                    (max_width, max_height),
+                    "{} frame {i} must share the set canvas",
+                    spec.dir
+                );
+                assert_source_preserved(frame, &source_image(spec, &dir, i));
             }
         }
     }
 
     #[test]
-    fn real_assets_load_at_documented_size() {
+    fn real_assets_load_with_shared_canvases() {
         for spec in [
             SpriteSetSpec::SWEEP,
             SpriteSetSpec::IDLE,
@@ -411,8 +569,13 @@ mod tests {
             }
             let frames = spec.load_frames(&dir).expect("frames must decode");
             assert_eq!(frames.len(), spec.frame_count);
-            for f in &frames {
-                assert_eq!((f.width, f.height), (spec.width, spec.height));
+            let canvas = (frames[0].canvas_width, frames[0].canvas_height);
+            for frame in &frames {
+                assert_eq!((frame.canvas_width, frame.canvas_height), canvas);
+                assert_eq!(
+                    frame.rgba.len(),
+                    (canvas.0 as usize) * (canvas.1 as usize) * 4
+                );
             }
         }
     }
@@ -427,14 +590,7 @@ mod tests {
         }
         let frames = spec.load_frames(&dir).expect("idle frames must decode");
         for (i, frame) in frames.iter().enumerate() {
-            let expected = image::open(dir.join(spec.frame_name(i)))
-                .expect("source frame must decode")
-                .to_rgba8();
-            assert_eq!(
-                frame.rgba,
-                expected.into_raw(),
-                "idle frame {i} loaded out of order"
-            );
+            assert_source_preserved(frame, &source_image(spec, &dir, i));
         }
     }
 
@@ -460,14 +616,7 @@ mod tests {
         let frames = spec.load_frames(&dir).expect("health frames must decode");
         assert_eq!(frames.len(), HEALTH_FRAMES);
         for (i, frame) in frames.iter().enumerate() {
-            let expected = image::open(dir.join(spec.frame_name(i)))
-                .expect("source frame must decode")
-                .to_rgba8();
-            assert_eq!(
-                frame.rgba,
-                expected.into_raw(),
-                "health frame {i} loaded out of order"
-            );
+            assert_source_preserved(frame, &source_image(spec, &dir, i));
         }
     }
 
@@ -499,14 +648,7 @@ mod tests {
         let frames = spec.load_frames(&dir).expect("about frames must decode");
         assert_eq!(frames.len(), ABOUT_FRAMES);
         for (i, frame) in frames.iter().enumerate() {
-            let expected = image::open(dir.join(spec.frame_name(i)))
-                .expect("source frame must decode")
-                .to_rgba8();
-            assert_eq!(
-                frame.rgba,
-                expected.into_raw(),
-                "about frame {i} loaded out of order"
-            );
+            assert_source_preserved(frame, &source_image(spec, &dir, i));
         }
     }
 
@@ -536,14 +678,7 @@ mod tests {
         let frames = spec.load_frames(&dir).expect("help frames must decode");
         assert_eq!(frames.len(), HELP_FRAMES);
         for (i, frame) in frames.iter().enumerate() {
-            let expected = image::open(dir.join(spec.frame_name(i)))
-                .expect("source frame must decode")
-                .to_rgba8();
-            assert_eq!(
-                frame.rgba,
-                expected.into_raw(),
-                "help frame {i} loaded out of order"
-            );
+            assert_source_preserved(frame, &source_image(spec, &dir, i));
         }
     }
 
@@ -560,6 +695,126 @@ mod tests {
             "resolved {}",
             dir.display()
         );
+    }
+
+    #[test]
+    fn arbitrary_dimensions_load_successfully() {
+        let spec = SpriteSetSpec::HELP;
+        let dir = temp_dir("arbitrary-dims");
+        let sizes = [(11, 7), (3, 19), (42, 5), (1, 1)];
+        for (i, (w, h)) in sizes.iter().enumerate() {
+            save_solid(&dir, spec, i, *w, *h, [10 + i as u8, 20, 30, 255]);
+        }
+        let frames = spec.load_frames(&dir).expect("arbitrary PNGs must load");
+        assert_eq!(frames.len(), sizes.len());
+        for (i, frame) in frames.iter().enumerate() {
+            assert_eq!(
+                (frame.source_width, frame.source_height),
+                sizes[i],
+                "source dimensions must be preserved for frame {i}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mixed_help_frames_share_a_centered_transparent_canvas() {
+        let spec = SpriteSetSpec::HELP;
+        let dir = temp_dir("mixed-help");
+        // Regression scenario: Help frames differ in dimensions, including
+        // 360x452 and 346x557.
+        let sizes = [(360, 452), (346, 557), (100, 200), (360, 557)];
+        let colors = [
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 0, 255],
+        ];
+        for i in 0..sizes.len() {
+            save_solid(&dir, spec, i, sizes[i].0, sizes[i].1, colors[i]);
+        }
+
+        let frames = spec.load_frames(&dir).expect("mixed Help frames must load");
+        assert_eq!(frames.len(), sizes.len());
+        for frame in &frames {
+            assert_eq!(
+                (frame.canvas_width, frame.canvas_height),
+                (360, 557),
+                "canvas must use the largest required dimensions"
+            );
+            assert_eq!(
+                frame.rgba.len(),
+                (360 * 557 * 4) as usize,
+                "every frame must carry the full shared canvas"
+            );
+        }
+        for (i, frame) in frames.iter().enumerate() {
+            assert_eq!(
+                (frame.source_width, frame.source_height),
+                sizes[i],
+                "frame {i} must retain its original dimensions"
+            );
+            let (offset_x, offset_y) = frame.source_offset();
+            assert_eq!(
+                canvas_pixel(frame, offset_x, offset_y),
+                colors[i],
+                "frame {i} must be centered with its pixels preserved"
+            );
+        }
+        assert_eq!(frames[0].source_offset(), (0, 52));
+        assert_eq!(frames[1].source_offset(), (7, 0));
+        // Transparent padding, not duplicated edge pixels or black fill.
+        assert_eq!(canvas_pixel(&frames[0], 0, 0), [0, 0, 0, 0]);
+        assert_eq!(canvas_pixel(&frames[1], 0, 0), [0, 0, 0, 0]);
+        assert_eq!(canvas_pixel(&frames[2], 359, 556), [0, 0, 0, 0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn source_alpha_and_pixels_are_preserved_in_the_canvas() {
+        let spec = SpriteSetSpec::SWEEP;
+        let dir = temp_dir("alpha-preserved");
+        for i in 0..SWEEP_FRAMES {
+            let color = [10 + i as u8, 40, 90, 128];
+            save_solid(&dir, spec, i, 5 + i as u32, 9 + i as u32, color);
+        }
+        let frames = spec.load_frames(&dir).expect("alpha frames must load");
+        for (i, frame) in frames.iter().enumerate() {
+            let (offset_x, offset_y) = frame.source_offset();
+            let expected = [10 + i as u8, 40, 90, 128];
+            assert_eq!(canvas_pixel(frame, offset_x, offset_y), expected);
+            assert_eq!(canvas_pixel(frame, offset_x + 4, offset_y + 8), expected);
+            if offset_x > 0 {
+                assert_eq!(
+                    canvas_pixel(frame, 0, offset_y),
+                    [0, 0, 0, 0],
+                    "horizontal padding must remain fully transparent"
+                );
+            }
+            if offset_y > 0 {
+                assert_eq!(
+                    canvas_pixel(frame, offset_x, 0),
+                    [0, 0, 0, 0],
+                    "vertical padding must remain fully transparent"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn canvas_uses_checked_arithmetic_and_a_documented_budget() {
+        // Hostile dimensions must fail with a diagnostic, not overflow or
+        // attempt to allocate.
+        let err = checked_canvas_len(SpriteSetSpec::SWEEP, u32::MAX, u32::MAX).unwrap_err();
+        assert!(matches!(err, SpriteError::CanvasTooLarge { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("sweep animation"));
+        assert!(msg.contains("safety budget"));
+        assert!(msg.contains("provide smaller PNGs"));
+
+        let err = checked_canvas_len(SpriteSetSpec::HELP, 100_000, 100_000).unwrap_err();
+        assert!(matches!(err, SpriteError::CanvasTooLarge { .. }));
     }
 
     #[test]
@@ -591,6 +846,21 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_image_fails_gracefully() {
+        let dir = temp_dir("unsupported-help");
+        // A valid 1x1 GIF stored under a .png name: the loader expects PNG
+        // and must report an actionable decode failure.
+        let gif: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\
+            \xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\
+            \x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
+        std::fs::write(dir.join(SpriteSetSpec::HELP.frame_name(0)), gif).unwrap();
+        let err = SpriteSetSpec::HELP.load_frames(&dir).unwrap_err();
+        assert!(matches!(err, SpriteError::Load { .. }));
+        assert!(err.to_string().contains("cannot decode"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn missing_health_frame_diagnostic() {
         let dir = temp_dir("missing-health");
         let err = SpriteSetSpec::HEALTH.load_frames(&dir).unwrap_err();
@@ -604,9 +874,7 @@ mod tests {
     #[test]
     fn incomplete_health_set_reports_first_missing_frame() {
         let dir = temp_dir("incomplete-health");
-        let img = image::RgbaImage::new(HEALTH_WIDTH, HEALTH_HEIGHT);
-        img.save(dir.join(SpriteSetSpec::HEALTH.frame_name(0)))
-            .unwrap();
+        save_solid(&dir, SpriteSetSpec::HEALTH, 0, 8, 8, [1, 2, 3, 255]);
         let err = SpriteSetSpec::HEALTH.load_frames(&dir).unwrap_err();
         assert!(matches!(err, SpriteError::Missing { index: 1, .. }));
         assert!(err.to_string().contains("missing sprite frame 2"));
@@ -616,24 +884,14 @@ mod tests {
     #[test]
     fn corrupt_health_frame_diagnostic() {
         let dir = temp_dir("corrupt-health");
-        std::fs::write(dir.join(SpriteSetSpec::HEALTH.frame_name(0)), b"not a png").unwrap();
+        std::fs::write(
+            dir.join(SpriteSetSpec::HEALTH.frame_name(0)),
+            b"\x89PNG\r\n\x1a\ntruncated",
+        )
+        .unwrap();
         let err = SpriteSetSpec::HEALTH.load_frames(&dir).unwrap_err();
         assert!(matches!(err, SpriteError::Load { .. }));
         assert!(err.to_string().contains("cannot decode"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn bad_health_dimensions_report_health_size() {
-        let dir = temp_dir("bad-health-dim");
-        let img = image::RgbaImage::new(4, 4);
-        img.save(dir.join(SpriteSetSpec::HEALTH.frame_name(0)))
-            .unwrap();
-        let err = SpriteSetSpec::HEALTH.load_frames(&dir).unwrap_err();
-        assert!(matches!(err, SpriteError::BadDimensions { .. }));
-        let msg = err.to_string();
-        assert!(msg.contains("expected 358x575"));
-        assert!(msg.contains("health animation"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -659,20 +917,6 @@ mod tests {
     }
 
     #[test]
-    fn bad_about_dimensions_report_about_size() {
-        let dir = temp_dir("bad-about-dim");
-        let img = image::RgbaImage::new(4, 4);
-        img.save(dir.join(SpriteSetSpec::ABOUT.frame_name(0)))
-            .unwrap();
-        let err = SpriteSetSpec::ABOUT.load_frames(&dir).unwrap_err();
-        assert!(matches!(err, SpriteError::BadDimensions { .. }));
-        let msg = err.to_string();
-        assert!(msg.contains("expected 346x557"));
-        assert!(msg.contains("about animation"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn missing_help_frame_diagnostic() {
         let dir = temp_dir("missing-help");
         let err = SpriteSetSpec::HELP.load_frames(&dir).unwrap_err();
@@ -690,45 +934,6 @@ mod tests {
         let err = SpriteSetSpec::HELP.load_frames(&dir).unwrap_err();
         assert!(matches!(err, SpriteError::Load { .. }));
         assert!(err.to_string().contains("cannot decode"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn bad_help_dimensions_report_help_size() {
-        let dir = temp_dir("bad-help-dim");
-        let img = image::RgbaImage::new(4, 4);
-        img.save(dir.join(SpriteSetSpec::HELP.frame_name(0)))
-            .unwrap();
-        let err = SpriteSetSpec::HELP.load_frames(&dir).unwrap_err();
-        assert!(matches!(err, SpriteError::BadDimensions { .. }));
-        let msg = err.to_string();
-        assert!(msg.contains("expected 346x557"));
-        assert!(msg.contains("help animation"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn bad_dimensions_rejected() {
-        let dir = temp_dir("bad-dim");
-        let img = image::RgbaImage::new(4, 4);
-        img.save(dir.join(SpriteSetSpec::SWEEP.frame_name(0)))
-            .unwrap();
-        let err = SpriteSetSpec::SWEEP.load_frames(&dir).unwrap_err();
-        assert!(matches!(err, SpriteError::BadDimensions { .. }));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn bad_idle_dimensions_report_idle_size() {
-        let dir = temp_dir("bad-idle-dim");
-        let img = image::RgbaImage::new(4, 4);
-        img.save(dir.join(SpriteSetSpec::IDLE.frame_name(0)))
-            .unwrap();
-        let err = SpriteSetSpec::IDLE.load_frames(&dir).unwrap_err();
-        assert!(matches!(err, SpriteError::BadDimensions { .. }));
-        let msg = err.to_string();
-        assert!(msg.contains("expected 367x564"));
-        assert!(msg.contains("idle animation"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

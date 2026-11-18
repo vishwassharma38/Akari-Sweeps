@@ -3,9 +3,17 @@
 Eight nurse-inspired health-assistant frames shown during health/repair
 maintenance (including the health phase of `akariall`):
 
-- `health_001.png` — `health_008.png` (each 358×575, RGB, dark background)
+- `health_001.png` … `health_008.png`
 
-The Rust app validates all eight in order and loads them through the
-shared sprite pipeline without modifying the source PNGs. The frames are
-opaque (no alpha); the loader normalizes them to RGBA for the shared
-renderer.
+Replacement PNGs may use any dimensions and aspect ratio; frames within
+this set may even differ in size. RGB and RGBA PNGs are accepted and alpha
+transparency is preserved. The current art is opaque RGB, so its dark
+background is part of the artwork. At startup the loader measures every
+frame, builds a shared transparent canvas from the largest width and
+height, centers each image on it without stretching or cropping, and
+renders the set proportionally in the terminal. Source PNGs are never
+modified.
+
+To replace this animation, overwrite these eight files, keep their names
+and order, then build and run the application. No manual resizing or
+dimension configuration is required.

@@ -579,10 +579,21 @@ mod tests {
             );
             let spec = expected.sprite_set();
             assert_eq!(app.frames().len(), spec.frame_count);
+            let canvas = (app.frames()[0].canvas_width, app.frames()[0].canvas_height);
+            let max_source = {
+                let width = app.frames().iter().map(|f| f.source_width).max().unwrap();
+                let height = app.frames().iter().map(|f| f.source_height).max().unwrap();
+                (width, height)
+            };
             assert_eq!(
-                (app.frames()[0].width, app.frames()[0].height),
-                (spec.width, spec.height)
+                canvas, max_source,
+                "{} frames must share a canvas sized to the largest source dimensions",
+                spec.dir
             );
+            for frame in app.frames() {
+                assert_eq!((frame.canvas_width, frame.canvas_height), canvas);
+                assert!(frame.source_width > 0 && frame.source_height > 0);
+            }
         }
     }
 

@@ -139,33 +139,52 @@ Directories: `assets/akari/sweep/`, `assets/akari/idle/`,
 (shipped to `<InstallDir>\assets\…`).
 
 ```
-akari_sweep_001.png … akari_sweep_008.png   (each 256×320, RGBA)
-idle_001.png … idle_008.png                (each 367×564, RGB, dark background)
-health_001.png … health_008.png            (each 358×575, RGB, dark background)
-about_001.png … about_004.png              (each 346×557, RGB, dark background)
-help_001.png … help_004.png                (each 346×557, RGB, dark background)
+akari_sweep_001.png … akari_sweep_008.png   (8 frames)
+idle_001.png … idle_008.png                (8 frames)
+health_001.png … health_008.png            (8 frames)
+about_001.png … about_004.png              (4 frames)
+help_001.png … help_004.png                (4 frames)
 ```
 
-The About and Help folders also contain `about_005.png`–`about_008.png`
-and `help_005.png`–`help_008.png`, which are byte-identical duplicates of
-frames 001–004; the loader uses the four canonical poses for each set.
-The non-sweep art is opaque RGB, so its dark background is part of the
-artwork; sweep frames keep their alpha transparency.
+PNG frames may use any dimensions and aspect ratio. Frames within one
+animation may even differ in size; no resizing or source-code change is
+required. RGB and RGBA PNGs are accepted, converted to RGBA internally,
+and alpha transparency is preserved (opaque artwork keeps its own
+background). The About and Help folders also contain
+`about_005.png`–`about_008.png` and `help_005.png`–`help_008.png`, which
+are byte-identical duplicates of frames 001–004; the loader uses the four
+canonical poses for each set.
 
-Validated at startup: each set's frames must decode at its documented
-size, in order. Missing/corrupt frames produce an explicit diagnostic in
-the animation panel — the TUI stays usable. Source PNGs are never modified.
+At startup each set's frames are decoded in filename order and measured
+automatically. The loader builds one shared transparent canvas sized to
+the set's largest width and height, then centers every original image on
+it without stretching, cropping, or rewriting the source PNGs. Missing,
+corrupt, or unsupported frames produce an explicit diagnostic in the
+animation panel — the TUI stays usable. A resource-safety budget catches
+absurd image sizes with a clear message instead of exhausting memory.
+
 Home idle mode plays the book-reading frames; About plays the
 magnifying-glass frames; Help plays its own copy of the magnifying-glass
 frames; cleanup plays sweep frames; health/repair work (including the
 health phase of `akariall`) plays the health frames.
+
+To replace an animation:
+
+1. Open its directory under `assets/akari/`.
+2. Replace the PNGs.
+3. Keep the expected filenames and frame ordering.
+4. Build and run the application.
 
 ## Rendering + animation
 
 - Each half-block cell half is an **area average** over its source pixels
   (box filter): gradients survive downscaling instead of aliasing, and
   alpha composites over the terminal background during averaging.
-- Aspect preserved, centered on both axes (no per-frame drift).
+- Every frame is rendered through its animation set's shared virtual
+  canvas, so one scale/coordinate system is used for the whole loop even
+  when replacement frames have different dimensions.
+- Aspect preserved, centered on both axes (no per-frame drift), with
+  transparent padding kept transparent (no black rectangles).
 - True-color RGB output; terminals without true color degrade gracefully
   to shape-only rendering (no crash, no claim of pixel-exact output).
 - **6 FPS** (≈167 ms/frame) for all animations via deadline scheduling on

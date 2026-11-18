@@ -1,6 +1,6 @@
 # Akari sweep frames
 
-Eight separate, processed sprite images used during maintenance:
+Eight separate sprite images used during maintenance:
 
 - `akari_sweep_001.png`
 - `akari_sweep_002.png`
@@ -11,5 +11,13 @@ Eight separate, processed sprite images used during maintenance:
 - `akari_sweep_007.png`
 - `akari_sweep_008.png`
 
-Each frame must be 256×320 RGBA. The Rust app validates and loads them
-in order without modifying the source PNGs.
+Replacement PNGs may use any dimensions and aspect ratio; frames within
+this set may even differ in size. RGB and RGBA PNGs are accepted and alpha
+transparency is preserved. At startup the loader measures every frame,
+builds a shared transparent canvas from the largest width and height,
+centers each image on it without stretching or cropping, and renders the
+set proportionally in the terminal. Source PNGs are never modified.
+
+To replace this animation, overwrite these eight files, keep their names
+and order, then build and run the application. No manual resizing or
+dimension configuration is required.

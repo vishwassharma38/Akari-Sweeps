@@ -212,7 +212,7 @@ fn render_animation_panel(frame: &mut Frame, app: &App, area: Rect) {
     all.push(Line::from(Span::styled(
         format!(
             "{mode} · terminal approx. ({}×{} source)",
-            shown.width, shown.height
+            shown.source_width, shown.source_height
         ),
         Style::default().fg(Color::DarkGray),
     )));
@@ -422,8 +422,10 @@ mod tests {
         let assets = app.sprites.get_mut(set);
         assets.error = None;
         assets.frames = vec![SpriteFrame {
-            width: 2,
-            height: 4,
+            source_width: 2,
+            source_height: 4,
+            canvas_width: 2,
+            canvas_height: 4,
             rgba: vec![255, 0, 0, 255].repeat(8),
         }];
         let text = buffer_text(160, 40, &app);
@@ -432,6 +434,33 @@ mod tests {
         assert!(
             !text.contains("256×320"),
             "idle caption must not claim sweep dimensions"
+        );
+    }
+
+    #[test]
+    fn caption_reports_source_dimensions_not_padded_canvas_dimensions() {
+        use crate::akari::sprites::SpriteFrame;
+
+        let mut app = crate::app::App::new(AppCommand::Home);
+        let assets = app
+            .sprites
+            .get_mut(crate::akari::animation::AnimationSet::Idle);
+        assets.error = None;
+        assets.frames = vec![SpriteFrame {
+            source_width: 2,
+            source_height: 4,
+            canvas_width: 12,
+            canvas_height: 20,
+            rgba: vec![255, 0, 0, 255].repeat(12 * 20),
+        }];
+        let text = buffer_text(160, 40, &app);
+        assert!(
+            text.contains("2×4 source"),
+            "caption must report the original PNG dimensions"
+        );
+        assert!(
+            !text.contains("12×20 source"),
+            "caption must not report the padded shared canvas"
         );
     }
 
@@ -445,8 +474,10 @@ mod tests {
         let assets = app.sprites.get_mut(AnimationSet::About);
         assets.error = None;
         assets.frames = vec![SpriteFrame {
-            width: 2,
-            height: 4,
+            source_width: 2,
+            source_height: 4,
+            canvas_width: 2,
+            canvas_height: 4,
             rgba: vec![0, 255, 255, 255].repeat(8),
         }];
         let text = buffer_text(160, 40, &app);
@@ -485,8 +516,10 @@ mod tests {
         let assets = app.sprites.get_mut(AnimationSet::Help);
         assets.error = None;
         assets.frames = vec![SpriteFrame {
-            width: 2,
-            height: 4,
+            source_width: 2,
+            source_height: 4,
+            canvas_width: 2,
+            canvas_height: 4,
             rgba: vec![255, 0, 255, 255].repeat(8),
         }];
         let text = buffer_text(160, 40, &app);
@@ -527,14 +560,18 @@ mod tests {
         let mut app = crate::app::App::new(AppCommand::All);
         app.sprites.get_mut(AnimationSet::Sweep).error = None;
         app.sprites.get_mut(AnimationSet::Sweep).frames = vec![SpriteFrame {
-            width: 6,
-            height: 8,
+            source_width: 6,
+            source_height: 8,
+            canvas_width: 6,
+            canvas_height: 8,
             rgba: vec![255, 0, 0, 255].repeat(48),
         }];
         app.sprites.get_mut(AnimationSet::Health).error = None;
         app.sprites.get_mut(AnimationSet::Health).frames = vec![SpriteFrame {
-            width: 2,
-            height: 4,
+            source_width: 2,
+            source_height: 4,
+            canvas_width: 2,
+            canvas_height: 4,
             rgba: vec![0, 255, 0, 255].repeat(8),
         }];
 
@@ -574,8 +611,10 @@ mod tests {
             .get_mut(crate::akari::animation::AnimationSet::Health);
         assets.error = None;
         assets.frames = vec![SpriteFrame {
-            width: 2,
-            height: 4,
+            source_width: 2,
+            source_height: 4,
+            canvas_width: 2,
+            canvas_height: 4,
             rgba: vec![255, 0, 0, 255].repeat(8),
         }];
         let text = buffer_text(160, 40, &app);
