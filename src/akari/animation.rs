@@ -48,10 +48,6 @@ impl AnimationSet {
             Self::Help => SpriteSetSpec::HELP,
         }
     }
-
-    pub fn frame_count(self) -> usize {
-        self.sprite_set().frame_count
-    }
 }
 
 /// Playback state driven by `App::execution_state`.
@@ -75,28 +71,53 @@ pub struct Animator {
 }
 
 impl Animator {
-    pub fn new(set: AnimationSet) -> Self {
+    /// Build an animator for `set` using the number of frames actually
+    /// loaded by `SpriteLibrary` (never a compile-time frame count).
+    pub fn new(set: AnimationSet, frame_count: usize) -> Self {
         Self {
             set,
             mode: AnimationMode::Ambient,
             frame: 0,
             last_advance_ms: 0,
-            frame_count: set.frame_count(),
+            frame_count,
         }
     }
 
     /// Select a new animation set without ever retaining an out-of-range
-    /// frame index from the previous set. The timing anchor is rebased to
+    /// frame index from the previous set. `frame_count` is the selected
+    /// set's actual loaded frame count. The timing anchor is rebased to
     /// `now_ms` so a switch never fast-forwards the new loop.
-    pub fn select_set(&mut self, set: AnimationSet, now_ms: u64) -> bool {
+    pub fn select_set(&mut self, set: AnimationSet, frame_count: usize, now_ms: u64) -> bool {
         if self.set == set {
+            // The same set may have been reloaded/replaced (for example by
+            // tests or a future runtime reload). Keep the current position
+            // when still valid but always adopt the real count.
+            self.sync_frame_count(frame_count);
             return false;
         }
         self.set = set;
-        self.frame_count = set.frame_count();
+        self.frame_count = frame_count;
         self.frame = 0;
         self.last_advance_ms = now_ms;
         true
+    }
+
+    /// Adopt a new loaded frame count, clamping the current position so
+    /// selection and Settled mode can never index past the loaded vector.
+    pub fn sync_frame_count(&mut self, frame_count: usize) {
+        self.frame_count = frame_count;
+        self.frame = if frame_count == 0 {
+            0
+        } else {
+            self.frame.min(frame_count - 1)
+        };
+    }
+
+    /// Number of frames playback currently cycles through (the loaded
+    /// vector length supplied by `SpriteLibrary`).
+    #[allow(dead_code)]
+    pub fn frame_count(&self) -> usize {
+        self.frame_count
     }
 
     pub fn set_mode(&mut self, mode: AnimationMode) {
@@ -142,7 +163,7 @@ impl Animator {
     /// a long stall advances by whole elapsed intervals at once instead
     /// of queuing a backlog (no spiral, no busy loop).
     pub fn tick(&mut self, now_ms: u64) -> bool {
-        if self.mode == AnimationMode::Settled {
+        if self.mode == AnimationMode::Settled || self.frame_count == 0 {
             return false;
         }
         let interval = self.interval_ms();
@@ -161,17 +182,22 @@ impl Animator {
     /// loop polls for at most this long (capped), so frames land on time
     /// without blocking keyboard input.
     pub fn ms_until_next_frame(&self, now_ms: u64) -> u64 {
-        if self.mode == AnimationMode::Settled {
+        if self.mode == AnimationMode::Settled || self.frame_count == 0 {
             return u64::MAX;
         }
         let interval = self.interval_ms();
         interval.saturating_sub(now_ms.wrapping_sub(self.last_advance_ms))
     }
 
-    /// Pure helper for tests: frame index at tick `n`.
+    /// Pure helper for tests: frame index at tick `n`. A set with no loaded
+    /// frames always resolves to index 0 without dividing by zero.
     #[allow(dead_code)]
     pub fn frame_at_tick(tick: u64, count: usize) -> usize {
-        (tick as usize) % count
+        if count == 0 {
+            0
+        } else {
+            (tick as usize) % count
+        }
     }
 }
 
@@ -184,7 +210,7 @@ mod tests {
 
     #[test]
     fn loops_through_eight_frames() {
-        let mut a = Animator::new(AnimationSet::Sweep);
+        let mut a = Animator::new(AnimationSet::Sweep, SWEEP_FRAMES);
         a.set_mode(AnimationMode::Sweeping);
         let mut seen = std::collections::HashSet::new();
         let mut t = 0u64;
@@ -198,7 +224,7 @@ mod tests {
 
     #[test]
     fn settled_holds_last_frame() {
-        let mut a = Animator::new(AnimationSet::Sweep);
+        let mut a = Animator::new(AnimationSet::Sweep, SWEEP_FRAMES);
         a.set_mode(AnimationMode::Sweeping);
         a.tick(SWEEP_INTERVAL_MS);
         a.set_mode(AnimationMode::Settled);
@@ -211,7 +237,7 @@ mod tests {
     fn playback_targets_six_fps_without_drift() {
         // 6 FPS == ~166.7 ms per frame.
         assert_eq!(SWEEP_INTERVAL_MS, 167);
-        let mut a = Animator::new(AnimationSet::Sweep);
+        let mut a = Animator::new(AnimationSet::Sweep, SWEEP_FRAMES);
         a.set_mode(AnimationMode::Sweeping);
         // Simulate 2 s of deadline ticks: expect 12 advances (±1 edge).
         let mut advances = 0;
@@ -230,7 +256,7 @@ mod tests {
 
     #[test]
     fn stall_resyncs_without_backlog_spiral() {
-        let mut a = Animator::new(AnimationSet::Sweep);
+        let mut a = Animator::new(AnimationSet::Sweep, SWEEP_FRAMES);
         a.set_mode(AnimationMode::Sweeping);
         a.tick(167);
         // A 10 s stall: one tick catches up (modulo frame count)…
@@ -251,16 +277,16 @@ mod tests {
 
     #[test]
     fn idle_set_uses_its_own_frame_count() {
-        assert_eq!(AnimationSet::Idle.frame_count(), IDLE_FRAMES);
         assert_eq!(AnimationSet::Idle.sprite_set(), SpriteSetSpec::IDLE);
-        let a = Animator::new(AnimationSet::Idle);
+        let a = Animator::new(AnimationSet::Idle, IDLE_FRAMES);
         assert_eq!(a.set(), AnimationSet::Idle);
+        assert_eq!(a.frame_count(), IDLE_FRAMES);
     }
 
     #[test]
     fn idle_ambient_loops_through_all_frames() {
         let interval = SWEEP_INTERVAL_MS * 3;
-        let mut a = Animator::new(AnimationSet::Idle);
+        let mut a = Animator::new(AnimationSet::Idle, IDLE_FRAMES);
         a.set_mode(AnimationMode::Ambient);
         assert_eq!(a.ms_until_next_frame(0), interval);
         let mut seen = std::collections::HashSet::new();
@@ -276,15 +302,15 @@ mod tests {
 
     #[test]
     fn health_set_uses_its_own_frame_count_and_frames() {
-        assert_eq!(AnimationSet::Health.frame_count(), HEALTH_FRAMES);
         assert_eq!(AnimationSet::Health.sprite_set(), SpriteSetSpec::HEALTH);
-        let a = Animator::new(AnimationSet::Health);
+        let a = Animator::new(AnimationSet::Health, HEALTH_FRAMES);
         assert_eq!(a.set(), AnimationSet::Health);
+        assert_eq!(a.frame_count(), HEALTH_FRAMES);
     }
 
     #[test]
     fn health_sweeping_loops_through_all_frames() {
-        let mut a = Animator::new(AnimationSet::Health);
+        let mut a = Animator::new(AnimationSet::Health, HEALTH_FRAMES);
         a.set_mode(AnimationMode::Sweeping);
         let mut seen = std::collections::HashSet::new();
         let mut t = 0u64;
@@ -299,16 +325,16 @@ mod tests {
 
     #[test]
     fn about_set_uses_its_own_frame_count_and_frames() {
-        assert_eq!(AnimationSet::About.frame_count(), ABOUT_FRAMES);
         assert_eq!(AnimationSet::About.sprite_set(), SpriteSetSpec::ABOUT);
-        let a = Animator::new(AnimationSet::About);
+        let a = Animator::new(AnimationSet::About, ABOUT_FRAMES);
         assert_eq!(a.set(), AnimationSet::About);
+        assert_eq!(a.frame_count(), ABOUT_FRAMES);
     }
 
     #[test]
     fn about_ambient_loops_through_all_frames() {
         let interval = SWEEP_INTERVAL_MS * 3;
-        let mut a = Animator::new(AnimationSet::About);
+        let mut a = Animator::new(AnimationSet::About, ABOUT_FRAMES);
         a.set_mode(AnimationMode::Ambient);
         assert_eq!(a.ms_until_next_frame(0), interval);
         let mut seen = std::collections::HashSet::new();
@@ -324,16 +350,16 @@ mod tests {
 
     #[test]
     fn help_set_uses_its_own_frame_count_and_frames() {
-        assert_eq!(AnimationSet::Help.frame_count(), HELP_FRAMES);
         assert_eq!(AnimationSet::Help.sprite_set(), SpriteSetSpec::HELP);
-        let a = Animator::new(AnimationSet::Help);
+        let a = Animator::new(AnimationSet::Help, HELP_FRAMES);
         assert_eq!(a.set(), AnimationSet::Help);
+        assert_eq!(a.frame_count(), HELP_FRAMES);
     }
 
     #[test]
     fn help_ambient_loops_through_all_frames() {
         let interval = SWEEP_INTERVAL_MS * 3;
-        let mut a = Animator::new(AnimationSet::Help);
+        let mut a = Animator::new(AnimationSet::Help, HELP_FRAMES);
         a.set_mode(AnimationMode::Ambient);
         assert_eq!(a.ms_until_next_frame(0), interval);
         let mut seen = std::collections::HashSet::new();
@@ -357,7 +383,7 @@ mod tests {
 
     #[test]
     fn restart_rewinds_the_current_set_and_timing() {
-        let mut a = Animator::new(AnimationSet::Sweep);
+        let mut a = Animator::new(AnimationSet::Sweep, SWEEP_FRAMES);
         a.set_mode(AnimationMode::Sweeping);
         a.tick(SWEEP_INTERVAL_MS * 3);
         assert!(a.current_frame() > 0);
@@ -373,43 +399,89 @@ mod tests {
 
     #[test]
     fn switching_sets_resets_frame_and_stays_in_range() {
-        let mut a = Animator::new(AnimationSet::Sweep);
+        let mut a = Animator::new(AnimationSet::Sweep, SWEEP_FRAMES);
         a.set_mode(AnimationMode::Sweeping);
         // Advance to the final sweep frame.
         a.tick(SWEEP_INTERVAL_MS * (SWEEP_FRAMES as u64 - 1));
         assert_eq!(a.current_frame(), SWEEP_FRAMES - 1);
 
-        assert!(a.select_set(AnimationSet::Idle, 10_000));
+        for (set, count, now) in [
+            (AnimationSet::Idle, IDLE_FRAMES, 10_000),
+            (AnimationSet::Health, HEALTH_FRAMES, 20_000),
+            (AnimationSet::About, ABOUT_FRAMES, 30_000),
+            (AnimationSet::Help, HELP_FRAMES, 35_000),
+        ] {
+            assert!(a.select_set(set, count, now));
+            assert_eq!(a.frame_count(), count);
+            assert_eq!(a.current_frame(), 0);
+            for step in 1..=(count as u64 * 2) {
+                a.tick(now + step * SWEEP_INTERVAL_MS);
+                assert!(a.current_frame() < count);
+            }
+        }
+
+        assert!(a.select_set(AnimationSet::Sweep, SWEEP_FRAMES, 40_000));
+        assert_eq!(a.frame_count(), SWEEP_FRAMES);
         assert_eq!(a.current_frame(), 0);
-        for step in 1..=(IDLE_FRAMES as u64 * 2) {
+        assert!(!a.select_set(AnimationSet::Sweep, SWEEP_FRAMES, 41_000));
+    }
+
+    #[test]
+    fn settled_mode_uses_the_actual_loaded_frame_count() {
+        for (set, count) in [
+            (AnimationSet::Sweep, 3),
+            (AnimationSet::About, ABOUT_FRAMES),
+            (AnimationSet::Help, HELP_FRAMES),
+        ] {
+            let mut a = Animator::new(set, count);
+            a.set_mode(AnimationMode::Sweeping);
+            a.tick(SWEEP_INTERVAL_MS);
+            a.set_mode(AnimationMode::Settled);
+            assert_eq!(
+                a.current_frame(),
+                count - 1,
+                "{set:?} must hold its actual last loaded frame"
+            );
+            assert_eq!(a.ms_until_next_frame(u64::MAX / 2), u64::MAX);
+        }
+    }
+
+    #[test]
+    fn zero_loaded_frames_are_safe() {
+        let mut a = Animator::new(AnimationSet::About, 0);
+        assert_eq!(a.frame_count(), 0);
+        assert_eq!(a.current_frame(), 0);
+        assert_eq!(a.ms_until_next_frame(0), u64::MAX);
+
+        a.set_mode(AnimationMode::Ambient);
+        assert!(!a.tick(10_000_000), "no frames means no advancement");
+        assert_eq!(a.current_frame(), 0);
+        assert_eq!(Animator::frame_at_tick(7, 0), 0);
+
+        a.set_mode(AnimationMode::Settled);
+        assert_eq!(a.current_frame(), 0, "empty set settles at index 0 safely");
+        assert!(!a.tick(20_000_000));
+    }
+
+    #[test]
+    fn frame_count_updates_clamp_the_current_position() {
+        let mut a = Animator::new(AnimationSet::Help, HELP_FRAMES);
+        a.set_mode(AnimationMode::Sweeping);
+        a.tick(SWEEP_INTERVAL_MS * 7);
+        assert_eq!(a.current_frame(), 7);
+
+        // Same set, fewer loaded frames: adopt the new count and clamp.
+        assert!(!a.select_set(AnimationSet::Help, 3, 10_000));
+        assert_eq!(a.frame_count(), 3);
+        assert_eq!(a.current_frame(), 2);
+        for step in 1..=6 {
             a.tick(10_000 + step * SWEEP_INTERVAL_MS);
-            assert!(a.current_frame() < AnimationSet::Idle.frame_count());
+            assert!(a.current_frame() < 3);
         }
 
-        assert!(a.select_set(AnimationSet::Health, 20_000));
+        // Same set, no frames: index 0 and no division by zero.
+        a.sync_frame_count(0);
         assert_eq!(a.current_frame(), 0);
-        for step in 1..=(HEALTH_FRAMES as u64 * 2) {
-            a.tick(20_000 + step * SWEEP_INTERVAL_MS);
-            assert!(a.current_frame() < AnimationSet::Health.frame_count());
-        }
-
-        assert!(a.select_set(AnimationSet::About, 30_000));
-        assert_eq!(a.current_frame(), 0);
-        for step in 1..=(ABOUT_FRAMES as u64 * 2) {
-            a.tick(30_000 + step * SWEEP_INTERVAL_MS);
-            assert!(a.current_frame() < AnimationSet::About.frame_count());
-        }
-
-        assert!(a.select_set(AnimationSet::Help, 35_000));
-        assert_eq!(a.current_frame(), 0);
-        for step in 1..=(HELP_FRAMES as u64 * 2) {
-            a.tick(35_000 + step * SWEEP_INTERVAL_MS);
-            assert!(a.current_frame() < AnimationSet::Help.frame_count());
-        }
-
-        assert!(a.select_set(AnimationSet::Sweep, 40_000));
-        assert_eq!(a.current_frame(), 0);
-        assert!(a.current_frame() < AnimationSet::Sweep.frame_count());
-        assert!(!a.select_set(AnimationSet::Sweep, 41_000));
+        assert!(!a.tick(100_000));
     }
 }

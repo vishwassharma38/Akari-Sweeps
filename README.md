@@ -142,26 +142,42 @@ Directories: `assets/akari/sweep/`, `assets/akari/idle/`,
 akari_sweep_001.png … akari_sweep_008.png   (8 frames)
 idle_001.png … idle_008.png                (8 frames)
 health_001.png … health_008.png            (8 frames)
-about_001.png … about_004.png              (4 frames)
-help_001.png … help_004.png                (4 frames)
+about_001.png … about_008.png              (8 frames)
+help_001.png … help_008.png                (8 frames)
 ```
+
+Frame filenames are discovered at runtime, not limited to a hardcoded
+count: every `<prefix>_<digits>.png` file in a set's directory is loaded
+and sorted by its numeric index, so `_009`, `_010`, and beyond continue
+the loop naturally. Leading zeros are optional (`help_1.png` and
+`help_001.png` are the same index). Non-PNG files (such as this project's
+README files) are ignored. Numeric gaps, duplicate numeric indices, and
+PNG files that do not match the naming convention produce an explicit
+diagnostic in the animation panel rather than ambiguous playback order.
+
+Every discovered file is kept as its own frame; identical bytes are never
+deduplicated or skipped. The About and Help folders therefore play all
+eight of their files, including `about_005.png`–`about_008.png` and
+`help_005.png`–`help_008.png`, which currently duplicate frames 001–004
+and extend each loop to eight frames. Playback counts come from the
+frames that actually loaded, so adding, removing, or extending a sequence
+needs no source-code change.
 
 PNG frames may use any dimensions and aspect ratio. Frames within one
 animation may even differ in size; no resizing or source-code change is
 required. RGB and RGBA PNGs are accepted, converted to RGBA internally,
 and alpha transparency is preserved (opaque artwork keeps its own
-background). The About and Help folders also contain
-`about_005.png`–`about_008.png` and `help_005.png`–`help_008.png`, which
-are byte-identical duplicates of frames 001–004; the loader uses the four
-canonical poses for each set.
+background).
 
-At startup each set's frames are decoded in filename order and measured
+At startup each set's frames are decoded in numeric order and measured
 automatically. The loader builds one shared transparent canvas sized to
 the set's largest width and height, then centers every original image on
 it without stretching, cropping, or rewriting the source PNGs. Missing,
 corrupt, or unsupported frames produce an explicit diagnostic in the
 animation panel — the TUI stays usable. A resource-safety budget catches
-absurd image sizes with a clear message instead of exhausting memory.
+absurd image sizes with a clear message instead of exhausting memory. A
+set with no usable frames shows the diagnostic instead of animating, and
+the rest of the TUI remains usable.
 
 Home idle mode plays the book-reading frames; About plays the
 magnifying-glass frames; Help plays its own copy of the magnifying-glass
@@ -171,8 +187,10 @@ health phase of `akariall`) plays the health frames.
 To replace an animation:
 
 1. Open its directory under `assets/akari/`.
-2. Replace the PNGs.
-3. Keep the expected filenames and frame ordering.
+2. Replace the PNGs, or add more frames with the next numeric indices.
+3. Keep the `<prefix>_NNN.png` naming and a contiguous 1-based sequence
+   (for example `help_001.png`, `help_002.png`, …). Extra frames play
+   automatically.
 4. Build and run the application.
 
 ## Rendering + animation

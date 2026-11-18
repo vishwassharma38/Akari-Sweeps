@@ -150,6 +150,13 @@ fn phase_from_name(name: &str) -> Option<Phase> {
 
 impl App {
     pub fn new(command: AppCommand) -> Self {
+        let sprites = SpriteLibrary::load_all();
+        // The animator starts from the actual number of frames the library
+        // loaded; `sync_animation` below rebases it onto the initial set.
+        let animator = Animator::new(
+            AnimationSet::Sweep,
+            sprites.get(AnimationSet::Sweep).frames.len(),
+        );
         let mut app = Self {
             command,
             screen: initial_screen(command),
@@ -161,8 +168,8 @@ impl App {
             operations: Vec::new(),
             phase: None,
             progress: ProgressState::default(),
-            animator: Animator::new(AnimationSet::Sweep),
-            sprites: SpriteLibrary::load_all(),
+            animator,
+            sprites,
             summary: None,
             exit_code: 0,
             started: Instant::now(),
@@ -223,7 +230,10 @@ impl App {
             },
         };
         let now_ms = self.elapsed_ms();
-        self.animator.select_set(set, now_ms);
+        // Playback always follows the frames actually present in the loaded
+        // set, including byte-identical duplicates and any replacement art.
+        let frame_count = self.sprites.get(set).frames.len();
+        self.animator.select_set(set, frame_count, now_ms);
         self.animator.set_mode(mode);
     }
 
@@ -578,7 +588,17 @@ mod tests {
                 app.sprite_error()
             );
             let spec = expected.sprite_set();
-            assert_eq!(app.frames().len(), spec.frame_count);
+            assert_eq!(
+                app.frames().len(),
+                8,
+                "{} must load every numbered PNG frame",
+                spec.dir
+            );
+            assert_eq!(
+                app.animator.frame_count(),
+                app.frames().len(),
+                "animator must use the loaded frame count"
+            );
             let canvas = (app.frames()[0].canvas_width, app.frames()[0].canvas_height);
             let max_source = {
                 let width = app.frames().iter().map(|f| f.source_width).max().unwrap();
@@ -638,7 +658,7 @@ mod tests {
         assert_eq!(app.phase, Some(Phase::Repair));
         assert_eq!(app.animator.set(), AnimationSet::Health);
         assert_eq!(app.animator.mode(), AnimationMode::Sweeping);
-        assert!(app.animator.current_frame() < AnimationSet::Health.frame_count());
+        assert!(app.animator.current_frame() < app.animator.frame_count());
         assert_eq!(app.execution, ExecutionState::Running);
     }
 
@@ -711,10 +731,7 @@ mod tests {
         assert_eq!(app.execution, ExecutionState::Done);
         assert_eq!(app.animator.set(), AnimationSet::Health);
         assert_eq!(app.animator.mode(), AnimationMode::Settled);
-        assert_eq!(
-            app.animator.current_frame(),
-            AnimationSet::Health.frame_count() - 1
-        );
+        assert_eq!(app.animator.current_frame(), app.animator.frame_count() - 1);
     }
 
     #[test]
@@ -734,10 +751,7 @@ mod tests {
         assert_eq!(app.execution, ExecutionState::Error);
         assert_eq!(app.animator.set(), AnimationSet::Health);
         assert_eq!(app.animator.mode(), AnimationMode::Settled);
-        assert_eq!(
-            app.animator.current_frame(),
-            AnimationSet::Health.frame_count() - 1
-        );
+        assert_eq!(app.animator.current_frame(), app.animator.frame_count() - 1);
     }
 
     #[test]
@@ -761,7 +775,7 @@ mod tests {
         assert_eq!(done.animator.mode(), AnimationMode::Settled);
         assert_eq!(
             done.animator.current_frame(),
-            AnimationSet::Health.frame_count() - 1
+            done.animator.frame_count() - 1
         );
 
         let mut failed = App::new(AppCommand::Health);
@@ -822,6 +836,83 @@ mod tests {
         assert!(help.summary.is_none());
         assert_eq!(help.animator.set(), AnimationSet::Help);
         assert_eq!(help.animator.mode(), AnimationMode::Ambient);
+    }
+
+    #[test]
+    fn about_and_help_play_every_loaded_frame() {
+        for (cmd, set) in [
+            (AppCommand::About, AnimationSet::About),
+            (AppCommand::Help, AnimationSet::Help),
+        ] {
+            let mut app = App::new(cmd);
+            assert_eq!(app.animator.set(), set);
+            assert_eq!(app.frames().len(), 8, "{set:?} must load eight frames");
+            assert_eq!(app.animator.frame_count(), 8);
+
+            let interval = crate::akari::sprites::SWEEP_INTERVAL_MS * 3;
+            let start = app.elapsed_ms();
+            let mut seen = std::collections::HashSet::new();
+            for step in 1..=8u64 {
+                assert!(
+                    app.animator.tick(start + step * interval),
+                    "{set:?} frame {step} should advance"
+                );
+                seen.insert(app.animator.current_frame());
+            }
+            assert_eq!(
+                seen,
+                (0..8).collect::<std::collections::HashSet<_>>(),
+                "{set:?} must visit frames 0 through 7"
+            );
+            assert_eq!(app.animator.current_frame(), 0, "loop returns to frame 0");
+        }
+    }
+
+    #[test]
+    fn duplicate_about_frames_are_independently_playable() {
+        let mut app = App::new(AppCommand::About);
+        assert_eq!(app.frames().len(), 8);
+        let duplicate = app.frames()[0].rgba.clone();
+        assert_eq!(
+            app.frames()[4].rgba,
+            duplicate,
+            "shipped frames 001 and 005 are byte-identical artwork"
+        );
+
+        let interval = crate::akari::sprites::SWEEP_INTERVAL_MS * 3;
+        let mut now = app.elapsed_ms();
+        for _ in 0..4 {
+            now += interval;
+            app.animator.tick(now);
+        }
+        assert_eq!(
+            app.animator.current_frame(),
+            4,
+            "playback must reach the duplicate frame as its own position"
+        );
+        assert_eq!(app.frames()[app.animator.current_frame()].rgba, duplicate);
+
+        for _ in 0..4 {
+            now += interval;
+            app.animator.tick(now);
+        }
+        assert_eq!(
+            app.animator.current_frame(),
+            0,
+            "the full eight-frame loop includes duplicate indices"
+        );
+    }
+
+    #[test]
+    fn empty_sprite_set_keeps_the_animator_safe() {
+        let mut app = App::new(AppCommand::Home);
+        app.sprites.get_mut(AnimationSet::Idle).frames.clear();
+        app.sprites.get_mut(AnimationSet::Idle).error = Some("missing".into());
+        app.sync_animation();
+        assert_eq!(app.animator.frame_count(), 0);
+        assert_eq!(app.animator.current_frame(), 0);
+        assert!(!app.animator.tick(10_000_000));
+        assert!(app.frames().is_empty());
     }
 
     #[test]
@@ -894,10 +985,7 @@ mod tests {
         );
         app.on_event(ExecEvent::Finished(summary));
         assert_eq!(app.animator.mode(), AnimationMode::Settled);
-        assert_eq!(
-            app.animator.current_frame(),
-            AnimationSet::Sweep.frame_count() - 1
-        );
+        assert_eq!(app.animator.current_frame(), app.animator.frame_count() - 1);
 
         app.mark_started(2);
         assert_eq!(app.animator.set(), AnimationSet::Sweep);
@@ -948,10 +1036,7 @@ mod tests {
         assert_eq!(app.execution, ExecutionState::Done);
         assert_eq!(app.animator.set(), AnimationSet::Sweep);
         assert_eq!(app.animator.mode(), AnimationMode::Settled);
-        assert_eq!(
-            app.animator.current_frame(),
-            AnimationSet::Sweep.frame_count() - 1
-        );
+        assert_eq!(app.animator.current_frame(), app.animator.frame_count() - 1);
     }
 
     #[test]
@@ -988,22 +1073,19 @@ mod tests {
         assert_eq!(app.screen, Screen::Home);
         assert_eq!(app.animator.set(), AnimationSet::Sweep);
         assert_eq!(app.animator.mode(), AnimationMode::Sweeping);
-        assert!(app.animator.current_frame() < AnimationSet::Sweep.frame_count());
+        assert!(app.animator.current_frame() < app.animator.frame_count());
 
         app.execution = ExecutionState::Done;
         app.sync_animation();
         assert_eq!(app.animator.set(), AnimationSet::Sweep);
         assert_eq!(app.animator.mode(), AnimationMode::Settled);
-        assert_eq!(
-            app.animator.current_frame(),
-            AnimationSet::Sweep.frame_count() - 1
-        );
+        assert_eq!(app.animator.current_frame(), app.animator.frame_count() - 1);
 
         app.execution = ExecutionState::Idle;
         app.sync_animation();
         assert_eq!(app.animator.set(), AnimationSet::Idle);
         assert_eq!(app.animator.mode(), AnimationMode::Ambient);
-        assert!(app.animator.current_frame() < AnimationSet::Idle.frame_count());
+        assert!(app.animator.current_frame() < app.animator.frame_count());
     }
 
     #[test]

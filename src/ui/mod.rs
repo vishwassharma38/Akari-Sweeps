@@ -493,6 +493,40 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_about_frame_renders_at_its_own_index() {
+        use crate::akari::animation::AnimationSet;
+        use crate::akari::sprites::SWEEP_INTERVAL_MS;
+
+        let mut app = crate::app::App::new(AppCommand::About);
+        assert_eq!(app.animator.set(), AnimationSet::About);
+        assert_eq!(app.frames().len(), 8);
+        let duplicate = app.frames()[0].rgba.clone();
+        assert_eq!(
+            app.frames()[4].rgba,
+            duplicate,
+            "shipped frame 005 duplicates frame 001"
+        );
+
+        let interval = SWEEP_INTERVAL_MS * 3;
+        let mut now = app.elapsed_ms();
+        for _ in 0..4 {
+            now += interval;
+            app.animator.tick(now);
+        }
+        assert_eq!(
+            app.animator.current_frame(),
+            4,
+            "the duplicate frame is a normal playback position"
+        );
+        let text = buffer_text(160, 40, &app);
+        assert!(text.contains("investigating"));
+        assert!(
+            text.contains("346×557 source"),
+            "duplicate frame must render through the shared canvas"
+        );
+    }
+
+    #[test]
     fn missing_about_frames_show_diagnostic_not_sweep_frames() {
         use crate::akari::animation::AnimationSet;
 
