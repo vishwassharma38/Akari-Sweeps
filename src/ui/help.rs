@@ -1,48 +1,88 @@
 //! Help screen content.
 use crate::commands::COMMAND_CATALOGUE;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 pub fn lines() -> Vec<Line<'static>> {
+    let title_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let mut out = vec![
-        Line::from(Span::styled(
-            "Commands and usage:",
-            Style::default().fg(Color::Cyan),
-        )),
+        Line::from(Span::styled("AKARI-SWEEPS", title_style)),
+        Line::from("Windows maintenance utility"),
         Line::from(""),
+        heading("USAGE"),
+        Line::from("  akari"),
+        Line::from("  akari <command> [options]"),
+        Line::from(""),
+        heading("COMMANDS"),
     ];
-    for cmd in COMMAND_CATALOGUE {
-        out.push(Line::from(vec![
-            Span::styled(
-                format!("{:<14}", cmd.display_invocation()),
-                Style::default().fg(Color::Yellow),
-            ),
-            Span::raw(cmd.description()),
-        ]));
+
+    for (name, description) in [
+        ("clean", "Run the cleanup phase."),
+        ("health", "Run Windows system-image repair."),
+        ("all", "Run cleanup followed by system-image repair."),
+        ("about", "Display application information."),
+        ("help", "Display this help message."),
+        (
+            "update [--check]",
+            "Check for and install a newer Akari release.",
+        ),
+    ] {
+        out.push(row(name, description));
     }
+
     out.extend([
         Line::from(""),
-        Line::from("Run maintenance directly with `akari clean`,"),
-        Line::from("`akari health`, or `akari all`. Cleanup removes supported"),
-        Line::from("Legacy concatenated executable aliases remain supported."),
-        Line::from("temporary files and caches. Health runs Windows image repair."),
-        Line::from("All runs cleanup followed by repair. Maintenance requires"),
-        Line::from("administrator approval on Windows; no work starts if UAC is declined."),
+        heading("OPTIONS"),
+        row("--version", "Display the installed version."),
+        row("--check", "Check for an update without installing it."),
+        Line::from("                    Available with: akari update"),
         Line::from(""),
-        Line::from("Other primary launcher options:"),
-        Line::from("  akari --version       Print the installed version."),
-        Line::from("  akari update          Check for and install a newer Windows release."),
-        Line::from("  akari update --check  Check for a release without installing it."),
-        Line::from("These options are available through `akari`, not maintenance aliases."),
+        heading("INTERACTIVE MODE"),
+        row("1-5", "Select a menu item."),
+        row("/ <name>", "Search for a command by name, then press Enter."),
+        row("back", "Return to the Home screen."),
+        row("akariback", "Return to the Home screen."),
+        row("-", "Return to the Home screen."),
+        row("Esc", "Cancel the current entry or quit the interface."),
+        row("q", "Quit the interface."),
+        row("Ctrl+U", "Clear the current entry."),
+        row("Ctrl+C", "Request cancellation of a running operation."),
         Line::from(""),
-        Line::from("Inside the interface: press 1-5 to select a command, or press /"),
-        Line::from("and type its name, then Enter. Entry is case-insensitive; Esc cancels"),
-        Line::from("and Ctrl+U clears it. Type back, akariback, or - to return Home."),
-        Line::from("Press - to return immediately when the entry field is not focused."),
-        Line::from("Press q or Esc to quit. Ctrl+C requests cancellation of a running"),
-        Line::from("operation; quitting does not forcibly stop its subprocesses."),
+        heading("NOTES"),
+        Line::from("  Maintenance commands require administrator approval"),
+        Line::from("  through Windows UAC."),
+        Line::from("  No maintenance operation starts if administrator"),
+        Line::from("  approval is declined."),
+        Line::from(""),
+        Line::from("  Legacy concatenated executable aliases remain supported"),
+        Line::from("  for backward compatibility."),
+        Line::from(""),
+        Line::from("  Quitting the interface does not forcibly terminate its"),
+        Line::from("  subprocesses."),
     ]);
+
     out
+}
+
+fn heading(label: &'static str) -> Line<'static> {
+    Line::from(Span::styled(
+        label,
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn row(label: &'static str, description: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {label:<18}"),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::raw(description),
+    ])
 }
 
 #[cfg(test)]
@@ -64,15 +104,49 @@ mod tests {
     }
 
     #[test]
-    fn help_documents_every_registered_command_and_early_cli_option() {
+    fn help_uses_the_requested_sections_and_command_layout() {
         let help = text();
+
+        for section in [
+            "AKARI-SWEEPS",
+            "Windows maintenance utility",
+            "USAGE",
+            "COMMANDS",
+            "OPTIONS",
+            "INTERACTIVE MODE",
+            "NOTES",
+        ] {
+            assert!(help.contains(section), "missing help section: {section}");
+        }
+
+        assert!(help.contains("  akari\n  akari <command> [options]"));
+
         for command in COMMAND_CATALOGUE {
-            assert!(help.contains(command.display_invocation()));
-            assert!(help.contains(command.description()));
+            if let Some(name) = command.subcommand_token() {
+                assert!(
+                    help.lines().any(|line| line.starts_with(&format!("  {name} "))),
+                    "help should include the {name} command"
+                );
+            }
         }
-        for usage in ["akari --version", "akari update", "akari update --check"] {
-            assert!(help.contains(usage));
+
+        for expected in [
+            "update [--check]",
+            "--version",
+            "--check",
+            "Available with: akari update",
+            "/ <name>",
+            "akariback",
+            "Ctrl+U",
+            "Ctrl+C",
+            "Maintenance commands require administrator approval",
+            "No maintenance operation starts if administrator",
+            "Legacy concatenated executable aliases remain supported",
+            "Quitting the interface does not forcibly terminate its",
+        ] {
+            assert!(help.contains(expected), "missing help text: {expected}");
         }
+
         for legacy in [
             "akariclean",
             "akarihealth",
@@ -82,9 +156,8 @@ mod tests {
         ] {
             assert!(
                 !help.contains(legacy),
-                "help should display preferred commands"
+                "help should describe preferred commands, not aliases"
             );
         }
-        assert!(!help.contains("akari <name>"));
     }
 }
