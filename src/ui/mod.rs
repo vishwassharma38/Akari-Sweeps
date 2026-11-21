@@ -68,10 +68,10 @@ pub fn render(frame: &mut Frame, app: &App) {
 
 fn screen_subtitle(app: &App) -> String {
     match app.screen {
-        Screen::Home => format!("home — {} · q quit", app.command.public_name()),
+        Screen::Home => format!("home — {} · q quit", app.command.display_invocation()),
         Screen::Maintenance => format!(
             "maintenance — {} · {} · back/- home · q quit",
-            app.command.public_name(),
+            app.command.display_invocation(),
             maintenance::progress_line(app)
         ),
         Screen::About => "about — back/- home · q quit".to_string(),
@@ -389,16 +389,16 @@ mod tests {
         let text = buffer_text(100, 28, &app);
         assert!(text.contains(PRODUCT_LABEL));
         for name in [
-            "akariclean",
-            "akarihealth",
-            "akariall",
-            "akariabout",
-            "akarihelp",
+            "akari clean",
+            "akari health",
+            "akari all",
+            "akari about",
+            "akari help",
         ] {
             assert!(text.contains(name), "missing selectable {name}");
         }
         // `akari` as a bare selectable entry must not appear; the numbered
-        // rows carry only the five public names.
+        // rows carry only the five subcommand invocations.
         assert!(!text.contains("6  "), "must not offer six items");
     }
 
@@ -417,7 +417,7 @@ mod tests {
         assert!(text.contains("0.1.1"));
         assert!(text.contains("run akari update"));
         assert!(text.contains("releases/tag/v0.1.1"));
-        assert!(text.contains("akariclean"), "commands must remain visible");
+        assert!(text.contains("akari clean"), "commands must remain visible");
         assert_eq!(app.screen, crate::app::Screen::Home);
     }
 

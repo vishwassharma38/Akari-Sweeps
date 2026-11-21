@@ -9,7 +9,7 @@
 //! 6. `chkdsk %SystemDrive% /scan` (online scan; no reboot)
 //!
 //! `StartComponentCleanup` was historically BAT `[18/18]` cleanup; it
-//! now runs here so `akariclean` launches zero DISM commands.
+//! now runs here so `akari clean` launches zero DISM commands.
 
 use crate::commands::clean::{
     PermissionFailureKind, classify_permission_failure, record_dism, tail,
@@ -617,7 +617,7 @@ mod tests {
         assert_eq!(results.len(), 6);
         assert!(
             r.cleanup_dir_calls().is_empty(),
-            "akarihealth deleted files: {:?}",
+            "akari health deleted files: {:?}",
             r.cleanup_dir_calls()
                 .iter()
                 .map(|c| c.dir.clone())
@@ -625,7 +625,7 @@ mod tests {
         );
         assert!(
             r.cleanup_program_calls().is_empty(),
-            "akarihealth ran cleanup programs: {:?}",
+            "akari health ran cleanup programs: {:?}",
             r.cleanup_program_calls()
                 .iter()
                 .map(|c| format!("{} {}", c.program, c.args.join(" ")))

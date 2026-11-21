@@ -27,7 +27,9 @@ Restart your terminal after installation, then verify:
 
    akari --version
 
-   akarihelp
+   akari help
+
+The legacy concatenated executable aliases remain supported.
 
 ONLINE ONE-COMMAND INSTALL
 

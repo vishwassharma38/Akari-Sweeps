@@ -1,6 +1,6 @@
 //! Cleanup phase — strict cleaning-only workflow.
 //!
-//! Strict separation: `akariclean` launches zero DISM, SFC, CHKDSK, or
+//! Strict separation: `akari clean` launches zero DISM, SFC, CHKDSK, or
 //! other Windows health/servicing commands, including
 //! `DISM /StartComponentCleanup` (now owned by the health workflow).
 //! Directory targets preserve BAT `:PhaseCleanup` order; `[18/18]` is
@@ -1699,7 +1699,7 @@ mod tests {
         let (results, totals) = run_cleanup_phase(&mut r, &gate);
         assert!(
             r.repair_calls().is_empty(),
-            "akariclean invoked repair commands: {:?}",
+            "akari clean invoked repair commands: {:?}",
             r.repair_calls()
                 .iter()
                 .map(|c| format!("{} {}", c.program, c.args.join(" ")))
@@ -1758,18 +1758,18 @@ mod tests {
             let combined = format!("{prog} {args}");
             assert!(
                 !prog.contains("dism"),
-                "akariclean launched DISM: {combined}"
+                "akari clean launched DISM: {combined}"
             );
             assert!(
                 prog != "sfc" && prog != "chkdsk",
-                "akariclean launched health tool: {combined}"
+                "akari clean launched health tool: {combined}"
             );
             assert!(
                 !args.contains("startcomponentcleanup")
                     && !args.contains("checkhealth")
                     && !args.contains("scanhealth")
                     && !args.contains("restorehealth"),
-                "akariclean launched servicing args: {combined}"
+                "akari clean launched servicing args: {combined}"
             );
         }
         assert!(

@@ -88,7 +88,7 @@ fn real_main() -> i32 {
                         eprintln!(
                             "Elevation declined: the UAC prompt was dismissed, so {} was not started. \
                              Re-run and approve the prompt, or run as administrator.",
-                            command.public_name()
+                            command.display_invocation()
                         );
                         return crate::system::elevation::UAC_CANCELLED_CODE;
                     }
@@ -105,7 +105,7 @@ fn real_main() -> i32 {
                         eprintln!(
                             "Could not request elevation ({msg}); {} was not started. \
                              Right-click the app and choose 'Run as administrator'.",
-                            command.public_name()
+                            command.display_invocation()
                         );
                         return 1;
                     }
@@ -141,7 +141,7 @@ fn real_main() -> i32 {
             let t = crate::commands::normalize_token(first);
             if crate::commands::from_token(&t).is_none() {
                 app.push_log(format!(
-                    "Unknown command '{first}'. Showing home — type akarihelp for the command list."
+                    "Unknown command '{first}'. Showing home — type akari help for the command list."
                 ));
             }
         }
@@ -350,7 +350,7 @@ fn submit_input(app: &mut App, tx: &Sender<ExecEvent>) {
     app.set_input_focus(false);
     app.clear_input();
     if text.trim().is_empty() {
-        app.push_log("Type a command name (e.g. akariclean) or press 1-5.".to_string());
+        app.push_log("Type a command name (e.g. akari clean) or press 1-5.".to_string());
         return;
     }
     // Explicit back-command check keeps navigation intent obvious and
@@ -363,7 +363,7 @@ fn submit_input(app: &mut App, tx: &Sender<ExecEvent>) {
     match crate::commands::command_from_input(&text) {
         Some(cmd) => activate(app, tx, cmd),
         None => app.push_log(format!(
-            "Unknown command '{}'. Valid: akariclean, akarihealth, akariall, akariabout, akarihelp, back, akariback, -.",
+            "Unknown command '{}'. Valid: akari clean, akari health, akari all, akari about, akari help, back, akariback, -.",
             text.trim()
         )),
     }
@@ -396,7 +396,7 @@ fn activate(app: &mut App, tx: &Sender<ExecEvent>, cmd: AppCommand) {
                     .to_string(),
             );
         } else {
-            app.push_log(format!("Switched to {}.", cmd.public_name()));
+            app.push_log(format!("Switched to {}.", cmd.display_invocation()));
         }
         return;
     }
@@ -433,7 +433,7 @@ fn request_in_tui_elevation(
     app.status_line.clear();
     app.push_log(format!(
         "Administrator rights required — requesting elevation for {} via Windows UAC…",
-        cmd.public_name()
+        cmd.display_invocation()
     ));
     if let Some(error) = token_error {
         app.push_log(format!(
@@ -442,14 +442,17 @@ fn request_in_tui_elevation(
     }
     app.push_log("Maintenance has not started. You can navigate while UAC is open.".to_string());
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("akari"));
-    let arg = cmd.public_name().to_string();
+    let arg = cmd
+        .subcommand_token()
+        .expect("maintenance command has a token")
+        .to_string();
     let tx2 = tx.clone();
     std::thread::spawn(move || {
         let mut launcher = crate::system::elevation::RealElevationLauncher;
         use crate::system::elevation::ElevationLauncher as _;
         let outcome = launcher.launch(&exe, &[arg]);
         let _ = tx2.send(ExecEvent::ElevationFinished {
-            command: cmd.public_name().to_string(),
+            command: cmd.display_invocation().to_string(),
             outcome,
         });
     });
@@ -501,7 +504,7 @@ fn spawn_worker(cmd: AppCommand, tx: Sender<ExecEvent>, app: &mut App) {
     let token = RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     app.mark_started(token);
     app.screen = Screen::Maintenance;
-    app.push_log(format!("Starting {}…", cmd.public_name()));
+    app.push_log(format!("Starting {}…", cmd.display_invocation()));
     std::thread::spawn(move || {
         run_requested(cmd, tx);
     });
@@ -669,26 +672,26 @@ mod input_tests {
         }
     }
 
-    /// Test A — Ordinary command typing: `/` then `akariclean` yields exactly
-    /// `akariclean`, even when every keystroke arrives as Press+Release.
+    /// Test A — Ordinary command typing: `/` then `akari clean` yields exactly
+    /// `akari clean`, even when every keystroke arrives as Press+Release.
     #[test]
     fn test_a_ordinary_command_typing_is_exact() {
         let (mut app, tx, mut pending) = fresh();
         tap(&mut app, &tx, &mut pending, press(KeyCode::Char('/')));
         assert!(app.input_focused, "'/' must focus command entry");
-        type_text(&mut app, &tx, &mut pending, "akariclean");
-        assert_eq!(app.input, "akariclean");
+        type_text(&mut app, &tx, &mut pending, "akari clean");
+        assert_eq!(app.input, "akari clean");
     }
 
     /// Test B — All supported commands type exactly once.
     #[test]
     fn test_b_all_supported_commands_type_exactly_once() {
         let cases = [
-            ("akariclean", AppCommand::Clean),
-            ("akarihealth", AppCommand::Health),
-            ("akariall", AppCommand::All),
-            ("akariabout", AppCommand::About),
-            ("akarihelp", AppCommand::Help),
+            ("akari clean", AppCommand::Clean),
+            ("akari health", AppCommand::Health),
+            ("akari all", AppCommand::All),
+            ("akari about", AppCommand::About),
+            ("akari help", AppCommand::Help),
         ];
         for (name, expected) in cases {
             let (mut app, tx, mut pending) = fresh();
@@ -740,7 +743,7 @@ mod input_tests {
         let (mut app, tx, mut pending) = fresh();
         handle_key(&mut app, &tx, press(KeyCode::Char('/')), &mut pending);
         assert!(app.input_focused);
-        for ch in "akariclean".chars() {
+        for ch in "akari clean".chars() {
             let before = app.input.len();
             handle_key(&mut app, &tx, press_char(ch), &mut pending);
             assert_eq!(
@@ -755,7 +758,7 @@ mod input_tests {
                 "release '{ch}' must not mutate the buffer"
             );
         }
-        assert_eq!(app.input, "akariclean");
+        assert_eq!(app.input, "akari clean");
         // Repeat (held key) still inserts — only Release is dropped.
         let before = app.input.len();
         handle_key(
@@ -809,14 +812,14 @@ mod input_tests {
 
         // Enter submits once through the shared dispatch path. Use the safe
         // non-maintenance command so no worker or UAC relaunch runs.
-        type_text(&mut app, &tx, &mut pending, "akariabout");
-        assert_eq!(app.input, "akariabout");
+        type_text(&mut app, &tx, &mut pending, "akari about");
+        assert_eq!(app.input, "akari about");
         let logs_before = app.log.len();
         handle_key(&mut app, &tx, press(KeyCode::Enter), &mut pending);
         assert!(!app.input_focused, "submit must unfocus");
         assert!(app.input.is_empty(), "submit must clear the field");
         assert_eq!(app.screen, Screen::About);
-        let switched = app.log.iter().filter(|l| l.contains("akariabout")).count();
+        let switched = app.log.iter().filter(|l| l.contains("akari about")).count();
         assert_eq!(switched, 1, "Enter must dispatch exactly once");
         // Release of Enter dispatches nothing further.
         handle_key(&mut app, &tx, release(KeyCode::Enter), &mut pending);
@@ -831,7 +834,7 @@ mod input_tests {
         // must not quit when unfocused either.
         let (mut app2, tx2, mut pending2) = fresh();
         handle_key(&mut app2, &tx2, press(KeyCode::Char('/')), &mut pending2);
-        type_text(&mut app2, &tx2, &mut pending2, "akariclean");
+        type_text(&mut app2, &tx2, &mut pending2, "akari clean");
         handle_key(&mut app2, &tx2, press(KeyCode::Esc), &mut pending2);
         assert!(!app2.input_focused);
         assert!(app2.input.is_empty());
@@ -936,13 +939,13 @@ mod input_tests {
         ));
     }
 
-    /// Test G — Full sequence: launch, `/`, type `akariclean` as Press+Release
+    /// Test G — Full sequence: launch, `/`, type `akari clean` as Press+Release
     /// pairs, inspect buffer, Enter resolves to exactly one dispatch.
     ///
     /// The maintenance dispatch itself is verified through the existing
     /// `command_from_input` abstraction (no real cleanup/repair runs); the
     /// shared `submit_input`+`activate` path is exercised for real with the
-    /// safe `akariabout` command to prove Enter dispatches exactly once.
+    /// safe `akari about` command to prove Enter dispatches exactly once.
     #[test]
     fn test_g_full_sequence_dispatches_exactly_once() {
         // 1. Launch the TUI.
@@ -951,11 +954,11 @@ mod input_tests {
         // 2. Press `/`.
         tap(&mut app, &tx, &mut pending, press(KeyCode::Char('/')));
         assert!(app.input_focused);
-        // 3. Type `akariclean` (each physical key = Press+Release).
-        type_text(&mut app, &tx, &mut pending, "akariclean");
+        // 3. Type `akari clean` (each physical key = Press+Release).
+        type_text(&mut app, &tx, &mut pending, "akari clean");
         // 4. Inspect the input buffer.
-        assert_eq!(app.input, "akariclean");
-        assert_eq!(app.input.len(), "akariclean".len());
+        assert_eq!(app.input, "akari clean");
+        assert_eq!(app.input.len(), "akari clean".len());
         // 5-6. Enter: the buffer resolves to Clean exactly once; Release adds
         // nothing. Count resolutions with a mock dispatch counter instead of
         // spawning the real maintenance worker.
@@ -964,7 +967,7 @@ mod input_tests {
         if resolved == Some(AppCommand::Clean) {
             dispatches += 1;
         }
-        assert_eq!(dispatches, 1, "akariclean must dispatch to Clean once");
+        assert_eq!(dispatches, 1, "akari clean must dispatch to Clean once");
         let before = app.input.clone();
         handle_key(&mut app, &tx, release(KeyCode::Enter), &mut pending);
         assert_eq!(app.input, before, "release must not alter pending input");
@@ -975,13 +978,16 @@ mod input_tests {
         // Same shared path end-to-end with a safe command: real Enter submit.
         let (mut app2, tx2, mut pending2) = fresh();
         tap(&mut app2, &tx2, &mut pending2, press(KeyCode::Char('/')));
-        type_text(&mut app2, &tx2, &mut pending2, "akariabout");
+        type_text(&mut app2, &tx2, &mut pending2, "akari about");
         handle_key(&mut app2, &tx2, press(KeyCode::Enter), &mut pending2);
         assert_eq!(app2.screen, Screen::About);
         assert!(app2.input.is_empty());
         handle_key(&mut app2, &tx2, release(KeyCode::Enter), &mut pending2);
         assert_eq!(
-            app2.log.iter().filter(|l| l.contains("akariabout")).count(),
+            app2.log
+                .iter()
+                .filter(|l| l.contains("akari about"))
+                .count(),
             1
         );
     }
@@ -1188,7 +1194,7 @@ mod input_tests {
         assert_eq!(app.screen, Screen::About);
         let (mut app, tx, mut pending) = fresh();
         tap(&mut app, &tx, &mut pending, press(KeyCode::Char('/')));
-        type_text(&mut app, &tx, &mut pending, "akariabout");
+        type_text(&mut app, &tx, &mut pending, "akari about");
         handle_key(&mut app, &tx, press(KeyCode::Enter), &mut pending);
         assert_eq!(app.screen, Screen::About);
         assert_eq!(app.command, AppCommand::About);
@@ -1207,7 +1213,7 @@ mod input_tests {
         // `t` still selects All (maintenance dispatch, elevation-gated on
         // Windows — assert mapping + no crash, not worker side effects).
         assert_eq!(
-            crate::commands::command_from_input("akariall"),
+            crate::commands::command_from_input("akari all"),
             Some(AppCommand::All)
         );
         // `0` never selects anything.

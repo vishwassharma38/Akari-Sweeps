@@ -67,5 +67,5 @@ if ($UserPath -notlike "*$InstallDir*") {
 }
 
 Write-Host ""
-Write-Host "Done. Try: akarihelp   (new terminal)" -ForegroundColor Green
+Write-Host "Done. Try: akari help   (new terminal)" -ForegroundColor Green
 Write-Host "Undo:   .\uninstall.ps1 [-InstallDir '$InstallDir']"

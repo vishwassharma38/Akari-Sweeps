@@ -1,7 +1,7 @@
-//! Combined workflow — `akariall`: cleanup followed by repair.
+//! Combined workflow — `akari all`: cleanup followed by repair.
 //!
 //! The BAT gates repair behind an interactive Y/N prompt. An explicit
-//! `akariall` invocation *is* that consent, so both phases run in order
+//! `akari all` invocation *is* that consent, so both phases run in order
 //! without a second prompt; the final summary still reports each phase
 //! honestly (a failed cleanup does not silently cancel repair, and the
 //! overall status is never "success" when a required phase failed).
@@ -44,7 +44,7 @@ fn emit_combined_progress(
 
 /// Run cleanup, then repair, merging totals like the BAT summary.
 /// `repair_already_entered` is the `REPAIR_ENTERED` guard (always false on
-/// a fresh `akariall` run; exposed for tests).
+/// a fresh `akari all` run; exposed for tests).
 ///
 /// Gates are minted here — the only place holding both — and each phase
 /// receives only its own: cleanup runs strictly before repair, repair
@@ -70,7 +70,7 @@ fn run_all_phases_gated(
     let combined_start = Instant::now();
 
     runner.emit(ExecEvent::Log(
-        "akariall: running cleanup followed by system-image repair.".to_string(),
+        "akari all: running cleanup followed by system-image repair.".to_string(),
     ));
     // Shared operation-level total so the bar spans both phases without
     // resetting. Per-phase `Progress` inits (smaller totals) are ignored
@@ -157,7 +157,7 @@ fn run_all_phases_gated(
     );
     let combined_ms = combined_start.elapsed().as_millis() as u64;
     runner.emit(ExecEvent::Log(format!(
-        "akariall: {combined_done}/{combined_total} task units settled in {combined_ms} ms \
+        "akari all: {combined_done}/{combined_total} task units settled in {combined_ms} ms \
          (task-count approx; external utilities dominate where present)"
     )));
 

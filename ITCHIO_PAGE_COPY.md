@@ -54,11 +54,13 @@ The default installation folder is %LOCALAPPDATA%\Akari-Sweeps.
 | Command | What it does |
 | --- | --- |
 | akari | Open the interactive interface |
-| akariclean | Run cleanup operations only |
-| akarihealth | Run Windows health and repair operations only |
-| akariall | Run cleanup, then health/repair operations, in sequence |
-| akariabout | Show application information |
-| akarihelp | Show usage and command help |
+| akari clean | Run cleanup operations only |
+| akari health | Run Windows health and repair operations only |
+| akari all | Run cleanup, then health/repair operations, in sequence |
+| akari about | Show application information |
+| akari help | Show usage and command help |
+
+The legacy concatenated executables remain supported for existing scripts.
 
 ## Updates
 

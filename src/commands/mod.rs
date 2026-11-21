@@ -1,8 +1,9 @@
 //! Public command registry and executable-name dispatch.
 //!
-//! The six public names share one binary. Dispatch inspects the executable
-//! file stem first (so `akariclean.exe` works with no arguments), then
-//! falls back to the first CLI argument (so `akari.exe clean` also works).
+//! The six installed executable names share one binary. Dispatch inspects
+//! the executable file stem first (so the legacy `akariclean.exe` alias
+//! works with no arguments), then falls back to the first CLI argument
+//! (so `akari.exe clean` also works).
 
 pub mod all;
 pub mod clean;
@@ -14,19 +15,45 @@ pub mod runner;
 pub enum AppCommand {
     /// `akari` — interactive TUI, no maintenance on start.
     Home,
-    /// `akariclean` — cleanup phase only.
+    /// Legacy executable alias `akariclean`; preferred invocation `akari clean`.
     Clean,
-    /// `akarihealth` — system-image repair phase only.
+    /// Legacy executable alias `akarihealth`; preferred invocation `akari health`.
     Health,
-    /// `akariall` — cleanup followed by repair.
+    /// Legacy executable alias `akariall`; preferred invocation `akari all`.
     All,
-    /// `akariabout` — About screen, no maintenance.
+    /// Legacy executable alias `akariabout`; preferred invocation `akari about`.
     About,
-    /// `akarihelp` — Help screen, no maintenance.
+    /// Legacy executable alias `akarihelp`; preferred invocation `akari help`.
     Help,
 }
 
 impl AppCommand {
+    /// Preferred command invocation shown to users.
+    pub fn display_invocation(self) -> &'static str {
+        match self {
+            AppCommand::Home => "akari",
+            AppCommand::Clean => "akari clean",
+            AppCommand::Health => "akari health",
+            AppCommand::All => "akari all",
+            AppCommand::About => "akari about",
+            AppCommand::Help => "akari help",
+        }
+    }
+
+    /// Individual subcommand argument for the shared `akari` executable.
+    pub fn subcommand_token(self) -> Option<&'static str> {
+        match self {
+            AppCommand::Home => None,
+            AppCommand::Clean => Some("clean"),
+            AppCommand::Health => Some("health"),
+            AppCommand::All => Some("all"),
+            AppCommand::About => Some("about"),
+            AppCommand::Help => Some("help"),
+        }
+    }
+
+    /// Legacy executable alias retained for compatibility and dispatch.
+    #[allow(dead_code)]
     pub fn public_name(self) -> &'static str {
         match self {
             AppCommand::Home => "akari",
@@ -185,8 +212,9 @@ pub fn normalize_token(raw: &str) -> String {
     s
 }
 
-/// Map one normalized token to a command. Accepts full public names
-/// (`akariclean`), bare phase words (`clean`), and help flags.
+/// Map normalized command input to a command. Accepts preferred invocations
+/// (`akari clean`), legacy executable names (`akariclean`), bare phase words
+/// (`clean`), and help flags.
 ///
 /// Main-menu navigation: `back`, `akariback`, and `-` all resolve to
 /// [`AppCommand::Home`]. Matching is done on the caller-normalized
@@ -199,6 +227,11 @@ pub fn normalize_token(raw: &str) -> String {
 pub fn from_token(token: &str) -> Option<AppCommand> {
     match token {
         "akari" | "home" | "" => Some(AppCommand::Home),
+        "akari clean" => Some(AppCommand::Clean),
+        "akari health" => Some(AppCommand::Health),
+        "akari all" => Some(AppCommand::All),
+        "akari about" => Some(AppCommand::About),
+        "akari help" => Some(AppCommand::Help),
         // Dedicated, unambiguous return-to-menu commands. `1` is
         // intentionally NOT a back command.
         "back" | "akariback" | "-" => Some(AppCommand::Home),
@@ -307,6 +340,19 @@ mod tests {
     }
 
     #[test]
+    fn legacy_concatenated_tokens_remain_supported() {
+        for (token, expected) in [
+            ("akariclean", AppCommand::Clean),
+            ("akarihealth", AppCommand::Health),
+            ("akariall", AppCommand::All),
+            ("akariabout", AppCommand::About),
+            ("akarihelp", AppCommand::Help),
+        ] {
+            assert_eq!(resolve_command("akari.exe", &[token.to_string()]), expected);
+        }
+    }
+
+    #[test]
     fn phase_selection_is_isolated() {
         assert!(AppCommand::Clean.wants_cleanup() && !AppCommand::Clean.wants_repair());
         assert!(!AppCommand::Health.wants_cleanup() && AppCommand::Health.wants_repair());
@@ -351,7 +397,7 @@ mod tests {
     fn text_entry_agrees_with_number_selection() {
         // Every selectable command: typed name == number-key dispatch.
         for (i, cmd) in SELECTABLE_COMMANDS.iter().enumerate() {
-            let typed = command_from_input(cmd.public_name());
+            let typed = command_from_input(cmd.subcommand_token().unwrap());
             assert_eq!(typed, Some(*cmd));
             assert_eq!(typed, command_from_number((i + 1) as u8));
         }
@@ -410,6 +456,25 @@ mod tests {
                 "akarihelp"
             ]
         );
+    }
+
+    #[test]
+    fn display_invocations_use_akari_subcommands() {
+        assert_eq!(AppCommand::Home.display_invocation(), "akari");
+        assert_eq!(AppCommand::Clean.display_invocation(), "akari clean");
+        assert_eq!(AppCommand::Health.display_invocation(), "akari health");
+        assert_eq!(AppCommand::All.display_invocation(), "akari all");
+        assert_eq!(AppCommand::About.display_invocation(), "akari about");
+        assert_eq!(AppCommand::Help.display_invocation(), "akari help");
+        for (token, command) in [
+            ("clean", AppCommand::Clean),
+            ("health", AppCommand::Health),
+            ("all", AppCommand::All),
+            ("about", AppCommand::About),
+            ("help", AppCommand::Help),
+        ] {
+            assert_eq!(resolve_command("akari.exe", &[token.to_string()]), command);
+        }
     }
 
     #[test]

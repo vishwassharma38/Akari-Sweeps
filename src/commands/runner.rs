@@ -119,7 +119,7 @@ impl MaintenanceRunner for RealRunner {
 /// Repair/health commands are the six `[Repair 1/6]`–`[6/6]` operations:
 /// `DISM /StartComponentCleanup`, `DISM /CheckHealth`,
 /// `DISM /ScanHealth`, `DISM /RestoreHealth`, `sfc /scannow`,
-/// `chkdsk … /scan`. Strict separation: `akariclean` must launch none
+/// `chkdsk … /scan`. Strict separation: `akari clean` must launch none
 /// of these, including component-store cleanup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg(test)]
@@ -229,7 +229,7 @@ pub mod test_support {
         }
 
         /// True when every cleanup side effect finished before the first
-        /// repair side effect started (strict `akariall` ordering).
+        /// repair side effect started (strict `akari all` ordering).
         pub fn cleanup_before_repair(&self) -> bool {
             let last_cleanup = self
                 .calls

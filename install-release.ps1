@@ -897,7 +897,7 @@ function Install-AkariSweeps {
     } else {
         Write-Success "Akari-Sweeps $tag installed to $($result.InstallDirectory)"
     }
-    Write-Host 'Installed commands: akari, akariclean, akarihealth, akariall, akariabout, akarihelp'
+    Write-Host 'Installed commands: akari, akari clean, akari health, akari all, akari about, akari help'
     if ($result.PathAdded) {
         Write-Host "Added to the current user's PATH: $($result.InstallDirectory)" -ForegroundColor Green
         Write-Host 'Restart your terminal (or sign out and back in) before using the commands.'

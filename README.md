@@ -13,7 +13,7 @@ engine.
   servicing/repair commands with identical arguments and exit-code
   semantics, under strict cleaning/repair separation (see below).
   Note: `DISM /StartComponentCleanup` historically ran as BAT `[18/18]`
-  cleanup; it now runs as the first health step so `akariclean`
+  cleanup; it now runs as the first health step so `akari clean`
   launches zero DISM commands.
 - Present live output + per-operation results in a responsive Ratatui TUI
   while Akari animates in a dedicated right-side panel.
@@ -29,7 +29,7 @@ src/commands/mod.rs  command registry, 5-item selection, input mapping,
                      phase identity (Phase) + capability gates (PhaseGate)
 src/commands/clean.rs cleanup plan ([1/18]–[18/18] dirs/programs, no DISM) + executor
 src/commands/health.rs health plan (DISM StartComponentCleanup + Check/Scan/Restore, SFC, CHKDSK) + exit-code mapping
-src/commands/all.rs  akariall sequencing (cleanup, then repair, merged summary)
+src/commands/all.rs  akari all sequencing (cleanup, then repair, merged summary)
 src/commands/runner.rs RealRunner + RecordingRunner (isolation tests)
 src/system/mod.rs    OpStatus/OpResult/ExecEvent/MaintenanceRunner/AppSummary
 src/system/elevation.rs elevation policy, native runas relaunch, cancel handling
@@ -56,13 +56,16 @@ selectable (keys `1`–`5`):
 
 | Key | Command      | Action                                        | Maintenance? |
 | --- | ------------ | --------------------------------------------- | ------------ |
-| `1` | `akariclean` | Cleanup only, zero DISM/SFC/CHKDSK            | Cleanup only |
-| `2` | `akarihealth`| Health/servicing only ([Repair 1/6]–[6/6])   | Repair only  |
-| `3` | `akariall`   | Cleanup, then health, then combined summary   | Both, in order |
-| `4` | `akariabout` | About (name, Cargo version, purpose, repo/license) | No       |
-| `5` | `akarihelp`  | Usage, per-command help, exit instructions    | No           |
+| `1` | `akari clean` | Cleanup only, zero DISM/SFC/CHKDSK            | Cleanup only |
+| `2` | `akari health`| Health/servicing only ([Repair 1/6]–[6/6])   | Repair only  |
+| `3` | `akari all`   | Cleanup, then health, then combined summary   | Both, in order |
+| `4` | `akari about` | About (name, Cargo version, purpose, repo/license) | No       |
+| `5` | `akari help`  | Usage, per-command help, exit instructions    | No           |
 
-`akari <name>` also works (`akari clean`, `akari --help`, …).
+The same subcommands can be run directly from PowerShell, for example
+`akari clean`, `akari health`, `akari all`, `akari about`, and `akari help`.
+The existing concatenated executables (`akariclean`, `akarihealth`,
+`akariall`, `akariabout`, and `akarihelp`) remain supported for compatibility.
 
 ### Update commands (CLI, outside the TUI)
 
@@ -72,8 +75,8 @@ akari update --check   # query GitHub, compare versions, download nothing
 akari update           # download, verify, and install the latest release
 ```
 
-Only the primary `akari` launcher accepts these commands. Maintenance
-aliases (`akariclean`, `akarihealth`, `akariall`) never make update
+Only the primary `akari` launcher accepts these updater options. Maintenance
+subcommands (`akari clean`, `akari health`, `akari all`) never make update
 network requests and keep their existing argument behavior.
 
 ### Command-entry field
@@ -90,13 +93,13 @@ Other keys: `t` all · `h` home · `↑/↓` scroll · `q`/`Esc` quit ·
 
 ### Cleanup/repair isolation (guaranteed, strict)
 
-- `akariclean` runs only cleanup. It invokes zero DISM commands of any
+- `akari clean` runs only cleanup. It invokes zero DISM commands of any
   kind (including `/StartComponentCleanup`), zero SFC, zero CHKDSK.
   `[18/18]` is Disk Cleanup + SilentCleanup only.
-- `akarihealth` runs only the six health/servicing commands (DISM
+- `akari health` runs only the six health/servicing commands (DISM
   StartComponentCleanup, Check/Scan/RestoreHealth, SFC, CHKDSK). It
   deletes no files and invokes no cleanup.
-- `akariall` runs cleanup to completion, then repair — never concurrent,
+- `akari all` runs cleanup to completion, then repair — never concurrent,
   never a second cleanup. **Failure policy:** cleanup errors never block
   repair, but they poison the combined summary, so overall status/exit
   code can never report success when a required phase failed.
@@ -121,12 +124,12 @@ and maintenance fails closed until a relaunched child verifies its token.
   warning. Selecting maintenance requests UAC again in a background thread;
   the TUI stays navigable, and cancellation or another launch failure starts
   no maintenance and does not mark an operation as running.
-- Direct maintenance entry points (`akariclean`, `akarihealth`, `akariall`,
-  and `akari clean|health|all`) request elevation before terminal or
+- Direct maintenance entry points (`akari clean`, `akari health`, `akari all`,
+  and the legacy executable aliases) request elevation before terminal or
   maintenance initialization. UAC cancellation returns `1223`; other shell,
   executable, or process-wait failures return an error with their diagnostic.
   Neither path runs cleanup, DISM, SFC, or CHKDSK in the parent.
-- `akariabout`, `akarihelp`, and informational TUI commands remain available
+- `akari about`, `akari help`, and informational TUI commands remain available
   without elevation. `akari --version` and updater CLI commands retain their
   early handling and do not trigger a UAC prompt.
 - The `ELEVATED` marker is appended once and is not treated as a public
@@ -159,11 +162,11 @@ maintenance started.
 decline UAC, verify the request clears, no worker or operation is marked
 running, and navigation remains available.
 
-**D. Direct maintenance startup:** launch `akariclean`, `akarihealth`, and
-`akariall` from a non-admin terminal, approve each UAC prompt, and verify work
+**D. Direct maintenance startup:** launch `akari clean`, `akari health`, and
+`akari all` from a non-admin terminal, approve each UAC prompt, and verify work
 starts only in the elevated child.
 
-**E. Direct maintenance cancellation:** launch `akariall`, decline UAC, and
+**E. Direct maintenance cancellation:** launch `akari all`, decline UAC, and
 verify neither phase runs, a cancellation message appears, and the process
 returns `1223`.
 
@@ -174,7 +177,7 @@ administrator terminal; verify that no second UAC prompt appears.
 CHKDSK permission failures remain failed results and identify access denial
 or required elevation while retaining useful command output.
 
-**H. Full `akariall` workflow:** in a disposable VM, verify cleanup completes
+**H. Full `akari all` workflow:** in a disposable VM, verify cleanup completes
 before repair, the four DISM operations and then SFC/CHKDSK run elevated, and
 the final summary and exit code match the real outcomes.
 
@@ -226,7 +229,7 @@ the rest of the TUI remains usable.
 Home idle mode plays the book-reading frames; About plays the
 magnifying-glass frames; Help plays its own copy of the magnifying-glass
 frames; cleanup plays sweep frames; health/repair work (including the
-health phase of `akariall`) plays the health frames.
+health phase of `akari all`) plays the health frames.
 
 To replace an animation:
 
@@ -291,7 +294,7 @@ terminal after the first installation, then verify:
 
 ~~~powershell
 akari --version
-akarihelp
+akari help
 ~~~
 
 ### Install from the itch.io page
@@ -371,7 +374,7 @@ forwarded, exit codes native).
 ```
 
 Adds the install dir to the **user** PATH (machine PATH untouched).
-Restart the terminal, then `akarihelp` should open the TUI. This developer
+Restart the terminal, then `akari help` should open the TUI. This developer
 path still requires Rust/Cargo; normal users should use
 `install-release.ps1` instead.
 
@@ -433,9 +436,9 @@ When a newer release exists, the Home screen shows a yellow update banner
 with the release page and the Output log gets a matching entry.
 
 Automatic checks **only notify**. They never download, install, or replace
-anything; the user must explicitly run `akari update`. Maintenance aliases
-(`akariclean`, `akarihealth`, `akariall`) do not perform automatic checks,
-and `akariabout` / `akarihelp` do not either.
+anything; the user must explicitly run `akari update`. Maintenance commands
+(`akari clean`, `akari health`, `akari all`) do not perform automatic checks,
+and `akari about` / `akari help` do not either.
 
 ### Security notes
 
@@ -576,7 +579,7 @@ CHKDSK `0/1/2/3+` mapped per BAT. Locked files are skipped + counted
   procedure above); the decision/relaunch/quote logic is unit-tested.
 - Disk-space deltas include concurrent drive activity (same caveat as BAT).
 - Animation is a scaled approximation, not pixel-exact blitting.
-- `akariall` runs repair without a second Y/N gate — the explicit alias
+- `akari all` runs repair without a second Y/N gate — the explicit alias
   is treated as consent (documented deviation from the BAT's prompt).
 
 ## Additional animation sets

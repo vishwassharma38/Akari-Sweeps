@@ -1,7 +1,7 @@
 # Akari health frames
 
 Nurse-inspired health-assistant frames shown during health/repair
-maintenance (including the health phase of `akariall`). Every numbered
+maintenance (including the health phase of `akari all`). Every numbered
 `health_<digits>.png` file in this directory is part of the animation.
 
 Frames are discovered automatically: every `health_<digits>.png` file is

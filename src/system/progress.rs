@@ -13,7 +13,7 @@
 //!   the running DISM/SFC/CHKDSK holds at the last defensible percentage
 //!   with a `working…` marker — no fabricated intra-command percentages,
 //!   no log-line parsing as progress.
-//! - Combined (`akariall`): shared total `cleanup_total + 6`, completed
+//! - Combined (`akari all`): shared total `cleanup_total + 6`, completed
 //!   accumulates across phases, never resets, never moves backward.
 //! - Failures: reaching `completed == total` with any failure renders as
 //!   `FAILED`, never as unconditional success. Cancellation leaves progress

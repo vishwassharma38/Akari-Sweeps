@@ -99,7 +99,7 @@ pub struct App {
     pub log: Vec<String>,
     pub operations: Vec<OpItem>,
     /// Latest maintenance phase reported by the worker. Selection uses the
-    /// phase (not just the command alias), so `akariall` can show sweep
+    /// phase (not just the command alias), so `akari all` can show sweep
     /// during cleanup and health during repair. Reset when a new run starts.
     pub phase: Option<Phase>,
     /// Evidence-based operation progress (single coherent model for
@@ -166,7 +166,7 @@ impl App {
             // Maintenance aliases auto-start; Home/informational screens wait.
             execution: initial_execution(command),
             log: vec![format!(
-                "{PRODUCT_LABEL} — type a command (e.g. akarihelp for help)."
+                "{PRODUCT_LABEL} — type a command (e.g. akari help for help)."
             )],
             operations: Vec::new(),
             phase: None,
@@ -400,7 +400,7 @@ impl App {
             return;
         }
         if p.total > self.progress.total {
-            // Larger combined total arriving (e.g. akariall init after a
+            // Larger combined total arriving (e.g. akari all init after a
             // phase init): keep accumulated completions, adopt the total.
             let completed = self.progress.completed;
             let failed = self.progress.failed || p.failed;
@@ -633,7 +633,7 @@ mod tests {
         app.navigate(AppCommand::Help);
         app.elevation_pending = true;
         app.on_event(ExecEvent::ElevationFinished {
-            command: "akariall".to_string(),
+            command: "akari all".to_string(),
             outcome: crate::system::elevation::RelaunchOutcome::Cancelled,
         });
         assert_eq!(app.screen, Screen::Help);

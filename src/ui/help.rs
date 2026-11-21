@@ -14,7 +14,7 @@ pub fn lines() -> Vec<Line<'static>> {
     for cmd in COMMAND_CATALOGUE {
         out.push(Line::from(vec![
             Span::styled(
-                format!("{:<14}", cmd.public_name()),
+                format!("{:<14}", cmd.display_invocation()),
                 Style::default().fg(Color::Yellow),
             ),
             Span::raw(cmd.description()),
@@ -22,8 +22,9 @@ pub fn lines() -> Vec<Line<'static>> {
     }
     out.extend([
         Line::from(""),
-        Line::from("Maintenance aliases can also be run as `akari clean`,"),
+        Line::from("Run maintenance directly with `akari clean`,"),
         Line::from("`akari health`, or `akari all`. Cleanup removes supported"),
+        Line::from("Legacy concatenated executable aliases remain supported."),
         Line::from("temporary files and caches. Health runs Windows image repair."),
         Line::from("All runs cleanup followed by repair. Maintenance requires"),
         Line::from("administrator approval on Windows; no work starts if UAC is declined."),
@@ -66,11 +67,23 @@ mod tests {
     fn help_documents_every_registered_command_and_early_cli_option() {
         let help = text();
         for command in COMMAND_CATALOGUE {
-            assert!(help.contains(command.public_name()));
+            assert!(help.contains(command.display_invocation()));
             assert!(help.contains(command.description()));
         }
         for usage in ["akari --version", "akari update", "akari update --check"] {
             assert!(help.contains(usage));
+        }
+        for legacy in [
+            "akariclean",
+            "akarihealth",
+            "akariall",
+            "akariabout",
+            "akarihelp",
+        ] {
+            assert!(
+                !help.contains(legacy),
+                "help should display preferred commands"
+            );
         }
         assert!(!help.contains("akari <name>"));
     }

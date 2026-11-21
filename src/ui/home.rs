@@ -44,7 +44,7 @@ pub fn lines(notice: Option<&UpdateNotice>, restricted: bool) -> Vec<Line<'stati
     for (i, cmd) in SELECTABLE_COMMANDS.iter().enumerate() {
         out.push(Line::from(vec![
             Span::styled(
-                format!("  {}  {:<12}", i + 1, cmd.public_name()),
+                format!("  {}  {:<14}", i + 1, cmd.display_invocation()),
                 Style::default().fg(Color::Yellow),
             ),
             Span::raw(format!("— {}", cmd.description())),
@@ -56,6 +56,9 @@ pub fn lines(notice: Option<&UpdateNotice>, restricted: bool) -> Vec<Line<'stati
     ));
     out.push(Line::from(
         "Cleanup/repair start only from their explicit commands.",
+    ));
+    out.push(Line::from(
+        "CLI aliases such as akariclean remain supported for compatibility.",
     ));
     out.push(Line::from(
         "After an operation: type back, akariback, or press - to return here.",
