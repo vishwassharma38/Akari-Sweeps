@@ -151,6 +151,24 @@ pub struct ProgramOutcome {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+    /// Present only when the OS failed to create the process. This keeps a
+    /// spawn failure distinct from a child that exits with the same code.
+    pub launch_error: Option<ProcessLaunchFailure>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessLaunchFailureKind {
+    ElevationRequired,
+    AccessDenied,
+    NotFound,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessLaunchFailure {
+    pub kind: ProcessLaunchFailureKind,
+    pub raw_os_error: Option<i32>,
+    pub message: String,
 }
 
 /// Events streamed from the background worker to the UI thread.
@@ -182,6 +200,15 @@ pub enum ExecEvent {
     Progress(ProgressState),
     Finished(AppSummary),
     Error(String),
+    /// Completion of a background self-elevation request. This is separate
+    /// from maintenance worker state: a cancelled request never becomes a
+    /// phantom running operation.
+    ElevationFinished {
+        command: String,
+        outcome: crate::system::elevation::RelaunchOutcome,
+    },
+    /// A worker boundary check failed before any maintenance side effect.
+    MaintenanceBlocked(String),
     /// Result of the non-blocking automatic release check. Strictly a
     /// notification: nothing is downloaded or installed from this event.
     UpdateAvailable(UpdateNotice),

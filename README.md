@@ -32,9 +32,9 @@ src/commands/health.rs health plan (DISM StartComponentCleanup + Check/Scan/Rest
 src/commands/all.rs  akariall sequencing (cleanup, then repair, merged summary)
 src/commands/runner.rs RealRunner + RecordingRunner (isolation tests)
 src/system/mod.rs    OpStatus/OpResult/ExecEvent/MaintenanceRunner/AppSummary
-src/system/elevation.rs UAC decision, runas relaunch, cancel handling
+src/system/elevation.rs elevation policy, native runas relaunch, cancel handling
 src/system/process.rs run_program_capture(), program_exists()
-src/system/windows.rs is_elevated() (fltmc, like BAT), free_space_kb()
+src/system/windows.rs TokenElevation check, free_space_kb()
 src/akari/sprites.rs animation-set discovery/validation/loading (RGBA output)
 src/akari/animation.rs Animator (idle/sweep/health/about/help sets; Ambient/Sweeping/Settled), 6 FPS deadline
 src/ui/*             Ratatui layout: header, main/output, animation, entry
@@ -106,31 +106,81 @@ Other keys: `t` all · `h` home · `↑/↓` scroll · `q`/`Esc` quit ·
 
 ## Administrator elevation (UAC)
 
-Detection uses the BAT's `fltmc` probe — a real privilege check.
+Windows elevation is detected from the current process access token using
+`OpenProcessToken` and `GetTokenInformation(TokenElevation)`. A successful
+negative result means restricted mode; an API error remains an unknown state
+and maintenance fails closed until a relaunched child verifies its token.
 
-- Maintenance aliases (`akariclean`, `akarihealth`, `akariall`) started
-  without elevation relaunch the **same executable** with the **same
-  arguments** through the Shell `runas` verb
-  (`Start-Process -Verb RunAs -Wait`), so aliases keep working after
-  elevation. Paths with spaces are quoted; assets resolve from the exe
-  directory; PATH is untouched.
-- The relaunch is synchronous: the parent propagates the elevated
-  child's exit code. Declining UAC yields exit `1223` with an actionable
-  message — maintenance is never started, never reported as started.
-- An `ELEVATED` marker prevents loops: a relaunched copy that is still
-  not elevated aborts with instructions instead of relaunching again.
-- Informational screens (home/about/help) need no elevation. From inside
-  a non-elevated TUI, maintenance requests elevation in a background
-  thread (UI stays responsive); declining logs a message and runs nothing.
+- The plain `akari` launcher requests standard Windows UAC elevation before
+  terminal initialization. If approved, the same executable starts with the
+  original arguments and an internal `ELEVATED` marker. The original process
+  waits for that child and propagates its exit code, so only the elevated
+  process owns the TUI. If the prompt is declined or the launch fails, the
+  original process continues in restricted mode.
+- Restricted mode keeps Home, About, and Help usable and displays a clear
+  warning. Selecting maintenance requests UAC again in a background thread;
+  the TUI stays navigable, and cancellation or another launch failure starts
+  no maintenance and does not mark an operation as running.
+- Direct maintenance entry points (`akariclean`, `akarihealth`, `akariall`,
+  and `akari clean|health|all`) request elevation before terminal or
+  maintenance initialization. UAC cancellation returns `1223`; other shell,
+  executable, or process-wait failures return an error with their diagnostic.
+  Neither path runs cleanup, DISM, SFC, or CHKDSK in the parent.
+- `akariabout`, `akarihelp`, and informational TUI commands remain available
+  without elevation. `akari --version` and updater CLI commands retain their
+  early handling and do not trigger a UAC prompt.
+- The `ELEVATED` marker is appended once and is not treated as a public
+  command. A marked child verifies its actual token and aborts if Windows did
+  not grant elevation, preventing relaunch loops.
+- The launcher uses `ShellExecuteExW` with the `runas` verb, passes the
+  current executable, safely quotes Windows arguments, and preserves the
+  current working directory. It waits on the returned process handle and
+  propagates the child's exit code. Only Windows `ERROR_CANCELLED` (`1223`)
+  is reported as a declined prompt; other errors remain launch failures.
+- A final token check occurs immediately before any maintenance runner is
+  constructed and again at the worker boundary. Process creation failures
+  retain a structured reason, and DISM, SFC, and CHKDSK report access-denied
+  and elevation-required results separately from missing tools and unrelated
+  failures.
 
-### Manual Windows verification (UAC can't be automated in CI)
+### Manual Windows verification (UAC cannot be automated in CI)
 
-1. Non-admin terminal: `akariclean` → approve UAC → cleanup runs elevated.
-2. Same, but decline UAC → "Elevation declined … was not started.",
-   exit `1223`, no maintenance output.
-3. `akari` → home works unelevated; press `1` → elevation requested,
-   declining keeps the TUI usable with an explanatory log line.
-4. `akarihelp` works fully unelevated.
+Use a disposable Windows 10/11 VM for servicing integration tests. Do not run
+the destructive full workflow against a primary personal installation.
+
+**A. Normal interactive startup:** launch `akari` from a non-admin terminal,
+approve UAC, verify the elevated TUI opens and only one TUI is active.
+
+**B. Declined interactive startup:** launch `akari`, decline UAC, verify the
+restricted warning and that Home, About, and Help remain usable with no
+maintenance started.
+
+**C. Declined in-TUI maintenance:** request maintenance in restricted mode,
+decline UAC, verify the request clears, no worker or operation is marked
+running, and navigation remains available.
+
+**D. Direct maintenance startup:** launch `akariclean`, `akarihealth`, and
+`akariall` from a non-admin terminal, approve each UAC prompt, and verify work
+starts only in the elevated child.
+
+**E. Direct maintenance cancellation:** launch `akariall`, decline UAC, and
+verify neither phase runs, a cancellation message appears, and the process
+returns `1223`.
+
+**F. Already elevated:** launch `akari` and each maintenance alias from an
+administrator terminal; verify that no second UAC prompt appears.
+
+**G. Permission diagnostics:** in a controlled VM, verify DISM, SFC, and
+CHKDSK permission failures remain failed results and identify access denial
+or required elevation while retaining useful command output.
+
+**H. Full `akariall` workflow:** in a disposable VM, verify cleanup completes
+before repair, the four DISM operations and then SFC/CHKDSK run elevated, and
+the final summary and exit code match the real outcomes.
+
+Automated policy, quoting, and permission tests use mocks and do not display
+UAC dialogs or invoke servicing tools. They are not substitutes for these
+manual Windows checks.
 
 ## Sprite assets
 

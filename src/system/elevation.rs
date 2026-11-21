@@ -1,161 +1,171 @@
-//! Administrator-elevation handling (Requirement 2).
+//! Controlled administrator elevation and relaunch policy.
 //!
-//! - Detection reuses the BAT's `fltmc` probe
-//!   ([`crate::system::windows::is_elevated`]): a real Windows privilege
-//!   check, not a username or terminal-title heuristic.
-//! - Relaunch uses the Windows Shell `runas` verb (`Start-Process -Verb
-//!   RunAs`), targeting the actual application executable with the
-//!   original arguments preserved — never a BAT wrapper, never a PATH
-//!   change.
-//! - The synchronous `-Wait` relaunch lets the parent detect UAC
-//!   cancellation (exit `1223`) and propagate the elevated child's exit
-//!   code instead of guessing.
-//!
-//! [`ElevationDecision::decide`] is pure and fully unit-tested; actual UAC
-//! interaction cannot be automated and is covered by the manual procedure
-//! in the README.
+//! Policy is kept separate from the Windows launcher so tests never open a
+//! UAC dialog. The production launcher uses ShellExecuteExW with the `runas`
+//! verb and waits on its process handle to propagate the child exit code.
 
 use std::path::Path;
 
-/// Marker appended when relaunching elevated (BAT-consistent: the BAT uses
-/// `ELEVATED`). Prevents infinite elevation loops: a relaunched copy that
-/// is still not elevated aborts instead of relaunching again.
+/// Marker appended to elevated relaunches. A child carrying the marker must
+/// verify its token and abort if Windows did not grant elevation.
 pub const ELEVATION_MARKER: &str = "ELEVATED";
 
-/// UAC decline sentinel (`ERROR_CANCELLED`). Returned by the relaunch
-/// wrapper when `Start-Process -Verb RunAs` throws instead of starting
-/// the child (user declined, or elevation is unavailable).
+/// Windows `ERROR_CANCELLED`, the only ShellExecuteExW result classified as
+/// a user-declined UAC prompt.
 pub const UAC_CANCELLED_CODE: i32 = 1223;
 
-/// What startup (or an in-TUI maintenance request) should do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenState {
+    Elevated,
+    NotElevated,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElevationIntent {
+    /// The plain `akari` launcher requests elevation but may continue in a
+    /// restricted TUI if the user declines or launch fails.
+    InteractiveStartup,
+    /// A direct maintenance entry point must not continue without elevation.
+    Maintenance,
+    /// About and Help remain available without elevation.
+    Informational,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElevationDecision {
-    /// Run normally. Either already elevated, elevation is inapplicable
-    /// (non-Windows dev/test), or the requested screen is non-destructive.
     Proceed,
-    /// Relaunch the same executable elevated, then exit with its result.
     RelaunchElevated,
-    /// Do not run maintenance and do not relaunch (e.g. the elevated
-    /// relaunch still lacks privileges — relaunching again would loop).
     Abort,
 }
 
-/// Pure relaunch policy. `starts_maintenance`: the requested command needs
-/// admin-only operations. `marker_present`: this process is already the
-/// elevated relaunch.
+/// Whether an unsuccessful elevation request may return to the caller's
+/// unelevated interactive TUI. Direct maintenance launches must abort.
+pub fn should_continue_restricted(intent: ElevationIntent, outcome: &RelaunchOutcome) -> bool {
+    intent == ElevationIntent::InteractiveStartup
+        && matches!(
+            outcome,
+            RelaunchOutcome::Cancelled | RelaunchOutcome::Failed(_)
+        )
+}
+
+/// Pure policy for startup. A marked relaunch that is not actually elevated
+/// always aborts, preventing recursive prompts and unelevated maintenance.
 pub fn decide(
-    starts_maintenance: bool,
-    elevated: bool,
+    intent: ElevationIntent,
+    token: TokenState,
     is_windows: bool,
     marker_present: bool,
 ) -> ElevationDecision {
-    if elevated {
-        return ElevationDecision::Proceed;
-    }
-    if !starts_maintenance {
-        // Informational screens (home/about/help) are safe to view
-        // without elevation.
+    if token == TokenState::Elevated {
         return ElevationDecision::Proceed;
     }
     if !is_windows {
-        // No UAC off Windows; proceed so dev/test can exercise the TUI.
-        // Callers still warn that real maintenance targets Windows.
         return ElevationDecision::Proceed;
     }
-    if marker_present {
-        return ElevationDecision::Abort;
+    match intent {
+        ElevationIntent::Informational => ElevationDecision::Proceed,
+        _ if marker_present => ElevationDecision::Abort,
+        ElevationIntent::InteractiveStartup | ElevationIntent::Maintenance => {
+            ElevationDecision::RelaunchElevated
+        }
     }
-    ElevationDecision::RelaunchElevated
 }
 
-/// True when argv already carries the elevation marker.
+/// Central fail-closed authorization check used immediately before any
+/// maintenance worker starts and again at the worker boundary.
+pub fn require_maintenance_privileges(
+    is_windows: bool,
+    token: Result<bool, String>,
+) -> Result<(), String> {
+    if !is_windows {
+        return Ok(());
+    }
+    match token {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(
+            "Administrator privileges are required; maintenance was not started. Approve the Windows UAC prompt and retry."
+                .to_string(),
+        ),
+        Err(error) => Err(format!(
+            "Could not verify the Windows administrator token ({error}); maintenance was not started."
+        )),
+    }
+}
+
+/// True when argv carries the internal elevation marker.
 pub fn has_marker(args: &[String]) -> bool {
     args.iter()
         .any(|a| a.eq_ignore_ascii_case(ELEVATION_MARKER))
 }
 
-/// PowerShell single-quote escaping for paths/args containing spaces.
-pub fn quote_ps(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
-
-/// Build the synchronous elevated-relaunch command:
-///
-/// `powershell -NoProfile -ExecutionPolicy Bypass -Command "try {
-///   $p = Start-Process -FilePath '<exe>' -ArgumentList '<a>','<b>',
-///   'ELEVATED' -Verb RunAs -Wait -PassThru; exit $p.ExitCode
-///  } catch { exit 1223 }"`
-///
-/// Returns `(program, argv)` ready for [`std::process::Command`].
-/// The marker is appended unless already present, so the child never
-/// relaunches a third copy.
-pub fn build_relaunch_command(exe: &Path, args: &[String]) -> (String, Vec<String>) {
-    let mut forwarded: Vec<String> = args.to_vec();
-    if !has_marker(&forwarded) {
-        forwarded.push(ELEVATION_MARKER.to_string());
+/// Produce the `lpParameters` string accepted by ShellExecuteExW. Windows
+/// command-line quoting follows the CRT rules for quotes, backslashes, and
+/// whitespace. The reserved marker is de-duplicated and always appended last.
+pub fn build_relaunch_parameters(args: &[String]) -> Result<String, String> {
+    if args.iter().any(|arg| arg.contains('\0')) {
+        return Err("an argument contains a NUL character and cannot be forwarded".to_string());
     }
-    let list = forwarded
+    let mut forwarded: Vec<&str> = args
         .iter()
-        .map(|a| quote_ps(a))
+        .filter(|arg| !arg.eq_ignore_ascii_case(ELEVATION_MARKER))
+        .map(String::as_str)
+        .collect();
+    forwarded.push(ELEVATION_MARKER);
+    Ok(forwarded
+        .into_iter()
+        .map(quote_windows_argument)
         .collect::<Vec<_>>()
-        .join(",");
-    let script = format!(
-        "try {{ $p = Start-Process -FilePath {} -ArgumentList {} -Verb RunAs -Wait -PassThru; exit $p.ExitCode }} catch {{ exit {} }}",
-        quote_ps(&exe.to_string_lossy()),
-        list,
-        UAC_CANCELLED_CODE
-    );
-    (
-        "powershell".to_string(),
-        vec![
-            "-NoProfile".to_string(),
-            "-ExecutionPolicy".to_string(),
-            "Bypass".to_string(),
-            "-Command".to_string(),
-            script,
-        ],
-    )
+        .join(" "))
 }
 
-/// Outcome of attempting the elevated relaunch.
+/// Quote a single Windows command-line argument using the standard CRT
+/// parsing rules. Always quotes, which also preserves empty arguments.
+pub fn quote_windows_argument(argument: &str) -> String {
+    let mut quoted = String::with_capacity(argument.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0usize;
+    for ch in argument.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.push_str(&"\\".repeat(backslashes));
+                backslashes = 0;
+                quoted.push(ch);
+            }
+        }
+    }
+    // Backslashes before the closing quote must be doubled.
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelaunchOutcome {
-    /// The elevated child ran to completion; carries its exit code.
     Launched { exit_code: i32 },
-    /// UAC was declined (or elevation unavailable): the requested
-    /// maintenance operation was NOT started.
     Cancelled,
-    /// The relaunch itself failed (message explains why); maintenance
-    /// was NOT started.
     Failed(String),
 }
 
-/// Abstraction over the relaunch so policy is unit-testable.
+/// Injectable relaunch boundary. Policy tests use mocks; this trait's real
+/// implementation is the only code that can display a UAC prompt.
 pub trait ElevationLauncher {
     fn launch(&mut self, exe: &Path, args: &[String]) -> RelaunchOutcome;
 }
 
-/// Production launcher: synchronous `runas` relaunch via PowerShell.
-/// Windows-only; elsewhere reports `Failed` without side effects.
 pub struct RealElevationLauncher;
 
 impl ElevationLauncher for RealElevationLauncher {
     fn launch(&mut self, exe: &Path, args: &[String]) -> RelaunchOutcome {
         #[cfg(target_os = "windows")]
         {
-            let (program, argv) = build_relaunch_command(exe, args);
-            match std::process::Command::new(&program).args(&argv).status() {
-                Ok(status) => match status.code() {
-                    Some(UAC_CANCELLED_CODE) => RelaunchOutcome::Cancelled,
-                    Some(code) => RelaunchOutcome::Launched { exit_code: code },
-                    None => RelaunchOutcome::Failed(
-                        "elevated process terminated without an exit code".to_string(),
-                    ),
-                },
-                Err(e) => RelaunchOutcome::Failed(format!(
-                    "could not request elevation via {program}: {e}"
-                )),
-            }
+            launch_windows(exe, args)
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -165,19 +175,126 @@ impl ElevationLauncher for RealElevationLauncher {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn launch_windows(exe: &Path, args: &[String]) -> RelaunchOutcome {
+    use std::mem::size_of;
+    use windows_sys::Win32::Foundation::{GetLastError, WAIT_FAILED, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, INFINITE, WaitForSingleObject,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+    };
+
+    if !exe.is_file() {
+        return RelaunchOutcome::Failed(format!(
+            "application executable does not exist or is not a file: {}",
+            exe.display()
+        ));
+    }
+    let parameters = match build_relaunch_parameters(args) {
+        Ok(parameters) => parameters,
+        Err(error) => return RelaunchOutcome::Failed(error),
+    };
+    let Ok(working_directory) = std::env::current_dir() else {
+        return RelaunchOutcome::Failed(
+            "could not determine the current working directory for elevation".to_string(),
+        );
+    };
+    let verb = wide_z("runas");
+    let file = wide_os_z(exe.as_os_str());
+    let params = wide_z(&parameters);
+    let directory = wide_os_z(working_directory.as_os_str());
+    // SAFETY: all strings are NUL-terminated and remain alive for the API
+    // call. The structure is zero-initialized and cbSize is set below.
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.lpParameters = params.as_ptr();
+    info.lpDirectory = directory.as_ptr();
+    info.nShow = 1; // SW_SHOWNORMAL
+
+    // SAFETY: `info` points to a correctly initialized SHELLEXECUTEINFOW.
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        let code = unsafe { GetLastError() } as i32;
+        if code == UAC_CANCELLED_CODE {
+            return RelaunchOutcome::Cancelled;
+        }
+        return RelaunchOutcome::Failed(format!(
+            "ShellExecuteExW with the runas verb failed with Windows error {code}: {}",
+            std::io::Error::from_raw_os_error(code)
+        ));
+    }
+
+    if info.hProcess.is_null() {
+        return RelaunchOutcome::Failed(
+            "ShellExecuteExW succeeded but returned no child process handle".to_string(),
+        );
+    }
+    let process = OwnedProcessHandle(info.hProcess);
+    // SAFETY: handle was returned by ShellExecuteExW with
+    // SEE_MASK_NOCLOSEPROCESS and remains owned until `process` drops.
+    let wait = unsafe { WaitForSingleObject(process.0, INFINITE) };
+    if wait == WAIT_FAILED {
+        let error = std::io::Error::last_os_error();
+        return RelaunchOutcome::Failed(format!("waiting for the elevated child failed: {error}"));
+    }
+    if wait != WAIT_OBJECT_0 {
+        return RelaunchOutcome::Failed(format!(
+            "waiting for the elevated child returned unexpected status 0x{:08X}",
+            wait
+        ));
+    }
+    let mut exit_code = 0u32;
+    // SAFETY: the process handle remains valid and `exit_code` is writable.
+    if unsafe { GetExitCodeProcess(process.0, &mut exit_code) } == 0 {
+        return RelaunchOutcome::Failed(format!(
+            "could not retrieve the elevated child's exit code: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    RelaunchOutcome::Launched {
+        exit_code: exit_code as i32,
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct OwnedProcessHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(target_os = "windows")]
+impl Drop for OwnedProcessHandle {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper uniquely owns the process handle returned by
+        // ShellExecuteExW. Closing it is correct on every return path.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn wide_z(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(target_os = "windows")]
+fn wide_os_z(value: &std::ffi::OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    value.encode_wide().chain(std::iter::once(0)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::VecDeque;
 
-    /// Scripted launcher: records requests, replays outcomes.
-    pub struct MockElevationLauncher {
-        pub requests: Vec<(String, Vec<String>)>,
-        pub outcomes: VecDeque<RelaunchOutcome>,
+    struct MockElevationLauncher {
+        requests: Vec<(String, Vec<String>)>,
+        outcomes: VecDeque<RelaunchOutcome>,
     }
 
     impl MockElevationLauncher {
-        pub fn new(outcomes: Vec<RelaunchOutcome>) -> Self {
+        fn new(outcomes: Vec<RelaunchOutcome>) -> Self {
             Self {
                 requests: Vec::new(),
                 outcomes: outcomes.into(),
@@ -189,107 +306,198 @@ mod tests {
         fn launch(&mut self, exe: &Path, args: &[String]) -> RelaunchOutcome {
             self.requests
                 .push((exe.to_string_lossy().to_string(), args.to_vec()));
-            self.outcomes.pop_front().unwrap_or(RelaunchOutcome::Failed(
-                "mock: no outcome scripted".to_string(),
-            ))
+            self.outcomes
+                .pop_front()
+                .unwrap_or_else(|| RelaunchOutcome::Failed("mock outcome missing".to_string()))
         }
     }
 
     #[test]
-    fn elevated_process_never_relaunches() {
-        // Already elevated: proceed even for maintenance, marker or not.
-        assert_eq!(decide(true, true, true, false), ElevationDecision::Proceed);
-        assert_eq!(decide(true, true, true, true), ElevationDecision::Proceed);
+    fn elevated_process_never_requests_uac() {
+        for intent in [
+            ElevationIntent::InteractiveStartup,
+            ElevationIntent::Maintenance,
+            ElevationIntent::Informational,
+        ] {
+            assert_eq!(
+                decide(intent, TokenState::Elevated, true, false),
+                ElevationDecision::Proceed
+            );
+        }
     }
 
     #[test]
-    fn non_elevated_maintenance_requests_elevation_on_windows() {
+    fn startup_and_maintenance_request_elevation_when_not_elevated() {
         assert_eq!(
-            decide(true, false, true, false),
+            decide(
+                ElevationIntent::InteractiveStartup,
+                TokenState::NotElevated,
+                true,
+                false
+            ),
             ElevationDecision::RelaunchElevated
         );
+        for intent in [ElevationIntent::Maintenance] {
+            assert_eq!(
+                decide(intent, TokenState::NotElevated, true, false),
+                ElevationDecision::RelaunchElevated
+            );
+        }
     }
 
     #[test]
-    fn relaunch_without_privileges_aborts_instead_of_looping() {
-        // The ELEVATED child is still not admin: stop, do not relaunch.
-        assert_eq!(decide(true, false, true, true), ElevationDecision::Abort);
+    fn unknown_token_fails_toward_elevation_for_protected_intents() {
+        for intent in [
+            ElevationIntent::InteractiveStartup,
+            ElevationIntent::Maintenance,
+        ] {
+            assert_eq!(
+                decide(intent, TokenState::Unknown, true, false),
+                ElevationDecision::RelaunchElevated
+            );
+        }
     }
 
     #[test]
-    fn informational_screens_do_not_require_elevation() {
+    fn informational_commands_are_available_without_elevation() {
         assert_eq!(
-            decide(false, false, true, false),
+            decide(
+                ElevationIntent::Informational,
+                TokenState::NotElevated,
+                true,
+                false
+            ),
+            ElevationDecision::Proceed
+        );
+        assert_eq!(
+            decide(
+                ElevationIntent::Informational,
+                TokenState::NotElevated,
+                true,
+                true
+            ),
+            ElevationDecision::Proceed,
+            "the internal marker must not change informational dispatch"
+        );
+    }
+
+    #[test]
+    fn marked_non_elevated_child_aborts_without_looping() {
+        for token in [TokenState::NotElevated, TokenState::Unknown] {
+            assert_eq!(
+                decide(ElevationIntent::Maintenance, token, true, true),
+                ElevationDecision::Abort
+            );
+        }
+    }
+
+    #[test]
+    fn non_windows_never_invokes_uac() {
+        assert_eq!(
+            decide(
+                ElevationIntent::InteractiveStartup,
+                TokenState::NotElevated,
+                false,
+                false
+            ),
             ElevationDecision::Proceed
         );
     }
 
     #[test]
-    fn non_windows_never_relaunches() {
+    fn maintenance_privilege_gate_fails_closed() {
+        assert!(require_maintenance_privileges(true, Ok(true)).is_ok());
+        assert!(require_maintenance_privileges(false, Ok(false)).is_ok());
+        assert!(
+            require_maintenance_privileges(true, Ok(false))
+                .unwrap_err()
+                .contains("not started")
+        );
+        assert!(
+            require_maintenance_privileges(true, Err("token query failed".into()))
+                .unwrap_err()
+                .contains("token query failed")
+        );
+    }
+
+    #[test]
+    fn marker_is_appended_once_and_after_public_arguments() {
+        let parameters = build_relaunch_parameters(&[
+            "clean".to_string(),
+            "ELEVATED".to_string(),
+            "elevated".to_string(),
+            "--verbose".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(parameters.matches("ELEVATED").count(), 1, "{parameters}");
+        assert!(parameters.find("clean").unwrap() < parameters.find("ELEVATED").unwrap());
+        assert!(parameters.ends_with("\"ELEVATED\""));
+    }
+
+    #[test]
+    fn windows_argument_quoting_handles_spaces_quotes_slashes_and_unicode() {
+        assert_eq!(quote_windows_argument(""), "\"\"");
+        assert_eq!(quote_windows_argument("two words"), "\"two words\"");
+        assert_eq!(quote_windows_argument("say \"hi\""), "\"say \\\"hi\\\"\"");
+        assert_eq!(quote_windows_argument("C:\\a path\\"), "\"C:\\a path\\\\\"");
         assert_eq!(
-            decide(true, false, false, false),
-            ElevationDecision::Proceed
+            quote_windows_argument("Akari-日本語 🙂"),
+            "\"Akari-日本語 🙂\""
         );
     }
 
     #[test]
-    fn cancellation_and_failure_carry_no_maintenance() {
-        // The outcome types themselves prove no maintenance ran: neither
-        // variant carries operation results, and callers must not start
-        // any runner on these paths (asserted in main-flow tests).
-        assert_ne!(
-            RelaunchOutcome::Cancelled,
-            RelaunchOutcome::Launched { exit_code: 0 }
-        );
-        let RelaunchOutcome::Failed(msg) = RelaunchOutcome::Failed("x".to_string()) else {
-            panic!("expected Failed");
-        };
-        assert_eq!(msg, "x");
-    }
-
-    #[test]
-    fn aliases_keep_dispatch_through_relaunch() {
-        // akariclean.exe relaunches ITSELF with its args + marker, so the
-        // elevated child dispatches to cleanup via its exe stem.
-        let exe = Path::new("C:\\My Programs\\Akari\\akariclean.exe");
-        let (program, argv) = build_relaunch_command(exe, &[]);
-        assert_eq!(program, "powershell");
-        let script = argv.last().unwrap();
-        assert!(script.contains("akariclean.exe"), "{script}");
+    fn nul_argument_is_rejected_instead_of_truncated() {
         assert!(
-            script.contains("runas") || script.contains("RunAs"),
-            "{script}"
+            build_relaunch_parameters(&["clean\0oops".to_string()])
+                .unwrap_err()
+                .contains("NUL")
         );
-        assert!(script.contains(ELEVATION_MARKER), "{script}");
-        // Shared-binary form preserves the subcommand arg first.
-        let exe2 = Path::new("C:\\tools\\akari.exe");
-        let (_, argv2) =
-            build_relaunch_command(exe2, &["clean".to_string(), "--verbose".to_string()]);
-        let script2 = argv2.last().unwrap();
-        let clean_pos = script2.find("clean").unwrap();
-        let marker_pos = script2.find(ELEVATION_MARKER).unwrap();
-        assert!(clean_pos < marker_pos, "{script2}");
     }
 
     #[test]
-    fn marker_is_appended_once_and_quoting_handles_spaces() {
-        let exe = Path::new("C:\\My Programs\\x\\akari.exe");
-        let (_, argv) = build_relaunch_command(exe, &["ELEVATED".to_string(), "clean".to_string()]);
-        let script = argv.last().unwrap();
-        assert_eq!(script.matches(ELEVATION_MARKER).count(), 1, "{script}");
-        assert!(
-            script.contains("'C:\\My Programs\\x\\akari.exe'"),
-            "{script}"
+    fn launcher_mock_records_executable_and_original_arguments() {
+        let mut mock = MockElevationLauncher::new(vec![RelaunchOutcome::Cancelled]);
+        let args = vec!["clean".to_string(), "a value".to_string()];
+        assert_eq!(
+            mock.launch(Path::new("C:\\Program Files\\Akari\\akari.exe"), &args),
+            RelaunchOutcome::Cancelled
         );
-        assert_eq!(quote_ps("o'clock"), "'o''clock'");
+        assert_eq!(mock.requests[0].0, "C:\\Program Files\\Akari\\akari.exe");
+        assert_eq!(mock.requests[0].1, args);
     }
 
     #[test]
-    fn mock_launcher_records_requests_for_policy_tests() {
-        let mut m = MockElevationLauncher::new(vec![RelaunchOutcome::Cancelled]);
-        let out = m.launch(Path::new("C:\\a\\akariclean.exe"), &[]);
-        assert_eq!(out, RelaunchOutcome::Cancelled);
-        assert_eq!(m.requests.len(), 1);
-        assert!(m.requests[0].0.ends_with("akariclean.exe"));
+    fn cancellation_is_distinct_from_real_launch_failures_and_child_codes() {
+        let child_exit_1223 = RelaunchOutcome::Launched { exit_code: 1223 };
+        assert!(!should_continue_restricted(
+            ElevationIntent::Maintenance,
+            &child_exit_1223
+        ));
+        let launch_failure = RelaunchOutcome::Failed("Windows error 2".into());
+        assert!(!should_continue_restricted(
+            ElevationIntent::Maintenance,
+            &launch_failure
+        ));
+        assert!(should_continue_restricted(
+            ElevationIntent::InteractiveStartup,
+            &RelaunchOutcome::Cancelled
+        ));
+        assert!(should_continue_restricted(
+            ElevationIntent::InteractiveStartup,
+            &RelaunchOutcome::Failed("shell error".into())
+        ));
+        assert!(!should_continue_restricted(
+            ElevationIntent::Maintenance,
+            &RelaunchOutcome::Cancelled
+        ));
+        assert!(!should_continue_restricted(
+            ElevationIntent::Maintenance,
+            &RelaunchOutcome::Failed("shell error".into())
+        ));
+        assert!(!should_continue_restricted(
+            ElevationIntent::InteractiveStartup,
+            &RelaunchOutcome::Launched { exit_code: 0 }
+        ));
     }
 }

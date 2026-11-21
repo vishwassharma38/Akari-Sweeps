@@ -7,8 +7,19 @@ use crate::update::UpdateNotice;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
-pub fn lines(notice: Option<&UpdateNotice>) -> Vec<Line<'static>> {
+pub fn lines(notice: Option<&UpdateNotice>, restricted: bool) -> Vec<Line<'static>> {
     let mut out = Vec::new();
+    if restricted {
+        out.push(Line::from(Span::styled(
+            "RESTRICTED MODE: Maintenance needs Administrator approval through UAC.",
+            Style::default().fg(Color::Red),
+        )));
+        out.push(Line::from(Span::styled(
+            "Home, About, and Help remain available; no maintenance runs until approved.",
+            Style::default().fg(Color::Yellow),
+        )));
+        out.push(Line::from(""));
+    }
     if let Some(notice) = notice {
         out.push(Line::from(Span::styled(
             format!(

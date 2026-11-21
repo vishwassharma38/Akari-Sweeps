@@ -42,14 +42,29 @@ fn real_main() -> i32 {
 
     let command = resolve_command(&exe, &args);
 
-    // Requirement 2: privilege handling happens BEFORE the TUI owns the
-    // terminal. Maintenance aliases relaunch elevated through UAC and this
-    // process exits with the elevated child's result (or a safe abort).
-    let elevated = crate::system::windows::is_elevated();
+    // Resolve elevation before the terminal is initialized. The plain
+    // interactive launcher attempts UAC but keeps running in restricted
+    // mode when that request is cancelled or unavailable. Direct
+    // maintenance entry points never continue without a verified token.
+    let token_result = crate::system::windows::elevation_status();
+    let token_state = match &token_result {
+        Ok(true) => crate::system::elevation::TokenState::Elevated,
+        Ok(false) => crate::system::elevation::TokenState::NotElevated,
+        Err(_) => crate::system::elevation::TokenState::Unknown,
+    };
+    let elevated = matches!(token_state, crate::system::elevation::TokenState::Elevated);
     let marker = crate::system::elevation::has_marker(&args);
+    let intent = if command.starts_maintenance() {
+        crate::system::elevation::ElevationIntent::Maintenance
+    } else if command == AppCommand::Home && crate::update::is_primary_launch(&exe) {
+        crate::system::elevation::ElevationIntent::InteractiveStartup
+    } else {
+        crate::system::elevation::ElevationIntent::Informational
+    };
+    let mut startup_elevation_issue: Option<String> = None;
     match crate::system::elevation::decide(
-        command.starts_maintenance(),
-        elevated,
+        intent,
+        token_state,
         crate::system::windows::is_windows(),
         marker,
     ) {
@@ -62,27 +77,45 @@ fn real_main() -> i32 {
                     return exit_code;
                 }
                 crate::system::elevation::RelaunchOutcome::Cancelled => {
-                    eprintln!(
-                        "Elevation declined: the UAC prompt was dismissed, so {} was not started. \
-                         Re-run and approve the prompt, or run as administrator.",
-                        command.public_name()
-                    );
-                    return crate::system::elevation::UAC_CANCELLED_CODE;
+                    if crate::system::elevation::should_continue_restricted(
+                        intent,
+                        &crate::system::elevation::RelaunchOutcome::Cancelled,
+                    ) {
+                        startup_elevation_issue = Some(
+                            "The Windows UAC prompt was declined. The TUI will continue in restricted mode.".to_string(),
+                        );
+                    } else {
+                        eprintln!(
+                            "Elevation declined: the UAC prompt was dismissed, so {} was not started. \
+                             Re-run and approve the prompt, or run as administrator.",
+                            command.public_name()
+                        );
+                        return crate::system::elevation::UAC_CANCELLED_CODE;
+                    }
                 }
                 crate::system::elevation::RelaunchOutcome::Failed(msg) => {
-                    eprintln!(
-                        "Could not request elevation ({msg}); {} was not started. \
-                         Right-click the app and choose 'Run as administrator'.",
-                        command.public_name()
-                    );
-                    return 1;
+                    if crate::system::elevation::should_continue_restricted(
+                        intent,
+                        &crate::system::elevation::RelaunchOutcome::Failed(msg.clone()),
+                    ) {
+                        startup_elevation_issue = Some(format!(
+                            "Could not request administrator elevation ({msg}). The TUI will continue in restricted mode."
+                        ));
+                    } else {
+                        eprintln!(
+                            "Could not request elevation ({msg}); {} was not started. \
+                             Right-click the app and choose 'Run as administrator'.",
+                            command.public_name()
+                        );
+                        return 1;
+                    }
                 }
             }
         }
         crate::system::elevation::ElevationDecision::Abort => {
             eprintln!(
-                "ERROR: Administrator privileges could not be obtained. \
-                 Right-click the app and choose Run as administrator."
+                "ERROR: This relaunch did not obtain administrator privileges. \
+                 No maintenance was started. Right-click the app and choose Run as administrator."
             );
             return 1;
         }
@@ -91,6 +124,9 @@ fn real_main() -> i32 {
 
     // Invalid invocation hint: `akari <unknown>` stays Home but flags it.
     let mut app = App::new(command);
+    // Use the result checked before launch decisions rather than a second
+    // potentially contradictory token probe in App::new.
+    app.elevated = elevated;
     if !args.is_empty()
         && matches!(
             exe_normalized(&exe).as_str(),
@@ -118,9 +154,18 @@ fn real_main() -> i32 {
                 .to_string(),
         );
     } else if !elevated && !command.starts_maintenance() {
+        if let Some(issue) = startup_elevation_issue {
+            app.status_line = issue.clone();
+            app.push_log(issue);
+        } else if let Err(error) = token_result {
+            let issue = format!(
+                "Could not verify the administrator token ({error}). Maintenance will remain blocked until UAC succeeds and the child token is verified."
+            );
+            app.status_line = issue.clone();
+            app.push_log(issue);
+        }
         app.push_log(
-            "Running without administrator rights. These screens work as-is; \
-             maintenance will request elevation through UAC first."
+            "Restricted mode: Home, About, and Help are available. Maintenance requires administrator approval through Windows UAC."
                 .to_string(),
         );
         app.push_log(crate::system::windows::elevation_help().to_string());
@@ -338,6 +383,10 @@ fn activate(app: &mut App, tx: &Sender<ExecEvent>, cmd: AppCommand) {
         app.push_log("A maintenance run is already in progress.".to_string());
         return;
     }
+    if cmd.starts_maintenance() && app.elevation_pending {
+        app.push_log("An administrator approval request is already in progress.".to_string());
+        return;
+    }
     if !cmd.starts_maintenance() {
         // Reuse the loaded sprite library; navigation only changes state.
         app.navigate(cmd);
@@ -351,9 +400,18 @@ fn activate(app: &mut App, tx: &Sender<ExecEvent>, cmd: AppCommand) {
         }
         return;
     }
-    if cfg!(target_os = "windows") && !app.elevated {
-        request_in_tui_elevation(app, tx, cmd);
-        return;
+    if crate::system::windows::is_windows() {
+        match crate::system::windows::elevation_status() {
+            Ok(true) => app.elevated = true,
+            Ok(false) => {
+                request_in_tui_elevation(app, tx, cmd, None);
+                return;
+            }
+            Err(error) => {
+                request_in_tui_elevation(app, tx, cmd, Some(error));
+                return;
+            }
+        }
     }
     if app.execution == crate::app::ExecutionState::Running {
         return;
@@ -363,50 +421,37 @@ fn activate(app: &mut App, tx: &Sender<ExecEvent>, cmd: AppCommand) {
     spawn_worker(cmd, tx.clone(), app);
 }
 
-/// In-TUI elevation: the running (non-elevated) interface must not run
-/// maintenance itself. It relaunches the same executable elevated in a
-/// blocking background thread — the TUI stays responsive — and reports
-/// the outcome honestly. UAC cancellation logs an actionable message
-/// and starts nothing.
-fn request_in_tui_elevation(app: &mut App, tx: &Sender<ExecEvent>, cmd: AppCommand) {
-    app.command = cmd;
-    app.screen = Screen::Maintenance;
-    app.phase = None;
-    app.sync_animation();
+/// In-TUI elevation never marks a maintenance run as started. The interface
+/// stays navigable while the background ShellExecuteExW request waits.
+fn request_in_tui_elevation(
+    app: &mut App,
+    tx: &Sender<ExecEvent>,
+    cmd: AppCommand,
+    token_error: Option<String>,
+) {
+    app.elevation_pending = true;
+    app.status_line.clear();
     app.push_log(format!(
-        "Administrator rights required — requesting elevation for {} via UAC…",
+        "Administrator rights required — requesting elevation for {} via Windows UAC…",
         cmd.public_name()
     ));
-    app.push_log(
-        "Approve the prompt to run elevated in a new window. Declining cancels safely; nothing runs here."
-            .to_string(),
-    );
+    if let Some(error) = token_error {
+        app.push_log(format!(
+            "The current administrator token could not be verified ({error}); maintenance remains blocked until the relaunched token is verified."
+        ));
+    }
+    app.push_log("Maintenance has not started. You can navigate while UAC is open.".to_string());
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("akari"));
     let arg = cmd.public_name().to_string();
     let tx2 = tx.clone();
     std::thread::spawn(move || {
         let mut launcher = crate::system::elevation::RealElevationLauncher;
         use crate::system::elevation::ElevationLauncher as _;
-        match launcher.launch(&exe, &[arg]) {
-            crate::system::elevation::RelaunchOutcome::Launched { exit_code } => {
-                let _ = tx2.send(ExecEvent::Log(format!(
-                    "Elevated {} finished with exit code {exit_code}.",
-                    cmd.public_name()
-                )));
-            }
-            crate::system::elevation::RelaunchOutcome::Cancelled => {
-                let _ = tx2.send(ExecEvent::Log(format!(
-                    "Elevation declined: {} was not started. Approve the UAC prompt, or run as administrator.",
-                    cmd.public_name()
-                )));
-            }
-            crate::system::elevation::RelaunchOutcome::Failed(msg) => {
-                let _ = tx2.send(ExecEvent::Error(format!(
-                    "Could not request elevation ({msg}); {} was not started.",
-                    cmd.public_name()
-                )));
-            }
-        }
+        let outcome = launcher.launch(&exe, &[arg]);
+        let _ = tx2.send(ExecEvent::ElevationFinished {
+            command: cmd.public_name().to_string(),
+            outcome,
+        });
     });
 }
 
@@ -441,6 +486,18 @@ fn spawn_background_update_check(tx: Sender<ExecEvent>) {
 static RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn spawn_worker(cmd: AppCommand, tx: Sender<ExecEvent>, app: &mut App) {
+    if crate::system::windows::is_windows() {
+        if let Err(message) = crate::system::elevation::require_maintenance_privileges(
+            true,
+            crate::system::windows::elevation_status(),
+        ) {
+            app.navigate(AppCommand::Home);
+            app.status_line = message.clone();
+            app.push_log(format!("ERROR: {message}"));
+            return;
+        }
+        app.elevated = true;
+    }
     let token = RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     app.mark_started(token);
     app.screen = Screen::Maintenance;
@@ -452,6 +509,31 @@ fn spawn_worker(cmd: AppCommand, tx: Sender<ExecEvent>, app: &mut App) {
 
 /// Background entry: runs the requested phases, then posts `Finished`.
 fn run_requested(cmd: AppCommand, tx: Sender<ExecEvent>) {
+    run_requested_with_token(
+        cmd,
+        tx,
+        crate::system::windows::is_windows(),
+        crate::system::windows::elevation_status(),
+    );
+}
+
+/// Testable worker boundary. Rejection returns before a `RealRunner` is
+/// constructed, so no filesystem or servicing operation can begin.
+fn run_requested_with_token(
+    cmd: AppCommand,
+    tx: Sender<ExecEvent>,
+    is_windows: bool,
+    token: Result<bool, String>,
+) {
+    // Defense in depth: the launch policy and `spawn_worker` both gate
+    // maintenance, and this final token check happens before a runner is
+    // constructed or a filesystem/servicing operation can run.
+    if let Err(message) =
+        crate::system::elevation::require_maintenance_privileges(is_windows, token)
+    {
+        let _ = tx.send(ExecEvent::MaintenanceBlocked(message));
+        return;
+    }
     let summary = match cmd {
         AppCommand::Clean => {
             let free_before = crate::system::windows::free_space_kb();
@@ -1139,5 +1221,21 @@ mod input_tests {
         handle_key(&mut app, &tx, press(KeyCode::Enter), &mut pending);
         assert_eq!(app.screen, Screen::Home);
         assert!(!app.worker_running);
+    }
+
+    #[test]
+    fn worker_gate_rejects_unelevated_and_unknown_tokens_before_runner_creation() {
+        for token in [Ok(false), Err("token query failed".to_string())] {
+            let (tx, rx) = mpsc::channel::<ExecEvent>();
+            run_requested_with_token(AppCommand::All, tx, true, token);
+            let ExecEvent::MaintenanceBlocked(message) = rx.try_recv().unwrap() else {
+                panic!("an unauthorized request must be blocked before maintenance");
+            };
+            assert!(message.contains("not started"));
+            assert!(
+                rx.try_recv().is_err(),
+                "no maintenance events may be emitted"
+            );
+        }
     }
 }

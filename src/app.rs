@@ -113,6 +113,9 @@ pub struct App {
     pub exit_code: i32,
     pub started: Instant,
     pub worker_running: bool,
+    /// True while an asynchronous UAC request is in progress. This does not
+    /// imply that maintenance has started.
+    pub elevation_pending: bool,
     pub status_line: String,
     /// Guard against double-start from repeated keypresses/events.
     pub run_token: Option<u64>,
@@ -174,6 +177,7 @@ impl App {
             exit_code: 0,
             started: Instant::now(),
             worker_running: false,
+            elevation_pending: false,
             status_line: String::new(),
             run_token: None,
             scroll: 0,
@@ -329,6 +333,43 @@ impl App {
                 self.push_log(format!("ERROR: {e}"));
                 self.status_line = e;
                 self.sync_animation();
+                false
+            }
+            ExecEvent::ElevationFinished { command, outcome } => {
+                self.elevation_pending = false;
+                match outcome {
+                    crate::system::elevation::RelaunchOutcome::Launched { exit_code } => {
+                        self.status_line =
+                            format!("Elevated {command} finished with exit code {exit_code}.");
+                        self.push_log(format!(
+                            "Elevated {command} finished with exit code {exit_code}."
+                        ));
+                    }
+                    crate::system::elevation::RelaunchOutcome::Cancelled => {
+                        self.status_line =
+                            format!("Elevation declined: {command} was not started.");
+                        self.push_log(format!(
+                            "Elevation declined: {command} was not started. Approve the Windows UAC prompt to retry."
+                        ));
+                    }
+                    crate::system::elevation::RelaunchOutcome::Failed(error) => {
+                        self.status_line =
+                            format!("Elevation failed ({error}); {command} was not started.");
+                        self.push_log(format!(
+                            "Could not request elevation ({error}); {command} was not started."
+                        ));
+                    }
+                }
+                // Do not change the screen the user chose while UAC was open.
+                // In particular, a declined request leaves navigation usable.
+                self.sync_animation();
+                false
+            }
+            ExecEvent::MaintenanceBlocked(message) => {
+                self.worker_running = false;
+                self.navigate(AppCommand::Home);
+                self.status_line = message.clone();
+                self.push_log(format!("ERROR: {message}"));
                 false
             }
             ExecEvent::UpdateAvailable(notice) => {
@@ -558,6 +599,24 @@ mod tests {
         assert_eq!(app.animator.set(), AnimationSet::Idle);
         assert_eq!(app.animator.mode(), AnimationMode::Ambient);
         assert!(app.summary.is_none());
+    }
+
+    #[test]
+    fn cancelled_elevation_clears_pending_state_without_starting_a_run() {
+        let mut app = App::new(AppCommand::Home);
+        app.navigate(AppCommand::Help);
+        app.elevation_pending = true;
+        app.on_event(ExecEvent::ElevationFinished {
+            command: "akariall".to_string(),
+            outcome: crate::system::elevation::RelaunchOutcome::Cancelled,
+        });
+        assert_eq!(app.screen, Screen::Help);
+        assert!(!app.elevation_pending);
+        assert!(!app.worker_running);
+        assert_eq!(app.execution, ExecutionState::Idle);
+        assert!(app.operations.is_empty());
+        assert!(app.summary.is_none());
+        assert!(app.log.iter().any(|line| line.contains("was not started")));
     }
 
     #[test]

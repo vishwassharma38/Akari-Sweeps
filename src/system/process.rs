@@ -3,7 +3,7 @@
 //! All maintenance subprocesses go through here so exit codes are honest:
 //! launching a command is not success — its exit status is.
 
-use crate::system::ProgramOutcome;
+use crate::system::{ProcessLaunchFailure, ProcessLaunchFailureKind, ProgramOutcome};
 use std::process::{Command, Stdio};
 
 /// Run `program args`, capturing stdout+stderr. Never panics; a spawn
@@ -27,6 +27,7 @@ pub fn run_program_capture(program: &str, args: &[&str]) -> ProgramOutcome {
             exit_code: out.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&out.stdout).to_string(),
             stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+            launch_error: None,
         },
         Err(e) => {
             #[cfg(target_os = "windows")]
@@ -43,6 +44,7 @@ pub fn run_program_capture(program: &str, args: &[&str]) -> ProgramOutcome {
                         exit_code: out.status.code().unwrap_or(-1),
                         stdout: String::from_utf8_lossy(&out.stdout).to_string(),
                         stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+                        launch_error: None,
                     };
                 }
             }
@@ -50,6 +52,21 @@ pub fn run_program_capture(program: &str, args: &[&str]) -> ProgramOutcome {
                 exit_code: 9009,
                 stdout: String::new(),
                 stderr: format!("failed to start '{program}': {e}"),
+                launch_error: Some(ProcessLaunchFailure {
+                    kind: match e.kind() {
+                        _ if e.raw_os_error() == Some(740) => {
+                            ProcessLaunchFailureKind::ElevationRequired
+                        }
+                        std::io::ErrorKind::PermissionDenied => {
+                            ProcessLaunchFailureKind::AccessDenied
+                        }
+                        std::io::ErrorKind::NotFound => ProcessLaunchFailureKind::NotFound,
+                        _ if e.raw_os_error() == Some(5) => ProcessLaunchFailureKind::AccessDenied,
+                        _ => ProcessLaunchFailureKind::Other,
+                    },
+                    raw_os_error: e.raw_os_error(),
+                    message: e.to_string(),
+                }),
             }
         }
     }
@@ -121,6 +138,8 @@ mod tests {
         let out = run_program_capture("akari-sweeps-definitely-missing-binary-xyz", &[]);
         assert_eq!(out.exit_code, 9009);
         assert!(!out.stderr.is_empty());
+        let failure = out.launch_error.expect("spawn failure is structured");
+        assert_eq!(failure.kind, ProcessLaunchFailureKind::NotFound);
     }
 
     #[test]

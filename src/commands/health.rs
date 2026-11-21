@@ -11,9 +11,14 @@
 //! `StartComponentCleanup` was historically BAT `[18/18]` cleanup; it
 //! now runs here so `akariclean` launches zero DISM commands.
 
-use crate::commands::clean::record_dism;
+use crate::commands::clean::{
+    PermissionFailureKind, classify_permission_failure, record_dism, tail,
+};
 use crate::system::windows::system_drive;
-use crate::system::{ExecEvent, MaintenanceRunner, OpResult, ProgressState, RunTotals};
+use crate::system::{
+    ExecEvent, MaintenanceRunner, OpResult, ProcessLaunchFailure, ProcessLaunchFailureKind,
+    ProgressState, RunTotals,
+};
 use std::time::Instant;
 
 /// Fixed six-step health workflow. Completed steps advance overall
@@ -127,6 +132,28 @@ pub fn record_sfc(totals: &mut RunTotals, exit_code: i32) -> OpResult {
     }
 }
 
+pub fn record_sfc_with_diagnostics(
+    totals: &mut RunTotals,
+    exit_code: i32,
+    diagnostic: &str,
+) -> OpResult {
+    if exit_code != 0 {
+        if let Some(kind) = classify_permission_failure(exit_code, diagnostic) {
+            return record_health_permission_failure(
+                totals,
+                "repair:sfc",
+                "[Repair 5/6] SFC",
+                "sfc /scannow",
+                "SFC",
+                exit_code,
+                kind,
+                diagnostic,
+            );
+        }
+    }
+    record_sfc(totals, exit_code)
+}
+
 /// Map a `chkdsk /scan` exit code per the BAT:
 /// 0 clean, 1 fixed, 2 informational, 3 incomplete (error), else unexpected.
 pub fn record_chkdsk(totals: &mut RunTotals, exit_code: i32, drive: &str) -> OpResult {
@@ -191,6 +218,92 @@ pub fn record_chkdsk(totals: &mut RunTotals, exit_code: i32, drive: &str) -> OpR
             r
         }
     }
+}
+
+pub fn record_chkdsk_with_diagnostics(
+    totals: &mut RunTotals,
+    exit_code: i32,
+    drive: &str,
+    diagnostic: &str,
+) -> OpResult {
+    if exit_code != 0 {
+        if let Some(kind) = classify_permission_failure(exit_code, diagnostic) {
+            return record_health_permission_failure(
+                totals,
+                "repair:chkdsk",
+                "[Repair 6/6] CHKDSK",
+                &format!("chkdsk {drive} /scan"),
+                "CHKDSK",
+                exit_code,
+                kind,
+                diagnostic,
+            );
+        }
+    }
+    record_chkdsk(totals, exit_code, drive)
+}
+
+fn record_health_permission_failure(
+    totals: &mut RunTotals,
+    id: &str,
+    label: &str,
+    target: &str,
+    tool: &str,
+    exit_code: i32,
+    kind: PermissionFailureKind,
+    diagnostic: &str,
+) -> OpResult {
+    let (reason, action) = match kind {
+        PermissionFailureKind::ElevationRequired => (
+            "requires administrator elevation",
+            "Approve the Windows UAC prompt and retry.",
+        ),
+        PermissionFailureKind::AccessDenied => (
+            "was denied access",
+            "Run Akari-Sweeps with administrator approval and check Windows file permissions.",
+        ),
+    };
+    let detail = format!(
+        "{tool} {reason} (exit code {exit_code}). {action} {}",
+        tail(diagnostic, 280)
+    );
+    totals.add_error(detail.clone());
+    let mut result = OpResult::failed(id, label, target, detail);
+    result.exit_code = Some(exit_code);
+    result
+}
+
+/// Convert structured OS process creation failures to honest maintenance
+/// results. Missing tools, access denied, and unrelated launch failures stay
+/// distinct and preserve the underlying OS error code where available.
+fn record_process_launch_failure(
+    totals: &mut RunTotals,
+    id: &str,
+    label: &str,
+    target: &str,
+    failure: &ProcessLaunchFailure,
+) -> OpResult {
+    let detail = match failure.kind {
+        ProcessLaunchFailureKind::ElevationRequired => format!(
+            "Administrator elevation is required to start {target}; approve the Windows UAC prompt and retry. {}",
+            failure.message
+        ),
+        ProcessLaunchFailureKind::AccessDenied => format!(
+            "Windows denied permission to start {target}; administrator privileges may be required. {}",
+            failure.message
+        ),
+        ProcessLaunchFailureKind::NotFound => format!(
+            "Could not start {target}: the executable was not found or is unavailable on PATH. {}",
+            failure.message
+        ),
+        ProcessLaunchFailureKind::Other => {
+            format!("Could not start {target}: {}", failure.message)
+        }
+    };
+    totals.add_error(detail.clone());
+    let mut result = OpResult::failed(id, label, target, detail);
+    result.exit_code = Some(failure.raw_os_error.unwrap_or(9009));
+    result
 }
 
 /// Execute the repair phase once (BAT guards re-entry with `REPAIR_ENTERED`).
@@ -267,10 +380,26 @@ pub fn run_repair_phase(
                 runner.emit(ExecEvent::Log(format!("stderr: {line}")));
             }
         }
-        let mut result = if id == "repair:sfc" {
-            record_sfc(&mut totals, out.exit_code)
+        let diagnostic = tail(
+            &format!(
+                "stdout: {}\nstderr: {}",
+                out.stdout.trim(),
+                out.stderr.trim()
+            ),
+            280,
+        );
+        let mut result = if let Some(failure) = out.launch_error.as_ref() {
+            record_process_launch_failure(
+                &mut totals,
+                &id,
+                &banner,
+                &format!("{program} {}", args.join(" ")),
+                failure,
+            )
+        } else if id == "repair:sfc" {
+            record_sfc_with_diagnostics(&mut totals, out.exit_code, &diagnostic)
         } else if id == "repair:chkdsk" {
-            record_chkdsk(&mut totals, out.exit_code, &drive)
+            record_chkdsk_with_diagnostics(&mut totals, out.exit_code, &drive, &diagnostic)
         } else {
             let op = match id.as_str() {
                 "repair:compcleanup" => "StartComponentCleanup",
@@ -278,7 +407,7 @@ pub fn run_repair_phase(
                 "repair:scanhealth" => "ScanHealth",
                 _ => "RestoreHealth",
             };
-            record_dism(&mut totals, op, out.exit_code, "")
+            record_dism(&mut totals, op, out.exit_code, &diagnostic)
         };
         result.duration_ms = Some(elapsed_ms);
         runner.emit(ExecEvent::OpFinished(result.clone()));
@@ -353,6 +482,7 @@ mod tests {
                 exit_code: *self.codes.get(&key).unwrap_or(&0),
                 stdout: String::new(),
                 stderr: String::new(),
+                launch_error: None,
             }
         }
         fn program_exists(&mut self, _: &str) -> bool {
@@ -403,6 +533,49 @@ mod tests {
         let r = record_sfc(&mut t, 1);
         assert_eq!(r.status, OpStatus::Failed);
         assert_eq!(t.err_count, 1);
+    }
+
+    #[test]
+    fn sfc_and_chkdsk_permission_failures_are_explicit() {
+        let mut sfc_totals = RunTotals::default();
+        let sfc = record_sfc_with_diagnostics(&mut sfc_totals, 1, "Access is denied.");
+        assert_eq!(sfc.status, OpStatus::Failed);
+        assert!(sfc.detail.to_lowercase().contains("denied access"));
+        assert_eq!(sfc.exit_code, Some(1));
+        assert_eq!(sfc_totals.err_count, 1);
+
+        let mut chkdsk_totals = RunTotals::default();
+        let chkdsk = record_chkdsk_with_diagnostics(
+            &mut chkdsk_totals,
+            5,
+            "C:",
+            "Access is denied as you do not have sufficient privileges.",
+        );
+        assert_eq!(chkdsk.status, OpStatus::Failed);
+        assert!(chkdsk.detail.contains("exit code 5"));
+        assert!(chkdsk.detail.contains("sufficient privileges"));
+        assert_eq!(chkdsk_totals.err_count, 1);
+    }
+
+    #[test]
+    fn missing_health_executable_is_not_reported_as_a_generic_exit() {
+        let mut totals = RunTotals::default();
+        let failure = ProcessLaunchFailure {
+            kind: ProcessLaunchFailureKind::NotFound,
+            raw_os_error: Some(2),
+            message: "The system cannot find the file specified".to_string(),
+        };
+        let result = record_process_launch_failure(
+            &mut totals,
+            "repair:sfc",
+            "[Repair 5/6] SFC",
+            "sfc /scannow",
+            &failure,
+        );
+        assert_eq!(result.status, OpStatus::Failed);
+        assert!(result.detail.contains("executable was not found"));
+        assert_eq!(result.exit_code, Some(2));
+        assert_eq!(totals.err_count, 1);
     }
 
     #[test]

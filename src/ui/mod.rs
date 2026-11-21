@@ -82,7 +82,7 @@ fn screen_subtitle(app: &App) -> String {
 fn render_main(frame: &mut Frame, app: &App, area: Rect) {
     match app.screen {
         Screen::Home => {
-            let p = Paragraph::new(home::lines(app.update_notice.as_ref()))
+            let p = Paragraph::new(home::lines(app.update_notice.as_ref(), !app.elevated))
                 .block(Block::default().borders(Borders::ALL).title(" Commands "))
                 .wrap(Wrap { trim: false });
             frame.render_widget(p, area);
@@ -225,6 +225,15 @@ fn render_animation_panel(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn status_text(app: &App) -> String {
+    if app.elevation_pending {
+        return "[waiting for UAC] · maintenance has not started · navigate freely or approve the prompt"
+            .to_string();
+    }
+    if app.execution == crate::app::ExecutionState::Idle && !app.status_line.is_empty() {
+        let message: String = app.status_line.chars().take(92).collect();
+        let elev = if app.elevated { "admin" } else { "restricted" };
+        return format!("[{elev}] {message}");
+    }
     // During maintenance operations the Status panel is the accurate,
     // continuously updated progress bar (spec: `Status: [====----] 76.4%`).
     // While work is actively running it shows only the progress display
@@ -248,11 +257,16 @@ fn status_text(app: &App) -> String {
             crate::app::ExecutionState::Done => "done",
             crate::app::ExecutionState::Error => "error",
         };
-        let elev = if app.elevated { "admin" } else { "not admin" };
+        let elev = if app.elevated { "admin" } else { "restricted" };
         if app.execution == crate::app::ExecutionState::Running {
             return format!("{bar} · [{exec}|{elev}]");
         }
-        return format!("{bar} · [{exec}|{elev}] · -/back home · q quit");
+        let hint = if app.elevated {
+            ""
+        } else {
+            " · maintenance requires UAC approval"
+        };
+        return format!("{bar} · [{exec}|{elev}]{hint} · -/back home · q quit");
     }
     let exec = match app.execution {
         crate::app::ExecutionState::Idle => "idle",
@@ -260,10 +274,15 @@ fn status_text(app: &App) -> String {
         crate::app::ExecutionState::Done => "done",
         crate::app::ExecutionState::Error => "error",
     };
-    let elev = if app.elevated { "admin" } else { "not admin" };
+    let elev = if app.elevated { "admin" } else { "restricted" };
+    let hint = if app.elevated {
+        ""
+    } else {
+        " · maintenance needs UAC approval"
+    };
     format!(
-        "[{}|{}] · 1-5 select · / input · -/back home · q/Esc quit",
-        exec, elev
+        "[{}|{}]{} · 1-5 select · / input · -/back home · q/Esc quit",
+        exec, elev, hint
     )
 }
 
@@ -936,7 +955,7 @@ mod tests {
                 "startup log must not say press ?"
             );
         }
-        for line in crate::ui::home::lines(None) {
+        for line in crate::ui::home::lines(None, false) {
             let s = format!("{line:?}");
             assert!(!s.contains("? help"), "home must not show ? help: {s}");
         }

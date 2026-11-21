@@ -200,6 +200,7 @@ mod tests {
                 exit_code: 0,
                 stdout: String::new(),
                 stderr: String::new(),
+                launch_error: None,
             }
         }
         fn program_exists(&mut self, _: &str) -> bool {
@@ -246,6 +247,7 @@ mod tests {
                     exit_code: code,
                     stdout: String::new(),
                     stderr: String::new(),
+                    launch_error: None,
                 }
             }
             fn program_exists(&mut self, _: &str) -> bool {

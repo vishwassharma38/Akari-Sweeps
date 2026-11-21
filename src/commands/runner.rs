@@ -273,6 +273,7 @@ pub mod test_support {
                 exit_code: *self.exits.get(&key).unwrap_or(&0),
                 stdout: String::new(),
                 stderr: String::new(),
+                launch_error: None,
             }
         }
 

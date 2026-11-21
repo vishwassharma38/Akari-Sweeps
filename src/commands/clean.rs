@@ -669,61 +669,111 @@ fn run_firefox(
 /// intended workflow (cleanup's `[18/18]` component-store cleanup vs.
 /// repair's Check/Scan/RestoreHealth); this mapping only interprets
 /// the exit code honestly.
-pub fn record_dism(
-    totals: &mut RunTotals,
-    op: &str,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionFailureKind {
+    ElevationRequired,
+    AccessDenied,
+}
+
+/// Detect known Windows permission errors from exit codes and captured
+/// diagnostics. Unrelated failures remain ordinary command errors.
+pub fn classify_permission_failure(
     exit_code: i32,
-    stdout_tail: &str,
-) -> OpResult {
+    diagnostic: &str,
+) -> Option<PermissionFailureKind> {
+    let unsigned = exit_code as u32;
+    let text = diagnostic.to_ascii_lowercase();
+    if exit_code == 740 || unsigned == 0x8007_02e4 || text.contains("0x800702e4") {
+        return Some(PermissionFailureKind::ElevationRequired);
+    }
+    if exit_code == 5 || unsigned == 0x8007_0005 || text.contains("0x80070005") {
+        return Some(PermissionFailureKind::AccessDenied);
+    }
+    if text.contains("elevation required")
+        || text.contains("requires elevation")
+        || text.contains("must be run as administrator")
+        || text.contains("must be an administrator")
+        || text.contains("must be run from an elevated")
+        || text.contains("elevated permissions are required")
+        || text.contains("requires administrator privileges")
+        || text.contains("requires administrative privileges")
+        || text.contains("administrator privileges are required")
+        || text.contains("insufficient privileges")
+        || text.contains("insufficient permissions")
+    {
+        return Some(PermissionFailureKind::ElevationRequired);
+    }
+    if text.contains("error_access_denied")
+        || text.contains("access is denied")
+        || text.contains("access denied")
+    {
+        return Some(PermissionFailureKind::AccessDenied);
+    }
+    None
+}
+
+/// DISM result mapping shared with the repair phase (`:RecordDism`):
+/// 0 = success, 3010 = success + restart warning, else failure. Bounded
+/// captured stdout/stderr context is retained for diagnosis.
+pub fn record_dism(totals: &mut RunTotals, op: &str, exit_code: i32, diagnostic: &str) -> OpResult {
+    if exit_code != 0
+        && let Some(kind) = classify_permission_failure(exit_code, diagnostic)
+    {
+        let (what, action) = match kind {
+            PermissionFailureKind::ElevationRequired => (
+                "requires administrator elevation",
+                "Approve the Windows UAC prompt and retry.",
+            ),
+            PermissionFailureKind::AccessDenied => (
+                "was denied access",
+                "Run Akari-Sweeps with administrator approval and check Windows file permissions.",
+            ),
+        };
+        let context = tail(diagnostic, 280);
+        let detail = format!("DISM {op} {what} (exit code {exit_code}). {action} {context}");
+        totals.add_error(detail.clone());
+        let mut result = OpResult::failed(&format!("dism:{op}"), "DISM", op, detail);
+        result.exit_code = Some(exit_code);
+        return result;
+    }
     if exit_code == 0 {
         totals.add_ok();
-        let mut r = OpResult::ok(
+        let mut result = OpResult::ok(
             &format!("dism:{op}"),
             "DISM",
             op,
-            format!("DISM {op} completed successfully (exit 0). {stdout_tail}"),
+            format!(
+                "DISM {op} completed successfully (exit 0). {}",
+                tail(diagnostic, 280)
+            ),
         );
-        r.exit_code = Some(0);
-        r
+        result.exit_code = Some(0);
+        result
     } else if exit_code == 3010 {
         totals.add_ok();
         totals.add_warning(format!(
             "DISM {op} completed, but Windows reports that a restart is required."
         ));
-        let mut r = OpResult::ok(
-            &format!("dism:{op}"),
-            "DISM",
-            op,
-            format!("DISM {op} completed; restart required (exit 3010). {stdout_tail}"),
-        );
-        r.exit_code = Some(3010);
-        r
-    } else if exit_code == 740 {
-        totals.add_error(format!(
-            "DISM {op} failed with exit code 740 (elevation required). \
-             Run as administrator and approve the UAC prompt, then retry. {stdout_tail}"
-        ));
-        let mut r = OpResult::failed(
+        let mut result = OpResult::ok(
             &format!("dism:{op}"),
             "DISM",
             op,
             format!(
-                "DISM {op} FAILED with exit code 740 — requires elevation. \
-                 Right-click the app and choose 'Run as administrator'. {stdout_tail}"
+                "DISM {op} completed; restart required (exit 3010). {}",
+                tail(diagnostic, 280)
             ),
         );
-        r.exit_code = Some(740);
-        r
+        result.exit_code = Some(3010);
+        result
     } else {
-        totals.add_error(format!("DISM {op} failed with exit code {exit_code}."));
-        let mut r = OpResult::failed(
-            &format!("dism:{op}"),
-            "DISM",
-            op,
-            format!("DISM {op} FAILED with exit code {exit_code}. {stdout_tail}"),
+        let detail = format!(
+            "DISM {op} FAILED with exit code {exit_code}. {}",
+            tail(diagnostic, 280)
         );
-        r.exit_code = Some(exit_code);
-        r
+        totals.add_error(format!("DISM {op} failed with exit code {exit_code}."));
+        let mut result = OpResult::failed(&format!("dism:{op}"), "DISM", op, detail);
+        result.exit_code = Some(exit_code);
+        result
     }
 }
 
@@ -758,12 +808,18 @@ pub fn npm_failure_detail(exit_code: i32, stderr_tail: &str) -> String {
     }
 }
 
-fn tail(s: &str, max: usize) -> String {
+pub fn tail(s: &str, max: usize) -> String {
     let t = s.trim();
     if t.len() <= max {
         t.to_string()
     } else {
-        format!("...{}", &t[t.len() - max..])
+        let start = t.len().saturating_sub(max);
+        let boundary = t
+            .char_indices()
+            .find(|(index, _)| *index >= start)
+            .map(|(index, _)| index)
+            .unwrap_or(t.len());
+        format!("...{}", &t[boundary..])
     }
 }
 
@@ -1475,6 +1531,7 @@ mod tests {
                 exit_code: code,
                 stdout: String::new(),
                 stderr: String::new(),
+                launch_error: None,
             }
         }
         fn program_exists(&mut self, program: &str) -> bool {
@@ -1570,6 +1627,42 @@ mod tests {
         assert_eq!(totals.warn_count, 1);
         let fail = record_dism(&mut totals, "CheckHealth", 2, "");
         assert_eq!(fail.status, OpStatus::Failed);
+        assert_eq!(totals.err_count, 1);
+    }
+
+    #[test]
+    fn permission_failures_distinguish_elevation_access_and_unrelated_errors() {
+        assert_eq!(
+            classify_permission_failure(740, ""),
+            Some(PermissionFailureKind::ElevationRequired)
+        );
+        assert_eq!(
+            classify_permission_failure(5, ""),
+            Some(PermissionFailureKind::AccessDenied)
+        );
+        assert_eq!(
+            classify_permission_failure(-2147024891, ""),
+            Some(PermissionFailureKind::AccessDenied)
+        );
+        assert_eq!(
+            classify_permission_failure(87, "DISM failed with 0x80070005"),
+            Some(PermissionFailureKind::AccessDenied)
+        );
+        assert_eq!(
+            classify_permission_failure(1, "This command must be run as administrator."),
+            Some(PermissionFailureKind::ElevationRequired)
+        );
+        assert_eq!(
+            classify_permission_failure(1726, "RPC server unavailable"),
+            None
+        );
+
+        let mut totals = RunTotals::default();
+        let denied = record_dism(&mut totals, "RestoreHealth", 5, "Access is denied.");
+        assert_eq!(denied.status, OpStatus::Failed);
+        assert!(denied.detail.contains("denied access"));
+        assert!(denied.detail.contains("Access is denied"));
+        assert_eq!(denied.exit_code, Some(5));
         assert_eq!(totals.err_count, 1);
     }
 
