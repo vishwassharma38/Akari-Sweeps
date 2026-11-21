@@ -1,10 +1,9 @@
 # Akari about assets
 
-All eight files are loaded: `about_001.png`–`about_008.png` play in numeric
-order on the About screen. Files `about_005.png`–`about_008.png` are
-currently byte-identical duplicates of frames 001–004, but every file is
-kept as a separate frame — duplicates are never detected or skipped, so
-they intentionally extend the loop to eight frames.
+Every numbered `about_<digits>.png` file is loaded in numeric order on the
+About screen. Some files in the current artwork are byte-identical to other
+numbered files. Each file remains a separate animation frame; duplicates
+are never detected or skipped.
 
 Frames are discovered automatically: every `about_<digits>.png` file is
 loaded with no hardcoded frame limit. Leading zeros are optional, and

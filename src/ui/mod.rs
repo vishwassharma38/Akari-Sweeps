@@ -518,29 +518,38 @@ mod tests {
 
         let mut app = crate::app::App::new(AppCommand::About);
         assert_eq!(app.animator.set(), AnimationSet::About);
-        assert_eq!(app.frames().len(), 8);
-        let duplicate = app.frames()[0].rgba.clone();
+        let duplicate_pair = (0..app.frames().len()).find_map(|first| {
+            ((first + 1)..app.frames().len())
+                .find(|duplicate| app.frames()[first].rgba == app.frames()[*duplicate].rgba)
+                .map(|duplicate| (first, duplicate))
+        });
+        let (first, duplicate_index) =
+            duplicate_pair.expect("shipped About artwork includes duplicate frames");
         assert_eq!(
-            app.frames()[4].rgba,
-            duplicate,
-            "shipped frame 005 duplicates frame 001"
+            app.frames()[duplicate_index].rgba,
+            app.frames()[first].rgba,
+            "byte-identical artwork remains at its own index"
         );
 
         let interval = SWEEP_INTERVAL_MS * 3;
         let mut now = app.elapsed_ms();
-        for _ in 0..4 {
+        for _ in 0..duplicate_index {
             now += interval;
             app.animator.tick(now);
         }
         assert_eq!(
             app.animator.current_frame(),
-            4,
+            duplicate_index,
             "the duplicate frame is a normal playback position"
         );
         let text = buffer_text(160, 40, &app);
         assert!(text.contains("investigating"));
         assert!(
-            text.contains("346×557 source"),
+            text.contains(&format!(
+                "{}×{} source",
+                app.frames()[duplicate_index].source_width,
+                app.frames()[duplicate_index].source_height
+            )),
             "duplicate frame must render through the shared canvas"
         );
     }

@@ -1,15 +1,7 @@
 # Akari sweep frames
 
-Eight separate sprite images used during maintenance:
-
-- `sweep_001.png`
-- `sweep_002.png`
-- `sweep_003.png`
-- `sweep_004.png`
-- `sweep_005.png`
-- `sweep_006.png`
-- `sweep_007.png`
-- `sweep_008.png`
+Sprite images used during maintenance. Every numbered
+`sweep_<digits>.png` file in this directory is part of the animation.
 
 Frames are discovered automatically: every `sweep_<digits>.png` file
 is loaded in numeric order, with no hardcoded frame limit. Every file is

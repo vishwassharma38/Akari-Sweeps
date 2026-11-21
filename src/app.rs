@@ -590,6 +590,32 @@ impl App {
 mod tests {
     use super::*;
     use crate::system::RunTotals;
+    use std::path::PathBuf;
+
+    fn expected_numbered_pngs(spec: crate::akari::sprites::SpriteSetSpec) -> Vec<PathBuf> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("akari")
+            .join(spec.dir);
+        let prefix = format!("{}_", spec.prefix);
+        let mut paths = std::fs::read_dir(dir)
+            .expect("shipped sprite directory must be readable")
+            .map(|entry| entry.expect("directory entry must be readable").path())
+            .filter_map(|path| {
+                if !path.extension()?.to_str()?.eq_ignore_ascii_case("png") {
+                    return None;
+                }
+                let frame_no = path.file_stem()?.to_str()?.strip_prefix(&prefix)?;
+                if frame_no.is_empty() || !frame_no.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                let frame_no = frame_no.parse::<usize>().ok()?;
+                (frame_no > 0).then_some((frame_no, path))
+            })
+            .collect::<Vec<_>>();
+        paths.sort_by_key(|(number, _)| *number);
+        paths.into_iter().map(|(_, path)| path).collect()
+    }
 
     #[test]
     fn home_starts_idle_without_maintenance() {
@@ -647,10 +673,16 @@ mod tests {
                 app.sprite_error()
             );
             let spec = expected.sprite_set();
+            let expected_paths = expected_numbered_pngs(spec);
+            assert!(
+                !expected_paths.is_empty(),
+                "{} must have shipped frames",
+                spec.dir
+            );
             assert_eq!(
                 app.frames().len(),
-                8,
-                "{} must load every numbered PNG frame",
+                expected_paths.len(),
+                "{} loaded frames",
                 spec.dir
             );
             assert_eq!(
@@ -898,20 +930,29 @@ mod tests {
     }
 
     #[test]
-    fn about_and_help_play_every_loaded_frame() {
+    fn playback_visits_every_loaded_frame_and_loops_for_each_set() {
         for (cmd, set) in [
+            (AppCommand::Home, AnimationSet::Idle),
             (AppCommand::About, AnimationSet::About),
             (AppCommand::Help, AnimationSet::Help),
+            (AppCommand::Clean, AnimationSet::Sweep),
+            (AppCommand::Health, AnimationSet::Health),
         ] {
             let mut app = App::new(cmd);
             assert_eq!(app.animator.set(), set);
-            assert_eq!(app.frames().len(), 8, "{set:?} must load eight frames");
-            assert_eq!(app.animator.frame_count(), 8);
+            let count = app.frames().len();
+            assert!(count > 0, "{set:?} must load frames");
+            assert_eq!(app.animator.frame_count(), count);
 
-            let interval = crate::akari::sprites::SWEEP_INTERVAL_MS * 3;
+            let interval = crate::akari::sprites::SWEEP_INTERVAL_MS
+                * if app.animator.mode() == AnimationMode::Ambient {
+                    3
+                } else {
+                    1
+                };
             let start = app.elapsed_ms();
             let mut seen = std::collections::HashSet::new();
-            for step in 1..=8u64 {
+            for step in 1..=count as u64 {
                 assert!(
                     app.animator.tick(start + step * interval),
                     "{set:?} frame {step} should advance"
@@ -920,45 +961,65 @@ mod tests {
             }
             assert_eq!(
                 seen,
-                (0..8).collect::<std::collections::HashSet<_>>(),
-                "{set:?} must visit frames 0 through 7"
+                (0..count).collect::<std::collections::HashSet<_>>(),
+                "{set:?} must visit every loaded frame"
             );
-            assert_eq!(app.animator.current_frame(), 0, "loop returns to frame 0");
+            for step in 1..=count as u64 {
+                assert!(app.animator.tick(start + (count as u64 + step) * interval));
+            }
+            assert_eq!(
+                app.animator.current_frame(),
+                0,
+                "{set:?} loop returns to frame 0"
+            );
         }
     }
 
     #[test]
     fn duplicate_about_frames_are_independently_playable() {
         let mut app = App::new(AppCommand::About);
-        assert_eq!(app.frames().len(), 8);
-        let duplicate = app.frames()[0].rgba.clone();
+        let about_paths = expected_numbered_pngs(AnimationSet::About.sprite_set());
+        let source_bytes = about_paths
+            .iter()
+            .map(|path| std::fs::read(path).expect("shipped PNG must be readable"))
+            .collect::<Vec<_>>();
+        let (first_index, duplicate_index) = (0..source_bytes.len())
+            .find_map(|first| {
+                ((first + 1)..source_bytes.len())
+                    .find(|duplicate| source_bytes[first] == source_bytes[*duplicate])
+                    .map(|duplicate| (first, duplicate))
+            })
+            .expect("shipped About artwork must include byte-identical frames");
+        assert_eq!(app.frames().len(), about_paths.len());
+        assert_eq!(app.animator.frame_count(), about_paths.len());
+        let duplicate = app.frames()[first_index].rgba.clone();
         assert_eq!(
-            app.frames()[4].rgba,
+            app.frames()[duplicate_index].rgba,
             duplicate,
-            "shipped frames 001 and 005 are byte-identical artwork"
+            "byte-identical source files remain identical loaded frames"
         );
 
         let interval = crate::akari::sprites::SWEEP_INTERVAL_MS * 3;
         let mut now = app.elapsed_ms();
-        for _ in 0..4 {
+        for _ in 0..duplicate_index {
             now += interval;
             app.animator.tick(now);
         }
         assert_eq!(
             app.animator.current_frame(),
-            4,
+            duplicate_index,
             "playback must reach the duplicate frame as its own position"
         );
         assert_eq!(app.frames()[app.animator.current_frame()].rgba, duplicate);
 
-        for _ in 0..4 {
+        for _ in duplicate_index..app.frames().len() {
             now += interval;
             app.animator.tick(now);
         }
         assert_eq!(
             app.animator.current_frame(),
             0,
-            "the full eight-frame loop includes duplicate indices"
+            "the loop includes duplicate indices and returns to its first frame"
         );
     }
 

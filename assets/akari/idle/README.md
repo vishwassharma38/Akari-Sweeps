@@ -1,8 +1,7 @@
 # Akari idle frames
 
-Eight book-reading frames shown while the Home screen waits for input:
-
-- `idle_001.png` … `idle_008.png`
+Book-reading frames shown while the Home screen waits for input. Every
+numbered `idle_<digits>.png` file in this directory is part of the animation.
 
 Frames are discovered automatically: every `idle_<digits>.png` file is
 loaded in numeric order, with no hardcoded frame limit. Every file is kept

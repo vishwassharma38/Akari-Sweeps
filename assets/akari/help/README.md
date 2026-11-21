@@ -1,11 +1,9 @@
 # Akari help assets
 
-All eight files are loaded: `help_001.png`–`help_008.png` play in numeric
-order on the Help screen as the ambient help animation. Files
-`help_005.png`–`help_008.png` are currently byte-identical duplicates of
-frames 001–004, but every file is kept as a separate frame — duplicates
-are never detected or skipped, so they intentionally extend the loop to
-eight frames.
+Every numbered `help_<digits>.png` file is loaded in numeric order on the
+Help screen as the ambient animation. Some files in the current artwork
+are byte-identical to other numbered files. Each file remains a separate
+animation frame; duplicates are never detected or skipped.
 
 Frames are discovered automatically: every `help_<digits>.png` file is
 loaded with no hardcoded frame limit. Leading zeros are optional, and

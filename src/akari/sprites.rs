@@ -16,20 +16,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Expected number of frames in the currently shipped artwork. These
-/// constants document the repository assets and are used by tests; the
-/// loader itself never limits itself to them and always loads every
-/// discovered numbered PNG.
-#[allow(dead_code)]
-pub const SWEEP_FRAMES: usize = 8;
-#[allow(dead_code)]
-pub const IDLE_FRAMES: usize = 8;
-#[allow(dead_code)]
-pub const HEALTH_FRAMES: usize = 8;
-#[allow(dead_code)]
-pub const ABOUT_FRAMES: usize = 8;
-#[allow(dead_code)]
-pub const HELP_FRAMES: usize = 8;
 /// Target 6 frames per second (≈166.7 ms per frame). All animation sets
 /// share this timing policy through `Animator`.
 pub const SWEEP_INTERVAL_MS: u64 = 167;
@@ -566,7 +552,7 @@ pub fn resolve_sweep_dir() -> Option<PathBuf> {
     SpriteSetSpec::SWEEP.resolve_dir()
 }
 
-/// Load and normalize all eight sweep frames in order.
+/// Load and normalize every discovered sweep frame in numeric order.
 #[allow(dead_code)]
 pub fn load_sweep_frames(dir: &Path) -> Result<Vec<SpriteFrame>, SpriteError> {
     SpriteSetSpec::SWEEP.load_frames(dir)
@@ -607,24 +593,35 @@ mod tests {
         img.save(dir.join(spec.frame_name(index))).unwrap();
     }
 
-    fn source_image(spec: SpriteSetSpec, dir: &Path, index: usize) -> image::RgbaImage {
-        image::open(dir.join(spec.frame_name(index)))
+    fn source_image(path: &Path) -> image::RgbaImage {
+        image::open(path)
             .expect("source frame must decode")
             .to_rgba8()
     }
 
-    fn expected_frame_count(spec: SpriteSetSpec) -> usize {
-        if spec == SpriteSetSpec::SWEEP {
-            SWEEP_FRAMES
-        } else if spec == SpriteSetSpec::IDLE {
-            IDLE_FRAMES
-        } else if spec == SpriteSetSpec::HEALTH {
-            HEALTH_FRAMES
-        } else if spec == SpriteSetSpec::ABOUT {
-            ABOUT_FRAMES
-        } else {
-            HELP_FRAMES
-        }
+    /// Independently enumerate numbered PNGs on disk for shipped-art checks.
+    /// This intentionally does not call the loader's discovery function.
+    fn numbered_png_paths(dir: &Path, spec: SpriteSetSpec) -> Vec<PathBuf> {
+        let filename_prefix = format!("{}_", spec.prefix);
+        let mut numbered = std::fs::read_dir(dir)
+            .expect("shipped sprite directory must be readable")
+            .map(|entry| entry.expect("directory entry must be readable").path())
+            .filter_map(|path| {
+                let extension = path.extension()?.to_str()?;
+                if !extension.eq_ignore_ascii_case("png") {
+                    return None;
+                }
+                let stem = path.file_stem()?.to_str()?;
+                let number = stem.strip_prefix(&filename_prefix)?;
+                if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                let number = number.parse::<usize>().ok()?;
+                (number > 0).then_some((number, path))
+            })
+            .collect::<Vec<_>>();
+        numbered.sort_by_key(|(number, _)| *number);
+        numbered.into_iter().map(|(_, path)| path).collect()
     }
 
     fn canvas_pixel(frame: &SpriteFrame, x: u32, y: u32) -> [u8; 4] {
@@ -660,87 +657,18 @@ mod tests {
     }
 
     #[test]
-    fn frame_names_sequential_for_all_sets() {
-        let sweep: Vec<_> = (0..SWEEP_FRAMES)
-            .map(|i| SpriteSetSpec::SWEEP.frame_name(i))
-            .collect();
-        assert_eq!(
-            sweep,
-            vec![
-                "sweep_001.png",
-                "sweep_002.png",
-                "sweep_003.png",
-                "sweep_004.png",
-                "sweep_005.png",
-                "sweep_006.png",
-                "sweep_007.png",
-                "sweep_008.png",
-            ]
-        );
-        let idle: Vec<_> = (0..IDLE_FRAMES)
-            .map(|i| SpriteSetSpec::IDLE.frame_name(i))
-            .collect();
-        assert_eq!(
-            idle,
-            vec![
-                "idle_001.png",
-                "idle_002.png",
-                "idle_003.png",
-                "idle_004.png",
-                "idle_005.png",
-                "idle_006.png",
-                "idle_007.png",
-                "idle_008.png",
-            ]
-        );
-        let health: Vec<_> = (0..HEALTH_FRAMES)
-            .map(|i| SpriteSetSpec::HEALTH.frame_name(i))
-            .collect();
-        assert_eq!(
-            health,
-            vec![
-                "health_001.png",
-                "health_002.png",
-                "health_003.png",
-                "health_004.png",
-                "health_005.png",
-                "health_006.png",
-                "health_007.png",
-                "health_008.png",
-            ]
-        );
-        let about: Vec<_> = (0..ABOUT_FRAMES)
-            .map(|i| SpriteSetSpec::ABOUT.frame_name(i))
-            .collect();
-        assert_eq!(
-            about,
-            vec![
-                "about_001.png",
-                "about_002.png",
-                "about_003.png",
-                "about_004.png",
-                "about_005.png",
-                "about_006.png",
-                "about_007.png",
-                "about_008.png",
-            ]
-        );
-        let help: Vec<_> = (0..HELP_FRAMES)
-            .map(|i| SpriteSetSpec::HELP.frame_name(i))
-            .collect();
-        assert_eq!(
-            help,
-            vec![
-                "help_001.png",
-                "help_002.png",
-                "help_003.png",
-                "help_004.png",
-                "help_005.png",
-                "help_006.png",
-                "help_007.png",
-                "help_008.png",
-            ]
-        );
+    fn frame_names_follow_the_numbering_convention_for_all_sets() {
+        for spec in [
+            SpriteSetSpec::SWEEP,
+            SpriteSetSpec::IDLE,
+            SpriteSetSpec::HEALTH,
+            SpriteSetSpec::ABOUT,
+            SpriteSetSpec::HELP,
+        ] {
+            assert_eq!(spec.frame_name(0), format!("{}_001.png", spec.prefix));
+            assert_eq!(spec.frame_name(8), format!("{}_009.png", spec.prefix));
+            assert_eq!(spec.frame_name(9), format!("{}_010.png", spec.prefix));
+        }
     }
 
     #[test]
@@ -767,19 +695,34 @@ mod tests {
                 spec.dir,
                 resolved.display()
             );
+            let expected_paths = numbered_png_paths(&dir, spec);
+            assert!(
+                !expected_paths.is_empty(),
+                "{} must have numbered PNGs",
+                spec.dir
+            );
+            let discovered = spec
+                .discover_frame_paths(&resolved)
+                .expect("all shipped numbered PNGs must be discovered");
+            assert_eq!(discovered, expected_paths, "{} discovery order", spec.dir);
             let frames = spec.load_frames(&resolved).expect("frames must decode");
-            assert_eq!(frames.len(), expected_frame_count(spec));
+            assert_eq!(
+                frames.len(),
+                expected_paths.len(),
+                "{} frame count",
+                spec.dir
+            );
 
             let max_width = frames.iter().map(|f| f.source_width).max().unwrap();
             let max_height = frames.iter().map(|f| f.source_height).max().unwrap();
-            for (i, frame) in frames.iter().enumerate() {
+            for (i, (frame, path)) in frames.iter().zip(&expected_paths).enumerate() {
                 assert_eq!(
                     (frame.canvas_width, frame.canvas_height),
                     (max_width, max_height),
                     "{} frame {i} must share the set canvas",
                     spec.dir
                 );
-                assert_source_preserved(frame, &source_image(spec, &dir, i));
+                assert_source_preserved(frame, &source_image(path));
             }
         }
     }
@@ -798,8 +741,9 @@ mod tests {
                 eprintln!("skipping: {} assets not in tree", spec.dir);
                 continue;
             }
+            let expected_paths = numbered_png_paths(&dir, spec);
             let frames = spec.load_frames(&dir).expect("frames must decode");
-            assert_eq!(frames.len(), expected_frame_count(spec));
+            assert_eq!(frames.len(), expected_paths.len());
             let canvas = (frames[0].canvas_width, frames[0].canvas_height);
             for frame in &frames {
                 assert_eq!((frame.canvas_width, frame.canvas_height), canvas);
@@ -812,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn shipped_asset_tree_loads_all_forty_frames() {
+    fn shipped_asset_tree_loads_every_numbered_png() {
         let specs = [
             SpriteSetSpec::SWEEP,
             SpriteSetSpec::IDLE,
@@ -820,42 +764,63 @@ mod tests {
             SpriteSetSpec::ABOUT,
             SpriteSetSpec::HELP,
         ];
-        let mut total = 0;
         for spec in specs {
+            let dir = manifest_dir(spec);
+            let expected_paths = numbered_png_paths(&dir, spec);
+            let discovered = spec
+                .discover_frame_paths(&dir)
+                .unwrap_or_else(|error| panic!("{} assets must discover: {error}", spec.dir));
+            assert_eq!(discovered, expected_paths, "{} discovered paths", spec.dir);
             let frames = spec
-                .load_frames(&manifest_dir(spec))
+                .load_frames(&dir)
                 .unwrap_or_else(|error| panic!("{} assets must load: {error}", spec.dir));
             assert_eq!(
                 frames.len(),
-                expected_frame_count(spec),
-                "{} must load every shipped frame",
+                expected_paths.len(),
+                "{} loaded count",
                 spec.dir
             );
-            total += frames.len();
         }
-        assert_eq!(total, 40, "the current asset tree contains 40 PNG frames");
     }
 
     #[test]
     fn byte_identical_shipped_frames_remain_separate_entries() {
         for spec in [SpriteSetSpec::ABOUT, SpriteSetSpec::HELP] {
             let dir = manifest_dir(spec);
+            let expected_paths = numbered_png_paths(&dir, spec);
             let frames = spec.load_frames(&dir).expect("duplicate frames must load");
-            assert_eq!(frames.len(), 8);
-            // Frames 001 and 005 (and later mirrors) are byte-identical in
-            // the shipped artwork. Both must be retained at their own indices.
-            assert_eq!(
-                frames[0].rgba, frames[4].rgba,
-                "{} duplicate frame data must match as artwork",
+            let source_bytes = expected_paths
+                .iter()
+                .map(|path| std::fs::read(path).expect("shipped PNG must be readable"))
+                .collect::<Vec<_>>();
+            let mut duplicate_pairs = Vec::new();
+            for first in 0..source_bytes.len() {
+                for duplicate in first + 1..source_bytes.len() {
+                    if source_bytes[first] == source_bytes[duplicate] {
+                        duplicate_pairs.push((first, duplicate));
+                    }
+                }
+            }
+            assert!(
+                !duplicate_pairs.is_empty(),
+                "{} shipped artwork should exercise duplicate preservation",
                 spec.dir
             );
-            assert_eq!(
-                frames[1].rgba, frames[5].rgba,
-                "{} duplicate frame data must match as artwork",
-                spec.dir
-            );
+            for (first, duplicate) in duplicate_pairs {
+                assert_eq!(
+                    frames[first].rgba, frames[duplicate].rgba,
+                    "{} byte-identical source files must decode identically",
+                    spec.dir
+                );
+                assert_ne!(
+                    frames[first].rgba.as_ptr(),
+                    frames[duplicate].rgba.as_ptr(),
+                    "{} duplicate files must remain separate loaded entries",
+                    spec.dir
+                );
+            }
             for (index, frame) in frames.iter().enumerate() {
-                assert_source_preserved(frame, &source_image(spec, &dir, index));
+                assert_source_preserved(frame, &source_image(&expected_paths[index]));
             }
         }
     }
@@ -869,8 +834,8 @@ mod tests {
             return;
         }
         let frames = spec.load_frames(&dir).expect("idle frames must decode");
-        for (i, frame) in frames.iter().enumerate() {
-            assert_source_preserved(frame, &source_image(spec, &dir, i));
+        for (frame, path) in frames.iter().zip(numbered_png_paths(&dir, spec)) {
+            assert_source_preserved(frame, &source_image(&path));
         }
     }
 
@@ -894,9 +859,8 @@ mod tests {
             return;
         }
         let frames = spec.load_frames(&dir).expect("health frames must decode");
-        assert_eq!(frames.len(), HEALTH_FRAMES);
-        for (i, frame) in frames.iter().enumerate() {
-            assert_source_preserved(frame, &source_image(spec, &dir, i));
+        for (frame, path) in frames.iter().zip(numbered_png_paths(&dir, spec)) {
+            assert_source_preserved(frame, &source_image(&path));
         }
     }
 
@@ -926,9 +890,8 @@ mod tests {
             return;
         }
         let frames = spec.load_frames(&dir).expect("about frames must decode");
-        assert_eq!(frames.len(), ABOUT_FRAMES);
-        for (i, frame) in frames.iter().enumerate() {
-            assert_source_preserved(frame, &source_image(spec, &dir, i));
+        for (frame, path) in frames.iter().zip(numbered_png_paths(&dir, spec)) {
+            assert_source_preserved(frame, &source_image(&path));
         }
     }
 
@@ -956,9 +919,8 @@ mod tests {
             return;
         }
         let frames = spec.load_frames(&dir).expect("help frames must decode");
-        assert_eq!(frames.len(), HELP_FRAMES);
-        for (i, frame) in frames.iter().enumerate() {
-            assert_source_preserved(frame, &source_image(spec, &dir, i));
+        for (frame, path) in frames.iter().zip(numbered_png_paths(&dir, spec)) {
+            assert_source_preserved(frame, &source_image(&path));
         }
     }
 
@@ -1054,7 +1016,7 @@ mod tests {
     fn source_alpha_and_pixels_are_preserved_in_the_canvas() {
         let spec = SpriteSetSpec::SWEEP;
         let dir = temp_dir("alpha-preserved");
-        for i in 0..SWEEP_FRAMES {
+        for i in 0..4 {
             let color = [10 + i as u8, 40, 90, 128];
             save_solid(&dir, spec, i, 5 + i as u32, 9 + i as u32, color);
         }
@@ -1086,16 +1048,15 @@ mod tests {
     fn canvas_uses_checked_arithmetic_and_a_documented_budget() {
         // Hostile dimensions must fail with a diagnostic, not overflow or
         // attempt to allocate.
-        let err =
-            checked_canvas_len(SpriteSetSpec::SWEEP, u32::MAX, u32::MAX, SWEEP_FRAMES).unwrap_err();
+        let err = checked_canvas_len(SpriteSetSpec::SWEEP, u32::MAX, u32::MAX, 4).unwrap_err();
         assert!(matches!(err, SpriteError::CanvasTooLarge { .. }));
         let msg = err.to_string();
         assert!(msg.contains("sweep animation"));
-        assert!(msg.contains(&format!("{SWEEP_FRAMES} frames")));
+        assert!(msg.contains("4 frames"));
         assert!(msg.contains("safety budget"));
         assert!(msg.contains("provide smaller PNGs"));
 
-        let err = checked_canvas_len(SpriteSetSpec::HELP, 100_000, 100_000, 8).unwrap_err();
+        let err = checked_canvas_len(SpriteSetSpec::HELP, 100_000, 100_000, 4).unwrap_err();
         assert!(matches!(err, SpriteError::CanvasTooLarge { .. }));
     }
 
@@ -1191,7 +1152,7 @@ mod tests {
                 frame.rgba, frames[0].rgba,
                 "frame {index} must decode its own identical pixels"
             );
-            assert_source_preserved(frame, &source_image(spec, &dir, index));
+            assert_source_preserved(frame, &source_image(&dir.join(spec.frame_name(index))));
         }
         assert_ne!(
             frames[0].rgba.as_ptr(),
@@ -1214,7 +1175,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_loads_more_than_eight_frames_in_numeric_order() {
+    fn discovery_loads_every_numbered_frame_in_numeric_order() {
         let spec = SpriteSetSpec::HELP;
         let dir = temp_dir("ten-frames");
         for number in 1..=10u8 {
@@ -1223,7 +1184,7 @@ mod tests {
         }
 
         let frames = spec.load_frames(&dir).expect("ten frames must load");
-        assert_eq!(frames.len(), 10, "discovery must not stop at eight frames");
+        assert_eq!(frames.len(), 10, "one fixture PNG must load per frame");
         for (index, frame) in frames.iter().enumerate() {
             assert_eq!(
                 canvas_pixel(frame, 0, 0),

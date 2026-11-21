@@ -188,13 +188,9 @@ Directories: `assets/akari/sweep/`, `assets/akari/idle/`,
 `assets/akari/health/`, `assets/akari/about/`, and `assets/akari/help/`
 (shipped to `<InstallDir>\assets\…`).
 
-```
-sweep_001.png … sweep_008.png              (8 frames)
-idle_001.png … idle_008.png                (8 frames)
-health_001.png … health_008.png            (8 frames)
-about_001.png … about_008.png              (8 frames)
-help_001.png … help_008.png                (8 frames)
-```
+Each directory contains numbered PNGs using its matching prefix, such as
+`sweep_001.png`, `idle_001.png`, `health_001.png`, `about_001.png`, and
+`help_001.png`. Every valid numbered PNG in a set is loaded automatically.
 
 Frame filenames are discovered at runtime, not limited to a hardcoded
 count: every `<prefix>_<digits>.png` file in a set's directory is loaded
@@ -206,12 +202,10 @@ PNG files that do not match the naming convention produce an explicit
 diagnostic in the animation panel rather than ambiguous playback order.
 
 Every discovered file is kept as its own frame; identical bytes are never
-deduplicated or skipped. The About and Help folders therefore play all
-eight of their files, including `about_005.png`–`about_008.png` and
-`help_005.png`–`help_008.png`, which currently duplicate frames 001–004
-and extend each loop to eight frames. Playback counts come from the
-frames that actually loaded, so adding, removing, or extending a sequence
-needs no source-code change.
+deduplicated or skipped. The About and Help folders include byte-identical
+frames in the current artwork, and those files retain separate playback
+positions. Playback counts come from the frames that actually loaded, so
+adding, removing, or extending a sequence needs no source-code change.
 
 PNG frames may use any dimensions and aspect ratio. Frames within one
 animation may even differ in size; no resizing or source-code change is
