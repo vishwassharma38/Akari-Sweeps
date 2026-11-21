@@ -745,7 +745,7 @@ mod tests {
         vec![
             ("akari-sweeps.exe", b"MZfake-executable", false),
             ("assets/", b"", true),
-            ("assets/akari/sweep/akari_sweep_001.png", b"png-data", false),
+            ("assets/akari/sweep/sweep_001.png", b"png-data", false),
             ("assets/akari/idle/README.md", b"notes", false),
         ]
     }
@@ -852,11 +852,7 @@ mod tests {
         write_zip(&zip, &valid_entries());
         assert_eq!(extract_package(&zip, &staging).unwrap(), 3);
         assert!(staging.join(CANONICAL_EXE).is_file());
-        assert!(
-            staging
-                .join("assets/akari/sweep/akari_sweep_001.png")
-                .is_file()
-        );
+        assert!(staging.join("assets/akari/sweep/sweep_001.png").is_file());
         assert!(staging.join("assets/akari/idle/README.md").is_file());
         let _ = fs::remove_dir_all(dir);
     }
@@ -873,20 +869,12 @@ mod tests {
             &[
                 ("akari-sweeps.exe", b"MZfake-executable", false),
                 ("assets\\", b"", true),
-                (
-                    "assets\\akari\\sweep\\akari_sweep_001.png",
-                    b"png-data",
-                    false,
-                ),
+                ("assets\\akari\\sweep\\sweep_001.png", b"png-data", false),
             ],
         );
         assert_eq!(extract_package(&zip, &staging).unwrap(), 2);
         assert!(staging.join(CANONICAL_EXE).is_file());
-        assert!(
-            staging
-                .join("assets/akari/sweep/akari_sweep_001.png")
-                .is_file()
-        );
+        assert!(staging.join("assets/akari/sweep/sweep_001.png").is_file());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -899,7 +887,7 @@ mod tests {
             &zip,
             &[
                 ("assets/", b"", true),
-                ("assets/akari/sweep/akari_sweep_001.png", b"png", false),
+                ("assets/akari/sweep/sweep_001.png", b"png", false),
             ],
         );
         let err = extract_package(&zip, &staging).unwrap_err();
@@ -1051,7 +1039,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.ends_with("  assets/akari/sweep/akari_sweep_001.png"))
+                .any(|line| line.ends_with("  assets/akari/sweep/sweep_001.png"))
         );
         assert!(text.ends_with('\n'));
         let _ = fs::remove_dir_all(dir);

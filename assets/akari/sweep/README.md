@@ -2,16 +2,16 @@
 
 Eight separate sprite images used during maintenance:
 
-- `akari_sweep_001.png`
-- `akari_sweep_002.png`
-- `akari_sweep_003.png`
-- `akari_sweep_004.png`
-- `akari_sweep_005.png`
-- `akari_sweep_006.png`
-- `akari_sweep_007.png`
-- `akari_sweep_008.png`
+- `sweep_001.png`
+- `sweep_002.png`
+- `sweep_003.png`
+- `sweep_004.png`
+- `sweep_005.png`
+- `sweep_006.png`
+- `sweep_007.png`
+- `sweep_008.png`
 
-Frames are discovered automatically: every `akari_sweep_<digits>.png` file
+Frames are discovered automatically: every `sweep_<digits>.png` file
 is loaded in numeric order, with no hardcoded frame limit. Every file is
 kept as its own frame; byte-identical duplicates are not deduplicated.
 Non-PNG files are ignored, while numeric gaps, duplicate indices, and PNG

@@ -110,7 +110,7 @@ jobs:
           if ($names -notcontains 'akari-sweeps.exe') {
             throw "The release ZIP is missing 'akari-sweeps.exe'."
           }
-          if ($names -notcontains 'assets/akari/sweep/akari_sweep_001.png') {
+          if ($names -notcontains 'assets/akari/sweep/sweep_001.png') {
             throw 'The release ZIP is missing the Akari sprite assets.'
           }
           $developmentFiles = @($names | Where-Object {

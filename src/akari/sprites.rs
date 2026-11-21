@@ -54,7 +54,7 @@ pub struct SpriteSetSpec {
 impl SpriteSetSpec {
     pub const SWEEP: Self = Self {
         dir: "sweep",
-        prefix: "akari_sweep",
+        prefix: "sweep",
     };
 
     pub const IDLE: Self = Self {
@@ -667,14 +667,14 @@ mod tests {
         assert_eq!(
             sweep,
             vec![
-                "akari_sweep_001.png",
-                "akari_sweep_002.png",
-                "akari_sweep_003.png",
-                "akari_sweep_004.png",
-                "akari_sweep_005.png",
-                "akari_sweep_006.png",
-                "akari_sweep_007.png",
-                "akari_sweep_008.png",
+                "sweep_001.png",
+                "sweep_002.png",
+                "sweep_003.png",
+                "sweep_004.png",
+                "sweep_005.png",
+                "sweep_006.png",
+                "sweep_007.png",
+                "sweep_008.png",
             ]
         );
         let idle: Vec<_> = (0..IDLE_FRAMES)

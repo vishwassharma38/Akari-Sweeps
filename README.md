@@ -139,7 +139,7 @@ Directories: `assets/akari/sweep/`, `assets/akari/idle/`,
 (shipped to `<InstallDir>\assets\…`).
 
 ```
-akari_sweep_001.png … akari_sweep_008.png   (8 frames)
+sweep_001.png … sweep_008.png              (8 frames)
 idle_001.png … idle_008.png                (8 frames)
 health_001.png … health_008.png            (8 frames)
 about_001.png … about_008.png              (8 frames)

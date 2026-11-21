@@ -481,7 +481,7 @@ mod windows_tests {
             .unwrap();
         writer.write_all(b"new-idle-png").unwrap();
         writer
-            .start_file("assets/akari/sweep/akari_sweep_001.png", options)
+            .start_file("assets/akari/sweep/sweep_001.png", options)
             .unwrap();
         writer.write_all(b"new-sweep-png").unwrap();
         writer.finish().unwrap();
@@ -512,11 +512,7 @@ mod windows_tests {
 
         assert_all_aliases(&install, NEW_BINARY);
         assert!(install.join("assets/akari/idle/idle_001.png").is_file());
-        assert!(
-            install
-                .join("assets/akari/sweep/akari_sweep_001.png")
-                .is_file()
-        );
+        assert!(install.join("assets/akari/sweep/sweep_001.png").is_file());
         assert!(
             !install.join("assets/akari/idle/old.png").exists(),
             "the previous assets tree must be replaced, not merged"
