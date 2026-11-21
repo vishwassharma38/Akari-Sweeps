@@ -1,5 +1,5 @@
-//! Ratatui layout: header (top-left identity), main/output panel,
-//! right-side Akari animation panel, status bar. Adapts to small terminals.
+//! Ratatui layout: main/output panel, right-side animation panel, status bar.
+//! Adapts to small terminals.
 
 pub mod about;
 pub mod help;
@@ -7,19 +7,13 @@ pub mod home;
 pub mod maintenance;
 pub mod widgets;
 
-use crate::app::{App, PRODUCT_LABEL, Screen};
+use crate::app::{App, Screen};
 use crate::system::OpStatus;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
-
-fn header_style() -> Style {
-    Style::default()
-        .fg(Color::Magenta)
-        .add_modifier(Modifier::BOLD)
-}
 
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -31,52 +25,27 @@ pub fn render(frame: &mut Frame, app: &App) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
             Constraint::Min(8),
             Constraint::Length(3),
             Constraint::Length(3),
         ])
         .split(area);
 
-    // Header: exact product label, top-left, visually distinct.
-    let header = Paragraph::new(vec![
-        Line::from(vec![Span::styled(PRODUCT_LABEL, header_style())]),
-        Line::from(Span::styled(
-            screen_subtitle(app),
-            Style::default().fg(Color::DarkGray),
-        )),
-    ])
-    .block(Block::default().borders(Borders::ALL).title(" Akari "));
-    frame.render_widget(header, vertical[0]);
-
     // Body: main (2/3) + animation (1/3), visually separate.
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
-        .split(vertical[1]);
+        .split(vertical[0]);
     render_main(frame, app, body[0]);
     render_animation_panel(frame, app, body[1]);
 
     // Status bar.
     let status = Paragraph::new(status_text(app))
         .block(Block::default().borders(Borders::ALL).title(" Status "));
-    frame.render_widget(status, vertical[2]);
+    frame.render_widget(status, vertical[1]);
 
     // Command-entry field (visible on every screen).
-    render_command_entry(frame, app, vertical[3]);
-}
-
-fn screen_subtitle(app: &App) -> String {
-    match app.screen {
-        Screen::Home => format!("home — {} · q quit", app.command.display_invocation()),
-        Screen::Maintenance => format!(
-            "maintenance — {} · {} · back/- home · q quit",
-            app.command.display_invocation(),
-            maintenance::progress_line(app)
-        ),
-        Screen::About => "about — back/- home · q quit".to_string(),
-        Screen::Help => "help — back/- home · q quit".to_string(),
-    }
+    render_command_entry(frame, app, vertical[2]);
 }
 
 fn render_main(frame: &mut Frame, app: &App, area: Rect) {
@@ -155,7 +124,7 @@ fn render_maintenance(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_animation_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" Akari ");
+    let block = Block::default().borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -188,40 +157,9 @@ fn render_animation_panel(frame: &mut Frame, app: &App, area: Rect) {
         .current_frame()
         .min(frames.len().saturating_sub(1));
     let shown = &frames[idx];
-    // Leave the last row for the activity/source caption.
-    let sprite_height = inner.height.saturating_sub(1);
     let lines =
-        widgets::render_sprite_halfblock(shown, inner.width as usize, sprite_height as usize);
-    // Caption: honest about fallback rendering + current activity.
-    let mode = match app.animator.mode() {
-        crate::akari::animation::AnimationMode::Sweeping => match app.animator.set() {
-            crate::akari::animation::AnimationSet::Health => "repairing…",
-            crate::akari::animation::AnimationSet::Help => "helping…",
-            _ => "sweeping…",
-        },
-        crate::akari::animation::AnimationMode::Settled => "done",
-        crate::akari::animation::AnimationMode::Ambient => match app.animator.set() {
-            crate::akari::animation::AnimationSet::Idle => "reading",
-            crate::akari::animation::AnimationSet::Sweep => "idle",
-            crate::akari::animation::AnimationSet::Health => "health",
-            crate::akari::animation::AnimationSet::About => "investigating",
-            crate::akari::animation::AnimationSet::Help => "helping",
-        },
-    };
-    let mut all = lines;
-    all.push(Line::from(Span::styled(
-        format!(
-            "{mode} · terminal approx. ({}×{} source)",
-            shown.source_width, shown.source_height
-        ),
-        Style::default().fg(Color::DarkGray),
-    )));
-    // Trim to fit without overflow.
-    let max = inner.height as usize;
-    if all.len() > max {
-        all.truncate(max);
-    }
-    frame.render_widget(Paragraph::new(all), inner);
+        widgets::render_sprite_halfblock(shown, inner.width as usize, inner.height as usize);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn status_text(app: &App) -> String {
@@ -332,12 +270,6 @@ fn render_command_entry(frame: &mut Frame, app: &App, area: Rect) {
 fn render_compact(frame: &mut Frame, app: &App, area: Rect) {
     // Graceful degradation: single column, no overlap, no crash.
     let text = vec![
-        Line::from(Span::styled(
-            PRODUCT_LABEL,
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        )),
         Line::from(format!(
             "{} · enlarge terminal for full TUI",
             status_text(app)
@@ -362,11 +294,10 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
-    fn product_label_constant_is_derived_from_cargo_version() {
-        assert_eq!(
-            PRODUCT_LABEL,
-            concat!("Akari-Sweeps_V", env!("CARGO_PKG_VERSION"))
-        );
+    fn product_identity_is_not_rendered_in_full_or_compact_ui() {
+        let app = crate::app::App::new(AppCommand::Home);
+        assert!(!buffer_text(100, 28, &app).contains("Akari-Sweeps_V"));
+        assert!(!buffer_text(40, 10, &app).contains("Akari-Sweeps_V"));
         assert_eq!(crate::app::PRODUCT_VERSION, env!("CARGO_PKG_VERSION"));
     }
 
@@ -387,7 +318,7 @@ mod tests {
     fn home_lists_five_commands_not_the_launcher() {
         let app = crate::app::App::new(AppCommand::Home);
         let text = buffer_text(100, 28, &app);
-        assert!(text.contains(PRODUCT_LABEL));
+        assert!(!text.contains("Akari-Sweeps_V"));
         for name in [
             "akari clean",
             "akari health",
@@ -428,12 +359,12 @@ mod tests {
         app.sprites.get_mut(set).frames.clear();
         app.sprites.get_mut(set).error = Some("test: assets missing".to_string());
         let text = buffer_text(100, 28, &app);
-        assert!(text.contains(PRODUCT_LABEL));
+        assert!(!text.contains("Akari-Sweeps_V"));
         assert!(text.contains("test: assets missing"));
     }
 
     #[test]
-    fn idle_panel_reports_real_source_dimensions() {
+    fn sprite_panel_has_no_debug_caption() {
         use crate::akari::sprites::SpriteFrame;
 
         let mut app = crate::app::App::new(AppCommand::Home);
@@ -448,16 +379,13 @@ mod tests {
             rgba: vec![255, 0, 0, 255].repeat(8),
         }];
         let text = buffer_text(160, 40, &app);
-        assert!(text.contains("reading"), "idle caption must be reading");
-        assert!(text.contains("2×4 source"), "caption must use frame size");
-        assert!(
-            !text.contains("256×320"),
-            "idle caption must not claim sweep dimensions"
-        );
+        assert!(!text.contains("reading"));
+        assert!(!text.contains("terminal approx."));
+        assert!(!text.contains("source)"));
     }
 
     #[test]
-    fn caption_reports_source_dimensions_not_padded_canvas_dimensions() {
+    fn sprite_panel_omits_source_dimension_diagnostics() {
         use crate::akari::sprites::SpriteFrame;
 
         let mut app = crate::app::App::new(AppCommand::Home);
@@ -473,18 +401,12 @@ mod tests {
             rgba: vec![255, 0, 0, 255].repeat(12 * 20),
         }];
         let text = buffer_text(160, 40, &app);
-        assert!(
-            text.contains("2×4 source"),
-            "caption must report the original PNG dimensions"
-        );
-        assert!(
-            !text.contains("12×20 source"),
-            "caption must not report the padded shared canvas"
-        );
+        assert!(!text.contains("source"));
+        assert!(!text.contains("terminal approx."));
     }
 
     #[test]
-    fn about_panel_reports_about_caption_and_source_dimensions() {
+    fn about_sprite_panel_has_no_activity_or_dimension_caption() {
         use crate::akari::animation::AnimationSet;
         use crate::akari::sprites::SpriteFrame;
 
@@ -500,15 +422,8 @@ mod tests {
             rgba: vec![0, 255, 255, 255].repeat(8),
         }];
         let text = buffer_text(160, 40, &app);
-        assert!(
-            text.contains("investigating"),
-            "about caption must report about activity"
-        );
-        assert!(text.contains("2×4 source"), "caption must use frame size");
-        assert!(
-            !text.contains("sweeping") && !text.contains("reading"),
-            "about panel must not claim another animation set"
-        );
+        assert!(!text.contains("investigating"));
+        assert!(!text.contains("source"));
     }
 
     #[test]
@@ -543,15 +458,8 @@ mod tests {
             "the duplicate frame is a normal playback position"
         );
         let text = buffer_text(160, 40, &app);
-        assert!(text.contains("investigating"));
-        assert!(
-            text.contains(&format!(
-                "{}×{} source",
-                app.frames()[duplicate_index].source_width,
-                app.frames()[duplicate_index].source_height
-            )),
-            "duplicate frame must render through the shared canvas"
-        );
+        assert!(!text.contains("investigating"));
+        assert!(!text.contains("source"));
     }
 
     #[test]
@@ -569,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn help_panel_reports_help_caption_and_source_dimensions() {
+    fn help_sprite_panel_has_no_activity_or_dimension_caption() {
         use crate::akari::animation::AnimationSet;
         use crate::akari::sprites::SpriteFrame;
 
@@ -585,12 +493,8 @@ mod tests {
             rgba: vec![255, 0, 255, 255].repeat(8),
         }];
         let text = buffer_text(160, 40, &app);
-        assert!(text.contains("helping"), "help caption must report helping");
-        assert!(text.contains("2×4 source"), "caption must use frame size");
-        assert!(
-            !text.contains("investigating") && !text.contains("sweeping"),
-            "help panel must not claim another animation set"
-        );
+        assert!(!text.contains("helping"));
+        assert!(!text.contains("source"));
     }
 
     #[test]
@@ -608,10 +512,10 @@ mod tests {
     }
 
     #[test]
-    fn sweep_panel_still_reports_maintenance_caption() {
+    fn sweep_sprite_panel_has_no_maintenance_caption() {
         let app = crate::app::App::new(AppCommand::Clean);
         let text = buffer_text(100, 28, &app);
-        assert!(text.contains("sweeping"), "running sweep caption preserved");
+        assert!(!text.contains("sweeping"));
     }
 
     #[test]
@@ -638,29 +542,26 @@ mod tests {
         }];
 
         let cleanup = buffer_text(160, 40, &app);
-        assert!(cleanup.contains("6×8 source"), "cleanup frame must show");
-        assert!(cleanup.contains("sweeping"));
+        assert!(!cleanup.contains("source"));
+        assert!(!cleanup.contains("sweeping"));
 
         app.on_event(crate::system::ExecEvent::PhaseStarted {
             name: "cleanup".into(),
         });
         let cleanup_phase = buffer_text(160, 40, &app);
-        assert!(cleanup_phase.contains("6×8 source"));
+        assert!(!cleanup_phase.contains("source"));
 
         app.on_event(crate::system::ExecEvent::PhaseStarted {
             name: "repair".into(),
         });
         let repair = buffer_text(160, 40, &app);
-        assert!(repair.contains("2×4 source"), "health frame must show");
-        assert!(repair.contains("repairing"));
-        assert!(
-            !repair.contains("6×8 source") && !repair.contains("sweeping"),
-            "stale sweep frame/caption must not survive the phase switch"
-        );
+        assert!(!repair.contains("source"));
+        assert!(!repair.contains("repairing"));
+        assert!(!repair.contains("sweeping"));
     }
 
     #[test]
-    fn health_panel_reports_health_caption_and_source_dimensions() {
+    fn health_sprite_panel_has_no_activity_or_dimension_caption() {
         use crate::akari::sprites::SpriteFrame;
 
         let mut app = crate::app::App::new(AppCommand::Health);
@@ -680,15 +581,9 @@ mod tests {
             rgba: vec![255, 0, 0, 255].repeat(8),
         }];
         let text = buffer_text(160, 40, &app);
-        assert!(
-            text.contains("repairing"),
-            "health caption must report health work"
-        );
-        assert!(text.contains("2×4 source"), "caption must use frame size");
-        assert!(
-            !text.contains("sweeping") && !text.contains("256×320"),
-            "health caption must not claim sweep activity or dimensions"
-        );
+        assert!(!text.contains("repairing"));
+        assert!(!text.contains("source"));
+        assert!(!text.contains("sweeping"));
     }
 
     #[test]
@@ -709,7 +604,7 @@ mod tests {
     fn tiny_terminal_degrades_gracefully() {
         let app = crate::app::App::new(AppCommand::Home);
         let text = buffer_text(40, 10, &app);
-        assert!(text.contains(PRODUCT_LABEL));
+        assert!(!text.contains("Akari-Sweeps_V"));
     }
 
     #[test]
