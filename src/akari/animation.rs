@@ -137,6 +137,7 @@ impl Animator {
         self.last_advance_ms = now_ms;
     }
 
+    #[cfg(test)]
     pub fn mode(&self) -> AnimationMode {
         self.mode
     }
