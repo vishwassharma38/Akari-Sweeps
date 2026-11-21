@@ -96,6 +96,7 @@ impl AppCommand {
 }
 
 /// All six commands in catalogue order.
+#[cfg(test)]
 pub const COMMAND_CATALOGUE: [AppCommand; 6] = [
     AppCommand::Home,
     AppCommand::Clean,
