@@ -16,6 +16,7 @@ pub fn lines() -> Vec<Line<'static>> {
         Line::from("Windows cleanup and system-image repair tools in an interactive"),
         Line::from("terminal interface featuring Akari animations."),
         Line::from(""),
+        Line::from("Developer: Vishwas Sharma (SoftwareFromVish)."),
         Line::from("Repository: vishwassharma38/Akari-Sweeps (MIT)."),
         Line::from("Source and project information: github.com/vishwassharma38/Akari-Sweeps."),
     ]
