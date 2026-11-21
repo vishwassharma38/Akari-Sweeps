@@ -1,5 +1,4 @@
 //! Help screen content.
-use crate::commands::COMMAND_CATALOGUE;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
