@@ -40,7 +40,10 @@ pub fn lines() -> Vec<Line<'static>> {
         Line::from(""),
         heading("INTERACTIVE MODE"),
         row("1-5", "Select a menu item."),
-        row("/ <name>", "Search for a command by name, then press Enter."),
+        row(
+            "/ <name>",
+            "Search for a command by name, then press Enter.",
+        ),
         row("back", "Return to the Home screen."),
         row("akariback", "Return to the Home screen."),
         row("-", "Return to the Home screen."),
@@ -76,10 +79,7 @@ fn heading(label: &'static str) -> Line<'static> {
 
 fn row(label: &'static str, description: &'static str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!("  {label:<18}"),
-            Style::default().fg(Color::Yellow),
-        ),
+        Span::styled(format!("  {label:<18}"), Style::default().fg(Color::Yellow)),
         Span::raw(description),
     ])
 }
@@ -124,8 +124,7 @@ mod tests {
             if let Some(name) = command.subcommand_token() {
                 let expected = format!("  {name} ");
                 assert!(
-                    help.lines()
-                        .any(|line| line.starts_with(expected.as_str())),
+                    help.lines().any(|line| line.starts_with(expected.as_str())),
                     "help should include the {name} command"
                 );
             }
