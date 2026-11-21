@@ -122,8 +122,10 @@ mod tests {
 
         for command in COMMAND_CATALOGUE {
             if let Some(name) = command.subcommand_token() {
+                let expected = format!("  {name} ");
                 assert!(
-                    help.lines().any(|line| line.starts_with(&format!("  {name} "))),
+                    help.lines()
+                        .any(|line| line.starts_with(expected.as_str())),
                     "help should include the {name} command"
                 );
             }
